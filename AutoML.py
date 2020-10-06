@@ -8,6 +8,7 @@ from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 import matplotlib
 matplotlib.use('Agg')
+matplotlib.rcParams['agg.path.chunksize'] = 1000000
 
 
 class Preprocessing(object):
@@ -211,7 +212,7 @@ class Stationarize(object):
 
 class ExploratoryDataAnalysis(object):
 
-    def __init__(self, data, pretag=None, output=None, seasonPeriods=[24 * 60, 7 * 24 * 60], lags=60):
+    def __init__(self, data, pretag=None, output=None, maxSamples=10000, seasonPeriods=[24 * 60, 7 * 24 * 60], lags=60):
         '''
         Doing all the fun EDA in an automized script :)
         :param data: Pandas Dataframe
@@ -221,6 +222,7 @@ class ExploratoryDataAnalysis(object):
         '''
         # Register data
         self.tag = pretag
+        self.maxSamples = maxSamples
         self.data = data
         self.output = output
         self.seasonPeriods = seasonPeriods
@@ -230,11 +232,11 @@ class ExploratoryDataAnalysis(object):
         self.createDirs()
 
         # Run all functions
-        print('Generating Boxplots')
-        self.boxplots()
-        print('Generating Timeplots')
-        self.timeplots()
-        # self.seasonality()
+        # print('Generating Timeplots')
+        # self.timeplots()
+        # print('Generating Boxplots')
+        # self.boxplots()
+        # # self.seasonality()
         print('Generating Colinearity Plots')
         self.colinearity()
         print('Generating ACF Plots')
@@ -248,13 +250,18 @@ class ExploratoryDataAnalysis(object):
             self.featureRanking()
 
     def createDirs(self):
-        dirs = ['EDA', 'EDA/Boxplots', 'EDA/seasonality', 'EDA/Colinearity', 'EDA/Lags', 'EDA/Correlation/ACF',
-                    'EDA/Correlation/Cross', 'EDA/NonLinear Correlation', 'EDA/Timeplots']
+        dirs = ['EDA', 'EDA/Boxplots', 'EDA/Seasonality', 'EDA/Colinearity', 'EDA/Lags', 'EDA/Correlation',
+                'EDA/Correlation/ACF', 'EDA/Correlation/PACF', 'EDA/Correlation/Cross', 'EDA/NonLinear Correlation', 'EDA/Timeplots']
         for period in self.seasonPeriods:
-            dirs.append('EDA/Seasonality' + str(period))
+            dirs.append('EDA/Seasonality/' + str(period))
         for dir in dirs:
             try:
                 os.mkdir(dir)
+                if dir == 'EDA/Correlation':
+                    file = open('EDA/Correlation/Readme.txt', 'w')
+                    edit = file.write(
+                        'Correlation Interpretation\n\nIf the series has positive autocorrelations for a high number of lags,\nit probably needs a higher order of differencing. If the lag-1 autocorrelation\nis zero or negative, or the autocorrelations are small and patternless, then \nthe series does not need a higher order of differencing. If the lag-1 autocorrleation\nis below -0.5, the series is likely to be overdifferenced. \nOptimum level of differencing is often where the variance is lowest. ')
+                    file.close()
             except:
                 continue
 
@@ -267,9 +274,12 @@ class ExploratoryDataAnalysis(object):
             plt.close()
 
     def timeplots(self):
-        for key in self.data.keys():
+        # Undersample
+        data = self.data.iloc[np.linspace(0, len(self.data) - 1, self.maxSamples).astype('int')]
+        # Plot
+        for key in data.keys():
             fig = plt.figure(figsize=[24, 16])
-            plt.plot(self.data[key])
+            plt.plot(data.index, data[key])
             plt.title(key)
             fig.savefig('EDA/Timeplots/' + self.tag + key + '.png', format='png', dpi=300)
             plt.close()
@@ -286,8 +296,9 @@ class ExploratoryDataAnalysis(object):
                 plt.close()
 
     def colinearity(self):
+        threshold = 0.95
         fig = plt.figure(figsize=[24, 16])
-        sns.heatmap(self.data.corr(), annot=False, cmap='bwr')
+        sns.heatmap(abs(self.data.corr()) < threshold, annot=False, cmap='Greys')
         fig.savefig('EDA/Colinearity/' + self.tag + 'All_Features.png', format='png', dpi=300)
         # Minimum representation
         corr_mat = self.data.corr().abs()
@@ -295,7 +306,7 @@ class ExploratoryDataAnalysis(object):
         col_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
         minimal_rep = self.data.drop(self.data[col_drop], axis=1)
         fig = plt.figure(figsize=[24, 16])
-        sns.heatmap(minimal_rep.corr(), annot=False, cmap='bwr')
+        sns.heatmap(abs(minimal_rep.corr()) < threshold, annot=False, cmap='Greys')
         fig.savefig('EDA/Colinearity/' + self.tag + 'Minimum_Representation.png', format='png', dpi=300)
 
     def differencing(self):
@@ -314,20 +325,11 @@ class ExploratoryDataAnalysis(object):
         fig.savefig('EDA/Lags/'  + self.tag + 'Variance.png', format='png', dpi=300)
 
     def completeAutoCorr(self):
-        file = open('EDA/Correlation/Readme.txt', 'wb')
-        file.write('Correlation Interpretation\n\n'
-                   'If the series has positive autocorrelations for a high number of lags,\n'
-                   'it probably needs a higher order of differencing. If the lag-1 autocorrelation\n'
-                   'is zero or negative, or the autocorrelations are small and patternless, then \n'
-                   'the series does not need a higher order of differencing. If the lag-1 autocorrleation\n'
-                   'is below -0.5, the series is likely to be overdifferenced. \n'
-                   'Optimum level of differencing is often where the variance is lowest. ')
-        file.close()
         for key in self.data.keys():
             fig = plt.figure(figsize=[24, 16])
-            plot_acf(self.data[keys])
+            plot_acf(self.data[key])
             plt.title(key)
-            fig.savefig('EDA/Correlation/Auto/' + self.tag + key + '.png', format='png', dpi=300)
+            fig.savefig('EDA/Correlation/ACF/' + self.tag + key + '.png', format='png', dpi=300)
             plt.close()
 
     def partialAutoCorr(self):
