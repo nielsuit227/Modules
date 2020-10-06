@@ -1,7 +1,11 @@
 import os
 import numpy as np
 import pandas as pd
+import seaborn as sns
 import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from statsmodels.tsa.seasonal import STL
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 
 class Preprocessing(object):
@@ -13,7 +17,7 @@ class Preprocessing(object):
                  datesCols=None,
                  stringCols=None,
                  missingValues='remove',
-                 outlierRemoval='boxplot',
+                 outlierRemoval='none',
                  zScoreThreshold=4,
                  ):
         '''
@@ -49,7 +53,7 @@ class Preprocessing(object):
                 print(file)
                 self._clean(file)
         except:
-            self._clean(inputPath)
+            self._clean('')
 
 
     def _clean(self, path):
@@ -70,7 +74,6 @@ class Preprocessing(object):
                 data[key] = data[key].astype('category').cat.codes
         for key in keys:
             data[key] = pd.to_numeric(data[key], errors='coerce').astype('float32')
-
 
         # Duplicates
         data = data.drop_duplicates()
@@ -95,12 +98,14 @@ class Preprocessing(object):
             data = data[data.isna().sum(axis=1) == 0]
         elif self.missingValues == 'interpolate':
             data = data.interpolate()
+            if data.isna().sum().sum() != 0:
+                data = data.interpolate(limit=100, limit_direction='backward')
         elif self.missingValues == 'mean':
             data = data.fillna(data.mean())
 
         # Save
+        print('Saving to: ', self.outputPath + path)
         data.to_csv(self.outputPath + path, index=self.indexCol is not None)
-
 
 class Normalize(object):
 
@@ -136,7 +141,6 @@ class Normalize(object):
             data -= self.min
             data /= self.max - self.min
         return data
-
 
 class Stationarize(object):
 
@@ -197,39 +201,150 @@ class Stationarize(object):
             w.append(-w[-1] * (self.fractional - k + 1) / k)
         return np.array(w).reshape((-1))
 
-
 class ExploratoryDataAnalysis(object):
 
-    def __init__(self, input, output):
+    def __init__(self, data, output=None, seasonPeriods=[24 * 60, 7 * 24 * 60], lags=60):
         '''
         Doing all the fun EDA in an automized script :)
-        :param input:
-        :param output:
+        :param data: Pandas Dataframe
+        :param output: Pandas series of the output
+        :param seasonPeriods: List of periods to check for seasonality
+        :param lags: Lags for (P)ACF and
         '''
-        # Create Directories
-        os.mkdir('EDA/Boxplots')
-        os.mkdir('EDA/Seasonality/Daily')
-        os.mkdir('EDA/Seasonality/Weekly')
-        os.mkdir('EDA/Seasonality/Montly')
-        os.mkdir('EDA/Seasonality/Annually')
-        os.mkdir('EDA/Colinearity')
-        os.mkdir('EDA/Correlation/Auto')
-        os.mkdir('EDA/Correlation/Auto - Diff')
-        os.mkdir('EDA/Correlation/Cross')
-        os.mkdir('EDA/Correlation/Cross - Diff')
-        os.mkdir('EDA/NonLinear Correlation')
+        # Register data
+        self.data = data
+        self.output = output
+        self.seasonPeriods = seasonPeriods
+        self.lags = lags
+
+        # Run all functions
+        self.boxplots()
+        self.seasonality()
+        self.colinearity()
+        self.completeAutoCorr()
+        self.partialAutoCorr()
+        if self.output is not None:
+            self.crossCorr()
+            self.featureRanking()
+
+    def createDirs(self):
+        try:
+            os.mkdir('EDA')
+            os.mkdir('EDA/Boxplots')
+            os.mkdir('EDA/Colinearity')
+            os.mkdir('EDA/Lags')
+            os.mkdir('EDA/Correlation/ACF')
+            os.mkdir('EDA/Correlation/Cross')
+            os.mkdir('EDA/Correlation/PACF')
+            if self.output is not None:
+                os.mkdir('EDA/Correlation/Cross')
+                os.mkdir('EDA/NonLinear Correlation')
+        except:
+            print('Dirs existing')
 
 
+    def boxplots(self):
+        for key in self.data.keys():
+            fig = plt.figure(figsize=[24, 16])
+            plt.boxplot(self.data[key])
+            plt.title(key)
+            fig.savefig('EDA/Boxplots/' + key, format='png', dpi=300)
+            plt.close()
 
+    def seasonality(self):
+        for period in self.seasonPeriods:
+            os.mkdir('EDA/Seasonality/' + str(period))
+            for key in self.data.keys():
+                seasonality = STL(series, period=period)
+                fig = plt.figure(figsize=[24, 16])
+                plt.plot(range(len(series)), series)
+                plt.plot(range(len(series)), seasonality)
+                plt.title(key + ', period=' + str(period))
+                fig.savefig('EDA/Seasonality/'+str(period)+'/'+key, format='png', dpi=300)
+                plt.close()
+    def seasonality(self):
+        for period in self.seasonPeriods:
+            os.mkdir('EDA/Seasonality/' + str(period))
+            for key in self.data.keys():
+                seasonality = STL(series, period=period)
+                fig = plt.figure(figsize=[24, 16])
+                plt.plot(range(len(series)), series)
+                plt.plot(range(len(series)), seasonality)
+                plt.title(key + ', period=' + str(period))
+                fig.savefig('EDA/Seasonality/'+str(period)+'/'+key, format='png', dpi=300)
+                plt.close()
 
+    def colinearity(self):
+        fig = plt.figure(figsize=[24, 16])
+        sns.heatmap(self.data.corr(), annot=False, cmap='bwr')
+        fig.savefig('EDA/Colinearity/All_Features.png', format='png', dpi=300)
+        # Minimum representation
+        corr_mat = self.data.corr().abs()
+        upper = corr_mat.where(np.triu(np.ones(corr_mat.shape), k=1).astype(np.bool))
+        col_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
+        minimal_rep = self.data.drop(self.data[col_drop], axis=1)
+        fig = plt.figure(figsize=[24, 16])
+        sns.heatmap(minimal_rep.corr(), annot=False, cmap='bwr')
+        fig.savefig('EDA/Colinearity/Minimum_Representation.png', format='png', dpi=300)
 
+    def differencing(self):
+        max_lags = 4
+        varVec = np.zeros(max_lags)
+        diffData = self.data
+        for i in range(max_lags):
+            varVec[i] = diffData.var().mean()
+            diffData = diffData.diff(1)[1:]
+        fig = plt.figure(figsize=[24, 16])
+        plt.yscale('log')
+        plt.plot(varVec)
+        plt.title('Variance for different lags')
+        plt.xlabel('Lag')
+        plt.ylable('Average variance')
+        fig.savefig('EDA/Lags/Variance.png', format='png', dpi=300)
 
+    def completeAutoCorr(self):
+        file = open('EDA/Correlation/Readme.txt', 'wb')
+        file.write('Correlation Interpretation\n\n'
+                   'If the series has positive autocorrelations for a high number of lags,\n'
+                   'it probably needs a higher order of differencing. If the lag-1 autocorrelation\n'
+                   'is zero or negative, or the autocorrelations are small and patternless, then \n'
+                   'the series does not need a higher order of differencing. If the lag-1 autocorrleation\n'
+                   'is below -0.5, the series is likely to be overdifferenced. \n'
+                   'Optimum level of differencing is often where the variance is lowest. ')
+        file.close()
+        for key in self.data.keys():
+            fig = plt.figure(figsize=[24, 16])
+            plot_acf(self.data[keys])
+            plt.title(key)
+            fig.savefig('EDA/Correlation/Auto/' + key, format='png', dpi=300)
+            plt.close()
 
+    def partialAutoCorr(self):
+        for key in self.data.keys():
+            fig = plt.figure(figsize=[24, 16])
+            plot_pacf(self.data[keys])
+            fig.savefig('EDA/Correlation/PACF/' + key, format='png', dpi=300)
+            plt.title(key)
+            plt.close()
 
+    def crossCorr(self):
+        for key in self.data.keys():
+            fig = plt.figure(figsiz=[24, 16])
+            plt.xcorr(self.data[key], self.output, maxlags=self.lags)
+            plt.title(key)
+            fig.savefig('EDA/Correlation/Cross/' + key, format='png', dpi=300)
+            plt.close()
 
-
-
-
-
+    def featureRanking(self):
+        if set(self.output) == {1, -1}:
+            model = RandomForestClassifier().fit(self.data, self.output)
+        else:
+            model = RandomForestRegressor().fit(self.data, self.output)
+        fig = plt.figure(figsize=[24, 16])
+        ind = np.argsort(model.feature_importances_, reversed=True)
+        plt.bar(self.data.keys()[ind], model.feature_importances_[ind])
+        plt.xticks(rotation=60)
+        fig.savefig('EDA/Nonlinear Correlation/RF.png', format='png', dpi=300)
+        plt.close()
 
 
