@@ -212,7 +212,7 @@ class Stationarize(object):
 
 class ExploratoryDataAnalysis(object):
 
-    def __init__(self, data, pretag=None, output=None, maxSamples=10000, seasonPeriods=[24 * 60, 7 * 24 * 60], lags=60):
+    def __init__(self, data, differ=0, pretag=None, output=None, maxSamples=10000, seasonPeriods=[24 * 60, 7 * 24 * 60], lags=60):
         '''
         Doing all the fun EDA in an automized script :)
         :param data: Pandas Dataframe
@@ -221,6 +221,7 @@ class ExploratoryDataAnalysis(object):
         :param lags: Lags for (P)ACF and
         '''
         # Register data
+        self.differ = differ
         self.tag = pretag
         self.maxSamples = maxSamples
         self.data = data
@@ -232,13 +233,15 @@ class ExploratoryDataAnalysis(object):
         self.createDirs()
 
         # Run all functions
-        # print('Generating Timeplots')
-        # self.timeplots()
-        # print('Generating Boxplots')
-        # self.boxplots()
-        # # self.seasonality()
+        print('Generating Timeplots')
+        self.timeplots()
+        print('Generating Boxplots')
+        self.boxplots()
+        # self.seasonality()
         print('Generating Colinearity Plots')
         self.colinearity()
+        print('Generating Diff Var Plot')
+        self.differencing()
         print('Generating ACF Plots')
         self.completeAutoCorr()
         print('Generating PACF Plots')
@@ -311,32 +314,32 @@ class ExploratoryDataAnalysis(object):
 
     def differencing(self):
         max_lags = 4
-        varVec = np.zeros(max_lags)
-        diffData = self.data
+        varVec = np.zeros((max_lags, len(self.data.keys())))
+        diffData = self.data / np.sqrt(self.data.var())
         for i in range(max_lags):
-            varVec[i] = diffData.var().mean()
+            varVec[i, :] = diffData.var()
             diffData = diffData.diff(1)[1:]
         fig = plt.figure(figsize=[24, 16])
         plt.yscale('log')
         plt.plot(varVec)
         plt.title('Variance for different lags')
         plt.xlabel('Lag')
-        plt.ylable('Average variance')
+        plt.ylabel('Average variance')
         fig.savefig('EDA/Lags/'  + self.tag + 'Variance.png', format='png', dpi=300)
 
     def completeAutoCorr(self):
+        for i in range(self.differ):
+            self.data = self.data.diff(1)[1:]
         for key in self.data.keys():
-            fig = plt.figure(figsize=[24, 16])
-            plot_acf(self.data[key])
+            fig = plot_acf(self.data[key])
             plt.title(key)
-            fig.savefig('EDA/Correlation/ACF/' + self.tag + key + '.png', format='png', dpi=300)
+            fig.savefig('EDA/Correlation/ACF/' + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
             plt.close()
 
     def partialAutoCorr(self):
         for key in self.data.keys():
-            fig = plt.figure(figsize=[24, 16])
-            plot_pacf(self.data[keys])
-            fig.savefig('EDA/Correlation/PACF/' + self.tag + key + '.png', format='png', dpi=300)
+            fig = plot_pacf(self.data[key])
+            fig.savefig('EDA/Correlation/PACF/' + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
             plt.title(key)
             plt.close()
 
@@ -345,7 +348,7 @@ class ExploratoryDataAnalysis(object):
             fig = plt.figure(figsiz=[24, 16])
             plt.xcorr(self.data[key], self.output, maxlags=self.lags)
             plt.title(key)
-            fig.savefig('EDA/Correlation/Cross/' + self.tag + key + '.png', format='png', dpi=300)
+            fig.savefig('EDA/Correlation/Cross/' + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
             plt.close()
 
     def featureRanking(self):
