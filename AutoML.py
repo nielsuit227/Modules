@@ -263,7 +263,7 @@ class ExploratoryDataAnalysis(object):
             fig = plt.figure(figsize=[24, 16])
             plt.boxplot(self.data[key])
             plt.title(key)
-            fig.savefig('EDA/Boxplots/' + self.tag + key, format='png', dpi=300)
+            fig.savefig('EDA/Boxplots/' + self.tag + key + '.png', format='png', dpi=300)
             plt.close()
 
     def timeplots(self):
@@ -271,7 +271,7 @@ class ExploratoryDataAnalysis(object):
             fig = plt.figure(figsize=[24, 16])
             plt.plot(self.data[key])
             plt.title(key)
-            fig.savefig('EDA/Timeplots/' + self.tag + key, format='png', dpi=300)
+            fig.savefig('EDA/Timeplots/' + self.tag + key + '.png', format='png', dpi=300)
             plt.close()
 
     def seasonality(self):
@@ -282,7 +282,7 @@ class ExploratoryDataAnalysis(object):
                 plt.plot(range(len(self.data)), self.data[key])
                 plt.plot(range(len(self.data)), seasonality)
                 plt.title(key + ', period=' + str(period))
-                fig.savefig('EDA/Seasonality/' + self.tag + str(period)+'/'+key, format='png', dpi=300)
+                fig.savefig('EDA/Seasonality/' + self.tag + str(period)+'/'+key + '.png', format='png', dpi=300)
                 plt.close()
 
     def colinearity(self):
@@ -327,14 +327,14 @@ class ExploratoryDataAnalysis(object):
             fig = plt.figure(figsize=[24, 16])
             plot_acf(self.data[keys])
             plt.title(key)
-            fig.savefig('EDA/Correlation/Auto/' + self.tag + key, format='png', dpi=300)
+            fig.savefig('EDA/Correlation/Auto/' + self.tag + key + '.png', format='png', dpi=300)
             plt.close()
 
     def partialAutoCorr(self):
         for key in self.data.keys():
             fig = plt.figure(figsize=[24, 16])
             plot_pacf(self.data[keys])
-            fig.savefig('EDA/Correlation/PACF/' + self.tag + key, format='png', dpi=300)
+            fig.savefig('EDA/Correlation/PACF/' + self.tag + key + '.png', format='png', dpi=300)
             plt.title(key)
             plt.close()
 
@@ -343,7 +343,7 @@ class ExploratoryDataAnalysis(object):
             fig = plt.figure(figsiz=[24, 16])
             plt.xcorr(self.data[key], self.output, maxlags=self.lags)
             plt.title(key)
-            fig.savefig('EDA/Correlation/Cross/' + self.tag + key, format='png', dpi=300)
+            fig.savefig('EDA/Correlation/Cross/' + self.tag + key + '.png', format='png', dpi=300)
             plt.close()
 
     def featureRanking(self):
