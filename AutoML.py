@@ -331,14 +331,14 @@ class ExploratoryDataAnalysis(object):
         for i in range(self.differ):
             self.data = self.data.diff(1)[1:]
         for key in self.data.keys():
-            fig = plot_acf(self.data[key])
+            fig = plot_acf(self.data[key], fft=True)
             plt.title(key)
             fig.savefig('EDA/Correlation/ACF/' + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
             plt.close()
 
     def partialAutoCorr(self):
         for key in self.data.keys():
-            fig = plot_pacf(self.data[key])
+            fig = plot_pacf(self.data[key], fft=True)
             fig.savefig('EDA/Correlation/PACF/' + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
             plt.title(key)
             plt.close()
