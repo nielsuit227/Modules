@@ -7,8 +7,6 @@ from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 import matplotlib
-matplotlib.use('Agg')
-matplotlib.rcParams['agg.path.chunksize'] = 1000000
 
 
 class Preprocessing(object):
@@ -165,9 +163,82 @@ class Stationarize(object):
         self.fraction = fraction
         self.lagCutOff = lagCutOff
         self.sequence = sequence
+        self.forward = None
+        self.backward = None
         standardizationTypes = ['differ', 'logdiffer', 'fractional', 'rollingstart', 'rollingend']
         if type not in standardizationTypes:
             raise ValueError('Type not implemented. Should be in ' + str(standardizationTypes))
+
+
+    def sequenceConvert(self, input, output, back=[0], forward=[0]):
+        '''
+
+        :param input: input data
+        :param output: output data
+        :param back: which samples are fed as descriptors
+        :param forward: which samples do we need to predict
+        :return: differenced input/output in sequence. Output (samples, back, features), input (samples, prediction)
+        '''
+        if type(back) == int:
+            back = [back]
+        if type(forward) == int:
+            forward = [forward]
+        self.backward = np.array([int(x) for x in back])
+        self.forward = np.array([int(x) for x in forward])
+
+        max_back = max(self.backward)
+        n_features = input.shape[1]
+        n_samples = int(len(output) - max(self.backward) - max(self.forward))
+
+        input_sequence = np.zeros((n_samples, len(self.backward), n_features))
+        output_sequence = np.zeros((n_samples, len(self.forward)))
+
+        if self.type == 'differ':
+            n_samples -= 1
+            input_sequence = np.zeros((n_samples, len(self.backward), n_features))
+            output_sequence = np.zeros((n_samples, len(self.forward)))
+            for i in range(n_samples):
+                input_sequence[i] = input[i + self.backward + 1] - input[i + self.backward]
+                output_sequence[i] = output[i + self.forward + 1 + max_back] - output [i + self.forward + max_back]
+
+        elif self.type == 'logdiffer':
+            if (np.min(input) < 0).any()  or (np.min(output) < 0).any():
+                raise ValueError('Cannot take log of a negative value, ensure positive data')
+            input = np.log(input)
+            output = np.log(output)
+            n_samples -= 1
+            input_sequence = np.zeros((n_samples, len(self.backward), n_features))
+            output_sequence = np.zeros((n_samples, len(self.forward)))
+            for i in range(n_samples):
+                input_sequence[i] = input[i + self.backward + 1] - input[i + self.backward]
+                output_sequence[i] = output[i + 1 + max_back + self.forward] - output [i + max_back + self.forward]
+
+        elif self.type == 'fractional':
+            input_residual = 0
+            output_residual = 0
+            weights = self.getFractionalWeights(self.fraction)
+            for k in range(self.lagCutOff):
+                shifted = np.roll(input, k)
+                shifted[:k] = 0
+                input_residual += weights[k] * shifted
+                shifted = np.roll(output, k)
+                shifted[:k] = 0
+                output_residual += weights[k] * shifted
+            for i in range(n_samples):
+                input_sequence[i] = input_residual[i + self.backward]
+                output_sequence[i] = output_residual[i + self.forward + max_back]
+
+        elif self.type == 'rollingstart':
+            for i in range(n_samples):
+                input_sequence[i] = input[i + self.backward] - input[i]
+                output_sequence[i]  = output[i + max_back + self.forward] - output[i + max_back]
+
+        elif self.type == 'rollingend':
+            for i in range(n_samples):
+                input_sequence[i] = input[i + self.backward] - input[i + max_back]
+                output_sequence[i]  = output[i + max_back + self.forward] - output[i + max_back]
+
+        return input_sequence, output_sequence
 
 
     def convert(self, data):
@@ -182,9 +253,11 @@ class Stationarize(object):
             return np.log(data).diff()[1:]
         elif self.type == 'fractional':
             res = 0
-            weights = self.getFractionalWeights()
+            weights = self.getFractionalWeights(self.fraction)
             for k in range(self.lagCutOff):
-                res += weights[k] * data.shift(k).fillna(0)
+                shifted = np.roll(output, k)
+                shifted[:k] = 0
+                res += weights[k] * shifted
             return res[self.lagCutOff:]
         elif self.type == 'rollingstart':
             nSamples = len(data) - self.sequence
@@ -200,14 +273,41 @@ class Stationarize(object):
             return seqX
 
 
-    def getFractionalWeights(self):
+    def recreateOutput(self, output, initial):
+        if self.type == 'differ':
+            return np.vstack((initial, initial + np.cumsum(output, axis=0)))
+        elif self.type == 'logdiffer':
+            return np.vstack((initial, np.exp(np.log(initial) + np.cumsum(output, axis=0))))
+        elif self.type == 'fractional':
+            weights = self.getFractionalWeights(-self.fraction)
+            res = 0
+            for k in range(self.lagCutOff):
+                shifted = np.roll(output, k, axis=0)
+                shifted[:k] = 0
+                res += weights[k] * shifted
+            return np.hstack((initial, initial + res))
+        elif self.type[:7] == 'rolling':
+            if 1 not in self.forward:
+                raise ValueError('To recreate rolling differenced signal, "1" needs to be within forward')
+            indOne = np.where(self.forward == 1)[0][0]
+            res = np.zeros_like(output)
+            res[:, indOne] = initial + np.cumsum(output[:, indOne])
+            original = res[:, indOne] - output[:, indOne]
+            for i, ind in enumerate(self.forward):
+                if ind == 1:
+                    continue
+                res[:, i] = original + output[:, i]
+            return res
+
+
+    def getFractionalWeights(self, fraction):
         '''
         Internal function what gets the weights of fractional differencing.
         :return: weights.
         '''
         w = [1]
         for k in range(1, self.lagCutOff):
-            w.append(-w[-1] * (self.fractional - k + 1) / k)
+            w.append(-w[-1] * (fraction - k + 1) / k)
         return np.array(w).reshape((-1))
 
 class ExploratoryDataAnalysis(object):
@@ -221,6 +321,8 @@ class ExploratoryDataAnalysis(object):
         :param lags: Lags for (P)ACF and
         '''
         # Register data
+        matplotlib.use('Agg')
+        matplotlib.rcParams['agg.path.chunksize'] = 1000000
         self.differ = differ
         self.tag = pretag
         self.maxSamples = maxSamples
@@ -363,4 +465,20 @@ class ExploratoryDataAnalysis(object):
         fig.savefig('EDA/Nonlinear Correlation/' + self.tag + 'RF.png', format='png', dpi=300)
         plt.close()
 
+class Modelling(object):
 
+    def __init__(self):
+        print('To be implemented!')
+
+class Metrics(object):
+
+    def r2score(ytrue, ypred):
+        res = sum((ytrue - ypred) ** 2)
+        tot = sum((ytrue - np.mean(ytrue)) ** 2)
+        return 1 - res / tot
+
+    def mae(ytrue, ypred):
+        return np.mean(abs(ytrue - ypred))
+
+    def mse(ytrue, ypred):
+        return np.mean((ytrue - ypred) ** 2)
