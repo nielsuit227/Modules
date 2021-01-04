@@ -1,8 +1,10 @@
-import os
+import os, time, itertools
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+import sklearn
+from sklearn.model_selection import StratifiedKFold
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
@@ -151,9 +153,15 @@ class Normalize(object):
 
 class Stationarize(object):
 
-    def __init__(self, type='differ', fraction=0.5, lagCutOff=5, sequence=1):
+    def __init__(self, type='diff', fraction=0.5, lagCutOff=25, sequence=1):
         '''
-        Initialize the stationarizing function.
+        Stationarizing class.
+        Init defines the stationarization.
+        Convert converts the actual in & output data
+        Revert reverts the data back to the original.
+        If the data needs sequencing too, first stationarize, then sequence, then revert here.
+
+
         :param type: Type of stationarization, options: 'differ', 'logdiffer', 'fractional', 'rollingstart', 'rollingend'
         :param fraction: if type='fractional', the fraction of fractional differencing
         :param lagCutOff: type='fractional' results in infinite decaying weights, which are cutoff by lagCutOff.
@@ -165,12 +173,17 @@ class Stationarize(object):
         self.sequence = sequence
         self.forward = None
         self.backward = None
-        standardizationTypes = ['differ', 'logdiffer', 'fractional', 'rollingstart', 'rollingend']
+        standardizationTypes = ['diff', 'logdiff', 'frac']
         if type not in standardizationTypes:
             raise ValueError('Type not implemented. Should be in ' + str(standardizationTypes))
+    '''
+    should probably be merged with Sequence
+    options:
+    - sequenced input
+    - sequenced output
+    '''
 
-
-    def sequenceConvert(self, input, output, back=[0], forward=[0]):
+    def convert(self, input, output):
         '''
 
         :param input: input data
@@ -179,125 +192,81 @@ class Stationarize(object):
         :param forward: which samples do we need to predict
         :return: differenced input/output in sequence. Output (samples, back, features), input (samples, prediction)
         '''
-        if type(back) == int:
-            back = [back]
-        if type(forward) == int:
-            forward = [forward]
-        self.backward = np.array([int(x) for x in back])
-        self.forward = np.array([int(x) for x in forward])
-
-        max_back = max(self.backward)
-        n_features = input.shape[1]
-        n_samples = int(len(output) - max(self.backward) - max(self.forward))
-
-        input_sequence = np.zeros((n_samples, len(self.backward), n_features))
-        output_sequence = np.zeros((n_samples, len(self.forward)))
-
-        if self.type == 'differ':
-            n_samples -= 1
-            input_sequence = np.zeros((n_samples, len(self.backward), n_features))
-            output_sequence = np.zeros((n_samples, len(self.forward)))
-            for i in range(n_samples):
-                input_sequence[i] = input[i + self.backward + 1] - input[i + self.backward]
-                output_sequence[i] = output[i + self.forward + 1 + max_back] - output [i + self.forward + max_back]
-
-        elif self.type == 'logdiffer':
-            if (np.min(input) < 0).any()  or (np.min(output) < 0).any():
-                raise ValueError('Cannot take log of a negative value, ensure positive data')
-            input = np.log(input)
-            output = np.log(output)
-            n_samples -= 1
-            input_sequence = np.zeros((n_samples, len(self.backward), n_features))
-            output_sequence = np.zeros((n_samples, len(self.forward)))
-            for i in range(n_samples):
-                input_sequence[i] = input[i + self.backward + 1] - input[i + self.backward]
-                output_sequence[i] = output[i + 1 + max_back + self.forward] - output [i + max_back + self.forward]
-
-        elif self.type == 'fractional':
-            input_residual = 0
-            output_residual = 0
+        self.input = input
+        self.output = output
+        if input.ndim == 1:
+            self.input = input.reshape((-1, 1))
+        if output.ndim == 1:
+            self.output = output.reshape((-1, 1))
+        if self.type == 'diff':
+            inputDiff = np.diff(input, axis=0)
+            outputDiff = np.diff(output, axis=0)
+        elif self.type == 'logdiff':
+            if np.min(input) <= 0 and np.min(output) <= 0:
+                raise ValueError('For Logarithmic Differencing, data cannot be smaller than zero')
+            elif np.min(input) <= 0:
+                raise Warning('Input neglected, smaller than zero.')
+                inputDiff = input
+                outputDiff = np.diff(np.log(output), axis=0)
+            elif np.min(output) <= 0:
+                raise Warning('Output neglected, smaller than zero.')
+                inputDiff = np.diff(np.log(input), axis=0)
+                outputDiff = output
+            else:
+                inputDiff = np.diff(np.log(input), axis=0)
+                outputDiff = np.diff(np.log(output), axis=0)
+        elif self.type == 'frac':
+            inputDiff = 0
+            outputDiff = output
             weights = self.getFractionalWeights(self.fraction)
             for k in range(self.lagCutOff):
                 shifted = np.roll(input, k)
                 shifted[:k] = 0
-                input_residual += weights[k] * shifted
-                shifted = np.roll(output, k)
-                shifted[:k] = 0
-                output_residual += weights[k] * shifted
-            for i in range(n_samples):
-                input_sequence[i] = input_residual[i + self.backward]
-                output_sequence[i] = output_residual[i + self.forward + max_back]
-
-        elif self.type == 'rollingstart':
-            for i in range(n_samples):
-                input_sequence[i] = input[i + self.backward] - input[i]
-                output_sequence[i]  = output[i + max_back + self.forward] - output[i + max_back]
-
-        elif self.type == 'rollingend':
-            for i in range(n_samples):
-                input_sequence[i] = input[i + self.backward] - input[i + max_back]
-                output_sequence[i]  = output[i + max_back + self.forward] - output[i + max_back]
-
-        return input_sequence, output_sequence
+                inputDiff += weights[k] * shifted
+        return inputDiff, outputDiff
 
 
-    def convert(self, data):
+    def revert(self, differenced, original=None, comparison=None, back=0, forward=0):
         '''
-        Function that does the actual conversion.
-        :param data: Pandas Dataframe.
-        :return:
+        Revert differencing, based on last convert!
+
+        :param differenced: The differenced & sequenced output data
+        :param original: The original output data
+        :return: The sequenced, UNdifferenced data
         '''
-        if self.type == 'differ':
-            return data.diff()[1:]
-        elif self.type == 'logdiffer':
-            return np.log(data).diff()[1:]
-        elif self.type == 'fractional':
-            res = 0
-            weights = self.getFractionalWeights(self.fraction)
-            for k in range(self.lagCutOff):
-                shifted = np.roll(output, k)
-                shifted[:k] = 0
-                res += weights[k] * shifted
-            return res[self.lagCutOff:]
-        elif self.type == 'rollingstart':
-            nSamples = len(data) - self.sequence
-            seqX = np.zeros((nSamples, self.sequence, len(data.keys())))
-            for i in range(nSamples):
-                seqX[i] = data.iloc[i:i + self.sequence].to_numpy() - data.iloc[i]
-            return seqX
-        elif self.type == 'rollingend':
-            nSamples = len(data) - self.sequence
-            seqX = np.zeros((nSamples, self.sequence, len(data.keys())))
-            for i in range(nSamples):
-                seqX[i] = data.iloc[i:i + self.sequence].to_numpy() - data.iloc[i + self.sequence]
-            return seqX
-
-
-    def recreateOutput(self, output, initial):
-        if self.type == 'differ':
-            return np.vstack((initial, initial + np.cumsum(output, axis=0)))
-        elif self.type == 'logdiffer':
-            return np.vstack((initial, np.exp(np.log(initial) + np.cumsum(output, axis=0))))
-        elif self.type == 'fractional':
-            weights = self.getFractionalWeights(-self.fraction)
-            res = 0
-            for k in range(self.lagCutOff):
-                shifted = np.roll(output, k, axis=0)
-                shifted[:k] = 0
-                res += weights[k] * shifted
-            return np.hstack((initial, initial + res))
-        elif self.type[:7] == 'rolling':
-            if 1 not in self.forward:
-                raise ValueError('To recreate rolling differenced signal, "1" needs to be within forward')
-            indOne = np.where(self.forward == 1)[0][0]
-            res = np.zeros_like(output)
-            res[:, indOne] = initial + np.cumsum(output[:, indOne])
-            original = res[:, indOne] - output[:, indOne]
-            for i, ind in enumerate(self.forward):
-                if ind == 1:
-                    continue
-                res[:, i] = original + output[:, i]
-            return res
+        if differenced.ndim == 1:
+            if self.type == 'diff':
+                return np.hstack((original[0], original[:-forward] + differenced))
+            elif self.type == 'logdiff':
+                return np.hstack((original[0], np.exp(np.log(original[:-1]) + differenced)))
+            elif self.type == 'frac':
+                weights = self.getFractionalWeights(-self.fraction)
+                res = 0
+                for k in range(self.lagCutOff):
+                    shifted = np.hstack((comparison[:k+1], differenced[k:]))
+                    shifted = np.roll(shifted, k, axis=0)
+                    shifted[:k] = 0
+                    res += weights[k] * shifted
+                return res
+        else:
+            reverted = np.zeros_like(differenced)
+            if self.type == 'diff':
+                for i in range(forward):
+                    reverted[:, i] = original[back-1:-forward-1].reshape((-1)) + np.sum(differenced[:, :i+1], axis=1)
+                return reverted
+            elif self.type == 'logdiff':
+                for i in range(forward):
+                    reverted[:, i] = np.exp(np.log(original[back-1:-forward-1]) + np.sum(differenced[:, :i+1], axis=1))
+                return reverted
+            elif self.type == 'frac':
+                raise ValueError('Fractional Integrating is incredibly hard')
+                # weights = self.getFractionalWeights(-self.fraction)
+                # for k in range(self.lagCutOff):
+                #     shifted = np.vstack((comparison[:k + 1], differenced[k:]))
+                #     shifted = np.roll(shifted, k, axis=0)
+                #     shifted[:k] = 0
+                #     reverted += weights[k] * shifted
+            # return reverted
 
 
     def getFractionalWeights(self, fraction):
@@ -334,6 +303,8 @@ class ExploratoryDataAnalysis(object):
         # Create dirs
         self.createDirs()
 
+
+    def run(self):
         # Run all functions
         print('Generating Timeplots')
         self.timeplots()
@@ -473,12 +444,181 @@ class Modelling(object):
 class Metrics(object):
 
     def r2score(ytrue, ypred):
+        ytrue = ytrue.reshape((-1))
+        ypred = ypred.reshape((-1))
         res = sum((ytrue - ypred) ** 2)
         tot = sum((ytrue - np.mean(ytrue)) ** 2)
         return 1 - res / tot
 
     def mae(ytrue, ypred):
+        ytrue = ytrue.reshape((-1))
+        ypred = ypred.reshape((-1))
         return np.mean(abs(ytrue - ypred))
 
     def mse(ytrue, ypred):
+        ytrue = ytrue.reshape((-1))
+        ypred = ypred.reshape((-1))
         return np.mean((ytrue - ypred) ** 2)
+
+class Sequence(object):
+
+    def __init__(self, back=1, forward=1, shift=0, diff='none'):
+        '''
+        Sequencer. Sequences and differnces data.
+        Scenarios:
+        - Sequenced I/O                     --> back & forward in int or list of ints
+        - Sequenced input, single output    --> back: int, forward: list of ints
+        - Single input, single output       --> back & forward = 1
+
+
+        :param back: Int or List[int]: input indices to include
+        :param forward: Int or List[int]: output indices to include
+        :param shift: Int: If there is a shift between input and output
+        :param diff: differencing algo, pick between 'none', 'diff', 'logdiff', 'frac' (no revert)
+        '''
+        if type(back) == int:
+            back = np.linspace(0, back-1, back).astype('int')
+            self.inputDtype = 'int'
+        elif type(back) == list:
+            back = np.array(back)
+            self.inputDtype = 'list'
+        else:
+            raise ValueError('Back needs to be int or list(int)')
+        if type(forward) == int:
+            self.outputDtype = 'int'
+            forward = np.linspace(1, forward, forward).astype('int')
+        elif type(forward) == list:
+            self.outputDtype = 'list'
+            forward = np.array(forward)
+        else:
+            raise ValueError('Forward needs to be int or list(int)')
+        self.backVec = back
+        self.foreVec = forward
+        self.nback = len(back)
+        self.nfore = len(forward)
+        self.foreRoll = np.roll(self.foreVec, 1)
+        self.foreRoll[0] = 0
+        self.mback = max(back)
+        self.mfore = max(forward)
+        self.shift = shift
+        self.diff = diff
+        self.samples = 1
+        if diff != 'none':
+            self.samples = 0
+            self.nback -= 1
+        if diff not in ['none', 'diff', 'logdiff', 'frac']:
+            raise ValueError('Type should be in [None, diff, logdiff, frac]')
+
+
+    def convert(self, input, output):
+        if input.ndim == 1:
+            input = input.reshape((-1, 1))
+        if output.ndim == 1:
+            output = output.reshape((-1, 1))
+        samples = len(input) - self.mback - self.mfore - self.shift + self.samples
+        features = len(input[0])
+        input_sequence = np.zeros((samples, self.nback, features))
+        output_sequence = np.zeros((samples, self.nfore))
+        if self.diff == 'none':
+            for i in range(samples):
+                input_sequence[i] = input[i + self.backVec]
+                output_sequence[i] = output[i - 1 + self.mback + self.shift + self.foreVec].reshape((-1))
+            return input_sequence, output_sequence
+        elif self.diff[-4:] == 'diff':
+            if self.diff == 'logdiff':
+                input = np.log(input)
+                output = np.log(output)
+            if (self.backVec == 0).all():
+                self.backVec = np.array([0, 1])
+            for i in range(samples):
+                input_sequence[i] = input[i + self.backVec[1:]] - input[i + self.backVec[:-1]]
+                output_sequence[i] = (output[i + self.mback + self.shift + self.foreVec] -
+                                      output[i + self.mback + self.shift + self.foreRoll]).reshape((-1))
+            return input_sequence, output_sequence
+
+
+    def revert(self, differenced, original):
+        if self.nfore == 1:
+            differenced = differenced.reshape((-1, 1))
+        output = np.zeros_like(differenced)
+        if self.diff == 'logdiff':
+            for i in range(self.nfore):
+                output[:, i] = np.log(original[self.mback + self.foreRoll[i]:-self.foreVec[i]]) + differenced[:, i]
+            return np.exp(output)
+        if self.diff == 'diff':
+            for i in range(self.nfore):
+                output[:, i] = original[self.mback + self.foreRoll[i]:-self.foreVec[i]] + differenced[:, i]
+            return output
+
+class GridSearch(object):
+
+    def __init__(self, model, params, cv=None, scoring=Metrics.r2score):
+        self.parsed_params = []
+        self.result = []
+        self.model = model
+        self.params = params
+        if cv == None:
+            self.cv = StratifiedKFold(n_splits=3)
+        else:
+            self.cv = cv
+        self.scoring = scoring
+        self._parse_params()
+
+        if scoring == Metrics.r2score:
+            self.best = [-np.inf, 0]
+        else:
+            self.best = [np.inf, 0]
+
+    def _parse_params(self):
+        k, v = zip(*self.params.items())
+        self.parsed_params = [dict(zip(k, v)) for v in itertools.product(*self.params.values())]
+        print('\n*** Grid Search ***')
+        print('%i folds with %i parameter combinations, %i runs.' % (
+            self.cv.n_splits,
+            len(self.parsed_params),
+            len(self.parsed_params) * self.cv.n_splits))
+
+
+    def fit(self, input, output):
+        for i, param in enumerate(self.parsed_params):
+            print('\n', param)
+            scoring = []
+            timing = []
+            for train_ind, val_ind in self.cv.split(input):
+                # Start Timer
+                t = time.time()
+
+                # Split data
+                xtrain, xval = input[train_ind], input[val_ind]
+                ytrain, yval = output[train_ind], output[val_ind]
+
+                # Model training
+                model = sklearn.base.clone(self.model, safe=True)
+                model.set_params(**param)
+                model.fit(xtrain, ytrain)
+                scoring.append(self.scoring(model.predict(xval), yval))
+                timing.append(time.time() - t)
+            if self.scoring == Metrics.r2score:
+                if np.mean(scoring) > self.best[0]:
+                    self.best = [np.mean(scoring), np.std(scoring)]
+            else:
+                if np.mean(scoring) <= self.best[0]:
+                    self.best = [np.mean(scoring), np.std(scoring)]
+            print('Score: %.1f \u00B1 %.1f (in %.1f seconds) (Best score so-far: %.1f \u00B1 %.1f) (%i / %i)' %
+                  (np.mean(scoring), np.std(scoring), np.mean(timing), self.best[0], self.best[1], i, len(self.parsed_params)))
+            self.result.append({
+                'scoring': scoring,
+                'mean_score': np.mean(scoring),
+                'std_score': np.std(scoring),
+                'time': timing,
+                'mean_time': np.mean(timing),
+                'std_time': np.std(timing),
+                'params': param
+            })
+        return pd.DataFrame(self.result)
+
+
+
+
+
+
