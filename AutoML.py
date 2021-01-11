@@ -1,4 +1,4 @@
-import os, time, itertools
+import os, time, itertools, re
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -71,7 +71,7 @@ class Preprocessing(object):
         # Clean keys
         newKeys = {}
         for key in data.keys():
-            newKeys[key] = key.lower().replace('.', '_').replace('/', '_')
+            newKeys[key] = re.sub('[^a-zA-Z0-9 \n\.]', '_', key.lower())
         data = data.rename(columns=newKeys)
 
         # Convert dtypes
