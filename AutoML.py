@@ -2,13 +2,18 @@ import os, time, itertools, re
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from datetime import datetime
 import matplotlib.pyplot as plt
+
 import sklearn
 from sklearn.model_selection import StratifiedKFold
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+
 from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-import matplotlib
+
+# todo multiprocessing for EDA RF, GridSearch
+# todo flat=bool for sequence (needed for lightGBM)
 
 
 class Preprocessing(object):
@@ -424,15 +429,16 @@ class ExploratoryDataAnalysis(object):
             fig.savefig('EDA/Correlation/Cross/' + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
             plt.close()
 
-    def featureRanking(self):
+    def featureRanking(self, args={}):
         if set(self.output) == {1, -1}:
-            model = RandomForestClassifier().fit(self.data, self.output)
+            model = RandomForestClassifier(**args).fit(self.data, self.output)
         else:
-            model = RandomForestRegressor().fit(self.data, self.output)
+            model = RandomForestRegressor(**args).fit(self.data, self.output)
         fig = plt.figure(figsize=[24, 16])
-        ind = np.argsort(model.feature_importances_, reversed=True)
-        plt.bar(self.data.keys()[ind], model.feature_importances_[ind])
+        ind = np.flip(np.argsort(model.feature_importances_))
+        plt.bar(range(max(ind) + 1), height=model.feature_importances_)
         plt.xticks(rotation=60)
+        np.save('EDA/Nonlinear Correlation/' + self.tag + '.npy', model.feature_importances_)
         fig.savefig('EDA/Nonlinear Correlation/' + self.tag + 'RF.png', format='png', dpi=300)
         plt.close()
 
@@ -442,6 +448,19 @@ class Modelling(object):
         print('To be implemented!')
 
 class Metrics(object):
+
+    def norm_r2(ytrue, ypred, yshift):
+        ytrue = ytrue.reshape((-1))
+        ypred = ypred.reshape((-1))
+        yshift = yshift.reshape((-1))
+        # Shifted R2
+        res = sum((ytrue - yshift) ** 2)
+        tot = sum((yshift - np.mean(ytrue)) ** 2)
+        shift_r2 = 1 - res / tot
+        # Pred R2
+        res = sum((ytrue - ypred) ** 2)
+        tot = sum((ytrue - np.mean(ytrue)) ** 2)
+        r2 = 1 - res / tot
 
     def r2score(ytrue, ypred):
         ytrue = ytrue.reshape((-1))
@@ -477,7 +496,7 @@ class Sequence(object):
         :param diff: differencing algo, pick between 'none', 'diff', 'logdiff', 'frac' (no revert)
         '''
         if type(back) == int:
-            back = np.linspace(0, back-1, back).astype('int')
+            back = np.linspace(0, back, back+1).astype('int')
             self.inputDtype = 'int'
         elif type(back) == list:
             back = np.array(back)
@@ -498,8 +517,8 @@ class Sequence(object):
         self.nfore = len(forward)
         self.foreRoll = np.roll(self.foreVec, 1)
         self.foreRoll[0] = 0
-        self.mback = max(back)
-        self.mfore = max(forward)
+        self.mback = max(back) - 1
+        self.mfore = max(forward) - 1
         self.shift = shift
         self.diff = diff
         self.samples = 1
@@ -580,8 +599,9 @@ class GridSearch(object):
 
 
     def fit(self, input, output):
+        print('\n')
         for i, param in enumerate(self.parsed_params):
-            print('\n', param)
+            print(param)
             scoring = []
             timing = []
             for train_ind, val_ind in self.cv.split(input):
@@ -599,13 +619,13 @@ class GridSearch(object):
                 scoring.append(self.scoring(model.predict(xval), yval))
                 timing.append(time.time() - t)
             if self.scoring == Metrics.r2score:
-                if np.mean(scoring) > self.best[0]:
+                if np.mean(scoring) - np.std(scoring) > self.best[0] - self.best[1]:
                     self.best = [np.mean(scoring), np.std(scoring)]
             else:
-                if np.mean(scoring) <= self.best[0]:
+                if np.mean(scoring) + np.std(scoring) <= self.best[0] + self.best[1]:
                     self.best = [np.mean(scoring), np.std(scoring)]
-            print('Score: %.1f \u00B1 %.1f (in %.1f seconds) (Best score so-far: %.1f \u00B1 %.1f) (%i / %i)' %
-                  (np.mean(scoring), np.std(scoring), np.mean(timing), self.best[0], self.best[1], i, len(self.parsed_params)))
+            print('[%s] Score: %.1f \u00B1 %.1f (in %.1f seconds) (Best score so-far: %.1f \u00B1 %.1f) (%i / %i)' %
+                  (datetime.now().stftime('%H:%M'), np.mean(scoring), np.std(scoring), np.mean(timing), self.best[0], self.best[1], i, len(self.parsed_params)))
             self.result.append({
                 'scoring': scoring,
                 'mean_score': np.mean(scoring),
@@ -616,6 +636,66 @@ class GridSearch(object):
                 'params': param
             })
         return pd.DataFrame(self.result)
+
+
+class LSTM(object):
+
+    def __init__(self, dense=[1], stacked=[100, 100], bidirectional=False,
+                 conv=False, conv_filters=64, conv_kernel_size=1, conv_pool_size=2, conv_seq=2,
+                 dropout=False, dropout_frac=0.1,
+                 regularization=1e-4, activation='tanh', loss='mse', lstm_input=None,
+                 optimizers=None, epochs=50, batch_size=256, shuffle=True, early_stopping=None):
+        from keras.models import Sequential
+        from keras.layers import LSTM, Dense, Bidirectional, TimeDistributed, convolutional, Flatten
+        from keras import optimizers, regularizers
+        try:
+            self.model = Sequential()
+            if conv:
+                i, j = lstm_input
+                self.model.add(TimeDistributed(convolutional.Conv1D(
+                    filters=conv_filters,
+                    kernel_size=conv_kernel_size,
+                    activation=activation
+                ), input_shape=conv_input))
+                self.model.add(TimeDistributed(convolutional.MaxPooling1D(pool_size=(None, int(i / conv_seq), j))))
+                self.model.add(TimeDistributed(Flatten()))
+            if bidirectional:
+                self.model.add(Bidirectional(LSTM(stacked[0], activation=activation), input_shape=lstm_input))
+                for i in range(len(stacked)-1):
+                    self.model.add(LSTM(stacked[i+1], activation=activation))
+            else:
+                self.model.add(LSTM(stacked[0], activation=activation), input_shape=lstm_input)
+                for i in range(len(stacked)-1):
+                    self.model.add(LSTM(stacked[i+1], activation=activation))
+            for dense_layer in dense:
+                self.model.add(Dense(dense_layer))
+            self.model.compile(optimizers=optimizers, loss=loss)
+
+            self.epochs = epochs
+            self.batch_size = batch_size
+            self.shuffle = shuffle
+            self.callbacks = early_stopping
+            return self.model
+        except Exception as e:
+            print(e)
+
+
+    def set_param(self, params):
+        self.__init__(**params)
+
+
+    def fit(self, input, output):
+        self.model.fit(input, output,
+                       epochs=self.epochs,
+                       batch_size=self.batch_size,
+                       shuffle=self.shuffle,
+                       callbacks=self.callbacks)
+        return self.model
+
+
+    def predict(self, input):
+        return self.model.predict(input)
+
 
 
 
