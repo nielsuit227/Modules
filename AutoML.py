@@ -14,14 +14,13 @@ from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 # todo multiprocessing for EDA RF, GridSearch
+# todo seq with pandas
 # todo flat=bool for sequence (needed for lightGBM)
 # todo implement PPS in EDA
-# todo implement Feature Extraction (upon Feature Importance / PPS)
+# todo implement SHAP in EDA
+# todo EDA to pandas
 # todo implement autoencoder for Feature Extraction
 
-# todo make pipeline of feature extraction / selection
-# todo Feature Extraction based on Feature Importance / PPS
-# todo Determine Differencing based on variance
 # todo Determine Lag based on Auto/Cross Correlations
 
 class Pipeline(object):
@@ -29,62 +28,107 @@ class Pipeline(object):
                  max_lags=15,
                  info_threshold=0.9,
                  max_diff=1,
-                 shift=0):
+                 shift=[0]):
+        print('\n\n*** Start Amplo PM Model Builder ***\n\n')
+        assert type(target) == str;
+        assert type(shift) == list;
+        assert type(info_threshold) == float;
+        assert type(max_diff) == int;
+        assert max_lags < 50;
+        assert info_threshold > 0 and info_threshold < 1;
+        assert max_diff < 5;
+        assert max(shift) >= 0 and min(shift) < 50;
         self.target = target
         self.max_lags = max_lags
         self.info_threshold = info_threshold
         self.max_diff = max_diff
-        self.shift = self.shift
+        self.shift = shift
         self.catKeys = []
         self.dateKeys = []
-        self.mean = []
-        self.var = []
+        self.norm = Normalize(type='minmax')
+        self.prep = None
+        self.seq = None
+        self.diff = 'none'
         self.diffOrder = 0
+        self.classification = False
+        self.regression = True
 
     def fit(self, data):
+        # Check whether is classification
+        if len(set(data[self.target])) == 2:
+            self.classification = True
+            self.regression = False
+
         # Identify Categorical & Datetime Columns
-        self.catkeys = list(data.keys()[data.dtypes == object])
+        self.catKeys = list(data.keys()[data.dtypes == object])
         self.dateKeys = list(data.keys()[[pd.to_datetime(val) >
                                      pd.to_datetime('2000-01-01')
                                      for val in data.iloc[10]]])
+        nCat = len(self.catKeys)
+        nDate = len(self.dateKeys)
+        nNum = len(data.keys()) - nCat - nDate
+        print('Found %i categorical, %i date and %i numerical variables.' %
+              (nCat, nDate, nNum))
 
         # Clean
-        prep = Preprocessing(missingValues='interpolate',
+        self.prep = Preprocessing(missingValues='interpolate',
                              datesCols=self.dateKeys,
-                             stringCols=self.catkeys)
-        data = prep.clean(data)
+                             stringCols=self.catKeys)
+        data = self.prep.clean(data)
 
         # Normalize
-        self.mean = data.mean()
-        self.std = data.std()
-        data -= self.mean
-        data /= self.std
+        data = self.norm.convert(data)
 
-        # Stationarize
-        varVec = np.zeros((self.max_diff + 1, len(self.data.keys())))
+        # Stationarity Check
+        varVec = np.zeros((self.max_diff + 1, len(data.keys())))
         diffData = data.copy(deep=True)
         for i in range(self.max_diff + 1):
             varVec[i, :] = diffData.std()
             diffData = diffData.diff(1)[1:]
         self.diffOrder = np.argmin(np.sum(varVec, axis=1))
-        for i in range(self.diffOrder):
-            data = data.diff(1)[1:]
+        if self.diffOrder == 0:
+            self.diff = 'none'
+        else:
+            self.diff = 'diff'
+        print('Applied Differencing order: %i' % self.diffOrder)
 
-        # Split input & output
-        output = data[self.target][self.shift:]
-        input = data[:self.shift]
-        if self.shift == 0:
-            input = data.drop([self.target], axis=1)
+        # Differencing, shifting, lagging
+        self.seq = Sequence(back=self.max_lags, forward=self.shift)
+        if self.shift != 0 and self.diffOrder != 0:
+            self.seq.diff = 'diff'
+            data, output = self.seq.convert_pandas(data, data[[self.target]])
+            data[self.target] = output
+        elif self.shift != 0:
+            data[self.target] = data[self.target].shift(-self.shift)
+            data = data.iloc[:-self.shift]
+        elif self.diffOrder != 0:
+            for i in range(self.diffOrder):
+                data = data.diff(1)[1:]
 
-        # Calculate Cross-Correlation to Input
-        # Determine Lags
-        # Calculate PPS
-        # Calculate Pearson
-        # Calculate RFFI
-        # Calculate SHAP Values
-        # Select Features
+        # Cross Correlation
+        # cors = np.zeros((self.max_lags, len(input.keys())))
+        # for i, key in enumerate(input.keys()):
+        #     for j, lag in enumerate(range(self.max_lags)):
+        #         cors[j, i] = np.correlate(input[key][:-1-j], output.iloc[j+1:])
+        #     cors[j, :] /= max(cors[j, :])
+
+        # Remove Colinearity
+        corr_mat = data.corr().abs()
+        upper = corr_mat.where(np.triu(np.ones(corr_mat.shape), k=1).astype(np.bool))
+        col_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
+        if self.target in col_drop:
+            col_drop.remove(self.target)
+        minimal_rep = self.data.drop(self.data[col_drop], axis=1)
+        print('Dropped %i Co-Linear variables.' % len(col_drop))
+
+        # Keep based on PPScore
+        pp_score = pps.score(lagged, self.target)
+        col_keep = pp_score[pp_score['ppscore'] >= 0.9]['x'].tolist()
+        input = lagged[col_keep]
 
         # Initial Modelling
+        init = Modelling(input,)
+
 
         # Hyperparameter Optimization
 
@@ -206,10 +250,6 @@ class Preprocessing(object):
             print('Saving to: ', self.outputPath + path)
             data.to_csv(self.outputPath + path, index=self.indexCol is not None)
         return data
-
-
-
-
 
 
 class Normalize(object):
@@ -422,14 +462,17 @@ class ExploratoryDataAnalysis(object):
 
 class Modelling(object):
 
-    def __init__(self):
-        print('To be implemented!')
+    def __init__(self, input, output, regression=False, classification=False):
+        if regression:
+            self.regression(input, output)
+        if classification:
+            self.classification(input, output)
 
-    def classification(self):
+    def classification(self, input, output):
         # LDA, QDA, LSVM, KNN, RBF SVM, DT, RF, ANN, LSTM, AdaBoost,
         return 0
 
-    def regression(self):
+    def regression(self, input, output):
         # Ridge, Lasso, SGD, KNN, DT, AdaBoost, GradBoost, RF, MLP, lightGBM, HistGradBoost, XG Boost, LSTM
         return 0
 
@@ -517,7 +560,7 @@ class Sequence(object):
             raise ValueError('Type should be in [None, diff, logdiff, frac]')
 
 
-    def convert_numpy(self, input, output):
+    def convert_numpy(self, input, output, flat=False):
         if input.ndim == 1:
             input = input.reshape((-1, 1))
         if output.ndim == 1:
@@ -543,23 +586,30 @@ class Sequence(object):
                                       output[i + self.mback + self.shift + self.foreRoll]).reshape((-1))
             return input_sequence, output_sequence
 
-    def convert(self, input, output):
+    def convert_pandas(self, input, output):
         assert len(input) == len(output)
-        samples = len(input) - self.mback - self.mfore - self.shift + self.samples
-        keys = input.keys()
-        features = len(keys)
-        # Create output DFs
-        inputKeys = []
-        outputKeys = []
-        for i in self.backVec:
-            [inputKeys.append(x + '_' + str(i)) for x in keys]
-        for i in self.foreVec:
-            [outputKeys.append(x + '_' + str(i)) for x in keys]
-        inputDF = pd.DataFrame(columns=inputKeys)
-        outputDF = pd.DataFrame(columns=outputKeys)
+        inputKeys = input.keys()
+        outputKeys = output.keys()
+        if self.diff == 'none':
+            for lag in self.backVec:
+                keys = [key + '_' + str(lag) for key in inputKeys]
+                input.iloc[:, keys] = input.iloc[:, inputKeys].shift(lag)
+            for shift in self.foreVec:
+                keys = [key + '_' + str(shift) for key in outputKeys]
+                output.iloc[:, keys] = output.iloc[:, outputKeys].shift(-shift)
+        elif self.diff[-4:] == 'diff':
+            for lag in self.backVec:
+                keys = [key + '_' + str(lag) for key in inputKeys]
+                dkeys = [key + '_d_' + str(lag) for key in inputKeys]
+                input[keys] = input[inputKeys].shift(lag)
+                input[dkeys] = input[inputKeys].shift(lag) - input[inputKeys]
+            for shift in self.foreVec:
+                keys = [key + '_' + str(shift) for key in outputKeys]
+                output[keys] = output[outputKeys].shift(lag) - output[outputKeys]
+        input = input.drop([key for key in input.keys() if '_0' in key], axis=1)
+        output = output.drop([key for key in output.keys() if '_0' in key], axis=1)
+        return input.iloc[lag:-shift], output.iloc[lag:-shift]
 
-
-        return 0
 
 
 
