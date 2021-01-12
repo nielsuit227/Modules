@@ -1,6 +1,7 @@
 import os, time, itertools, re
 import numpy as np
 import pandas as pd
+import ppscore as pps
 import seaborn as sns
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -14,17 +15,89 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 # todo multiprocessing for EDA RF, GridSearch
 # todo flat=bool for sequence (needed for lightGBM)
+# todo implement PPS in EDA
+# todo implement Feature Extraction (upon Feature Importance / PPS)
+# todo implement autoencoder for Feature Extraction
+
+# todo make pipeline of feature extraction / selection
+# todo Feature Extraction based on Feature Importance / PPS
+# todo Determine Differencing based on variance
+# todo Determine Lag based on Auto/Cross Correlations
+
+class Pipeline(object):
+    def __init__(self, target,
+                 max_lags=15,
+                 info_threshold=0.9,
+                 max_diff=1,
+                 shift=0):
+        self.target = target
+        self.max_lags = max_lags
+        self.info_threshold = info_threshold
+        self.max_diff = max_diff
+        self.shift = self.shift
+        self.catKeys = []
+        self.dateKeys = []
+        self.mean = []
+        self.var = []
+        self.diffOrder = 0
+
+    def fit(self, data):
+        # Identify Categorical & Datetime Columns
+        self.catkeys = list(data.keys()[data.dtypes == object])
+        self.dateKeys = list(data.keys()[[pd.to_datetime(val) >
+                                     pd.to_datetime('2000-01-01')
+                                     for val in data.iloc[10]]])
+
+        # Clean
+        prep = Preprocessing(missingValues='interpolate',
+                             datesCols=self.dateKeys,
+                             stringCols=self.catkeys)
+        data = prep.clean(data)
+
+        # Normalize
+        self.mean = data.mean()
+        self.std = data.std()
+        data -= self.mean
+        data /= self.std
+
+        # Stationarize
+        varVec = np.zeros((self.max_diff + 1, len(self.data.keys())))
+        diffData = data.copy(deep=True)
+        for i in range(self.max_diff + 1):
+            varVec[i, :] = diffData.std()
+            diffData = diffData.diff(1)[1:]
+        self.diffOrder = np.argmin(np.sum(varVec, axis=1))
+        for i in range(self.diffOrder):
+            data = data.diff(1)[1:]
+
+        # Split input & output
+        output = data[self.target][self.shift:]
+        input = data[:self.shift]
+        if self.shift == 0:
+            input = data.drop([self.target], axis=1)
+
+        # Calculate Cross-Correlation to Input
+        # Determine Lags
+        # Calculate PPS
+        # Calculate Pearson
+        # Calculate RFFI
+        # Calculate SHAP Values
+        # Select Features
+
+        # Initial Modelling
+
+        # Hyperparameter Optimization
 
 
 class Preprocessing(object):
 
     def __init__(self,
-                 inputPath,
-                 outputPath,
+                 inputPath=None,
+                 outputPath=None,
                  indexCol=None,
                  datesCols=None,
                  stringCols=None,
-                 missingValues='remove',
+                 missingValues='interpolate',
                  outlierRemoval='none',
                  zScoreThreshold=4,
                  ):
@@ -32,8 +105,9 @@ class Preprocessing(object):
         Preprocessing Class. Deals with Outliers, Missing Values, duplicate rows, data types (floats, categorical and dates),
         NaN, Infs.
 
-        :param inputPath: Path to file or directory of files to be processed
-        :param outputPath: Path to write processed files
+        :param input: (optional) Input data, Pandas DataFrame
+        :param inputPath: (optional) Path to file or directory of files to be processed
+        :param outputPath: (optional) Path to write processed files
         :param indexCol: Whether or not to take an index column from the input files.
         :param datesCols: Date columns, all parsed through pd.to_datetime()
         :param stringCols: String Columns. all parsed as categorical (output cat codes)
@@ -41,51 +115,61 @@ class Preprocessing(object):
         :param outlierRemoval: How to deal with outliers ('boxplot', 'zscore' or 'none')
         :param zScoreThreshold: If outlierRemoval='zscore', the threshold is adaptable, default=4.
         '''
+        ### Data
+        self.inputPath = inputPath
+        self.outputPath = outputPath
+
+        ### Algorithms
         missingValuesImplemented = ['remove', 'interpolate', 'mean']
         outlierRemovalImplemented = ['boxplot', 'zscore', 'none']
         if outlierRemoval not in outlierRemovalImplemented:
             raise ValueError("Outlier Removal Algo not implemented. Should be in " + str(outlierRemovalImplemented))
         if missingValues not in missingValuesImplemented:
             raise ValueError("Missing Values Algo not implemented. Should be in " + str(missingValuesImplemented))
-        self.inputPath = inputPath
-        self.outputPath = outputPath
-        self.indexCol = indexCol
-        self.datesCols = datesCols
-        self.stringCols = stringCols
         self.missingValues = missingValues
         self.outlierRemoval = outlierRemoval
         self.zScoreThreshold = zScoreThreshold
-        try:
+
+        ### Columns
+        if indexCol:
+            self.indexCol = [re.sub('[^a-zA-Z0-9 \n\.]', '_', x.lower()) for x in indexCols]
+        else:
+            self.indexCol = None
+        if datesCols:
+            self.datesCols = [re.sub('[^a-zA-Z0-9 \n\.]', '_', x.lower()) for x in datesCols]
+        else:
+            self.datesCols = None
+        if stringCols:
+            self.stringCols = [re.sub('[^a-zA-Z0-9 \n\.]', '_', x.lower()) for x in stringCols]
+        else:
+            self.stringCols = None
+
+        ### If inputPath:
+        if self.inputPath:
             files = os.listdir(inputPath)
             for file in files:
-                print(file)
-                self._clean(file)
-        except:
-            self._clean('')
+                data = pd.read_csv(self.inputPath + path,
+                                   index_col=self.indexCol,
+                                   parse_dates=self.datesCols)
+                self.clean(data)
 
 
-    def _clean(self, path):
-        '''
-        Internal function
-        :param path: path to file.
-        :return:
-        '''
-        # Read data
-        data = pd.read_csv(self.inputPath + path, index_col=self.indexCol, parse_dates=self.datesCols)
-
-        # Clean keys
+    def clean(self, data):
+        # Clean column names
         newKeys = {}
         for key in data.keys():
             newKeys[key] = re.sub('[^a-zA-Z0-9 \n\.]', '_', key.lower())
         data = data.rename(columns=newKeys)
 
         # Convert dtypes
+        keys = data.keys()
         if self.datesCols:
-            keys = [x for x in data.keys() if x not in self.datesCols]
+            [keys.remove(i) for i in self.datesCols]
         if self.stringCols:
-            keys = [x for x in keys if x not in self.stringCols]
             for key in self.stringCols:
-                data[key] = data[key].astype('category').cat.codes
+                keys.remove(key)
+                data = pd.concat([data, pd.get_dummies(data[key])], axis=1)
+                data = pd.drop([key], axis=1)
         for key in keys:
             data[key] = pd.to_numeric(data[key], errors='coerce').astype('float32')
 
@@ -118,8 +202,15 @@ class Preprocessing(object):
             data = data.fillna(data.mean())
 
         # Save
-        print('Saving to: ', self.outputPath + path)
-        data.to_csv(self.outputPath + path, index=self.indexCol is not None)
+        if self.outputPath:
+            print('Saving to: ', self.outputPath + path)
+            data.to_csv(self.outputPath + path, index=self.indexCol is not None)
+        return data
+
+
+
+
+
 
 class Normalize(object):
 
@@ -138,7 +229,7 @@ class Normalize(object):
         if type not in normalizationTypes:
             raise ValueError('Type not implemented. Should be in ' + str(normalizationTypes))
 
-    def convert(self, data):
+    def convert(self, data, output=None):
         '''
         Actual Conversion
         :param data: Pandas DataFrame.
@@ -154,135 +245,21 @@ class Normalize(object):
         elif self.type == 'minmax':
             data -= self.min
             data /= self.max - self.min
-        return data
-
-class Stationarize(object):
-
-    def __init__(self, type='diff', fraction=0.5, lagCutOff=25, sequence=1):
-        '''
-        Stationarizing class.
-        Init defines the stationarization.
-        Convert converts the actual in & output data
-        Revert reverts the data back to the original.
-        If the data needs sequencing too, first stationarize, then sequence, then revert here.
-
-
-        :param type: Type of stationarization, options: 'differ', 'logdiffer', 'fractional', 'rollingstart', 'rollingend'
-        :param fraction: if type='fractional', the fraction of fractional differencing
-        :param lagCutOff: type='fractional' results in infinite decaying weights, which are cutoff by lagCutOff.
-        :param sequence: if 'rolling', a rolling differences sequence is returned of length seq.
-        '''
-        self.type = type
-        self.fraction = fraction
-        self.lagCutOff = lagCutOff
-        self.sequence = sequence
-        self.forward = None
-        self.backward = None
-        standardizationTypes = ['diff', 'logdiff', 'frac']
-        if type not in standardizationTypes:
-            raise ValueError('Type not implemented. Should be in ' + str(standardizationTypes))
-    '''
-    should probably be merged with Sequence
-    options:
-    - sequenced input
-    - sequenced output
-    '''
-
-    def convert(self, input, output):
-        '''
-
-        :param input: input data
-        :param output: output data
-        :param back: which samples are fed as descriptors
-        :param forward: which samples do we need to predict
-        :return: differenced input/output in sequence. Output (samples, back, features), input (samples, prediction)
-        '''
-        self.input = input
-        self.output = output
-        if input.ndim == 1:
-            self.input = input.reshape((-1, 1))
-        if output.ndim == 1:
-            self.output = output.reshape((-1, 1))
-        if self.type == 'diff':
-            inputDiff = np.diff(input, axis=0)
-            outputDiff = np.diff(output, axis=0)
-        elif self.type == 'logdiff':
-            if np.min(input) <= 0 and np.min(output) <= 0:
-                raise ValueError('For Logarithmic Differencing, data cannot be smaller than zero')
-            elif np.min(input) <= 0:
-                raise Warning('Input neglected, smaller than zero.')
-                inputDiff = input
-                outputDiff = np.diff(np.log(output), axis=0)
-            elif np.min(output) <= 0:
-                raise Warning('Output neglected, smaller than zero.')
-                inputDiff = np.diff(np.log(input), axis=0)
-                outputDiff = output
-            else:
-                inputDiff = np.diff(np.log(input), axis=0)
-                outputDiff = np.diff(np.log(output), axis=0)
-        elif self.type == 'frac':
-            inputDiff = 0
-            outputDiff = output
-            weights = self.getFractionalWeights(self.fraction)
-            for k in range(self.lagCutOff):
-                shifted = np.roll(input, k)
-                shifted[:k] = 0
-                inputDiff += weights[k] * shifted
-        return inputDiff, outputDiff
-
-
-    def revert(self, differenced, original=None, comparison=None, back=0, forward=0):
-        '''
-        Revert differencing, based on last convert!
-
-        :param differenced: The differenced & sequenced output data
-        :param original: The original output data
-        :return: The sequenced, UNdifferenced data
-        '''
-        if differenced.ndim == 1:
-            if self.type == 'diff':
-                return np.hstack((original[0], original[:-forward] + differenced))
-            elif self.type == 'logdiff':
-                return np.hstack((original[0], np.exp(np.log(original[:-1]) + differenced)))
-            elif self.type == 'frac':
-                weights = self.getFractionalWeights(-self.fraction)
-                res = 0
-                for k in range(self.lagCutOff):
-                    shifted = np.hstack((comparison[:k+1], differenced[k:]))
-                    shifted = np.roll(shifted, k, axis=0)
-                    shifted[:k] = 0
-                    res += weights[k] * shifted
-                return res
+        if output:
+            self.output_mean = output.mean()
+            self.output_var = output.var()
+            self.output_min = output.min()
+            self.output_max = output.max()
+            if self.type == 'normal':
+                output -= self.output_mean
+                output /= np.sqrt(self.output_var)
+            elif self.type == 'minmax':
+                output -= self.output_min
+                output /= self.output_max - self.output_min
+            return data, output
         else:
-            reverted = np.zeros_like(differenced)
-            if self.type == 'diff':
-                for i in range(forward):
-                    reverted[:, i] = original[back-1:-forward-1].reshape((-1)) + np.sum(differenced[:, :i+1], axis=1)
-                return reverted
-            elif self.type == 'logdiff':
-                for i in range(forward):
-                    reverted[:, i] = np.exp(np.log(original[back-1:-forward-1]) + np.sum(differenced[:, :i+1], axis=1))
-                return reverted
-            elif self.type == 'frac':
-                raise ValueError('Fractional Integrating is incredibly hard')
-                # weights = self.getFractionalWeights(-self.fraction)
-                # for k in range(self.lagCutOff):
-                #     shifted = np.vstack((comparison[:k + 1], differenced[k:]))
-                #     shifted = np.roll(shifted, k, axis=0)
-                #     shifted[:k] = 0
-                #     reverted += weights[k] * shifted
-            # return reverted
+            return data
 
-
-    def getFractionalWeights(self, fraction):
-        '''
-        Internal function what gets the weights of fractional differencing.
-        :return: weights.
-        '''
-        w = [1]
-        for k in range(1, self.lagCutOff):
-            w.append(-w[-1] * (fraction - k + 1) / k)
-        return np.array(w).reshape((-1))
 
 class ExploratoryDataAnalysis(object):
 
@@ -442,10 +419,20 @@ class ExploratoryDataAnalysis(object):
         fig.savefig('EDA/Nonlinear Correlation/' + self.tag + 'RF.png', format='png', dpi=300)
         plt.close()
 
+
 class Modelling(object):
 
     def __init__(self):
         print('To be implemented!')
+
+    def classification(self):
+        # LDA, QDA, LSVM, KNN, RBF SVM, DT, RF, ANN, LSTM, AdaBoost,
+        return 0
+
+    def regression(self):
+        # Ridge, Lasso, SGD, KNN, DT, AdaBoost, GradBoost, RF, MLP, lightGBM, HistGradBoost, XG Boost, LSTM
+        return 0
+
 
 class Metrics(object):
 
@@ -479,9 +466,10 @@ class Metrics(object):
         ypred = ypred.reshape((-1))
         return np.mean((ytrue - ypred) ** 2)
 
+
 class Sequence(object):
 
-    def __init__(self, back=1, forward=1, shift=0, diff='none'):
+    def __init__(self, back=0, forward=0, shift=0, diff='none'):
         '''
         Sequencer. Sequences and differnces data.
         Scenarios:
@@ -505,7 +493,7 @@ class Sequence(object):
             raise ValueError('Back needs to be int or list(int)')
         if type(forward) == int:
             self.outputDtype = 'int'
-            forward = np.linspace(1, forward, forward).astype('int')
+            forward = np.linspace(0, forward, forward+1).astype('int')
         elif type(forward) == list:
             self.outputDtype = 'list'
             forward = np.array(forward)
@@ -525,16 +513,16 @@ class Sequence(object):
         if diff != 'none':
             self.samples = 0
             self.nback -= 1
-        if diff not in ['none', 'diff', 'logdiff', 'frac']:
+        if diff not in ['none', 'diff', 'logdiff']:
             raise ValueError('Type should be in [None, diff, logdiff, frac]')
 
 
-    def convert(self, input, output):
+    def convert_numpy(self, input, output):
         if input.ndim == 1:
             input = input.reshape((-1, 1))
         if output.ndim == 1:
             output = output.reshape((-1, 1))
-        samples = len(input) - self.mback - self.mfore - self.shift + self.samples
+        samples = len(input) - self.mback - self.mfore - self.shift - 1
         features = len(input[0])
         input_sequence = np.zeros((samples, self.nback, features))
         output_sequence = np.zeros((samples, self.nfore))
@@ -555,8 +543,28 @@ class Sequence(object):
                                       output[i + self.mback + self.shift + self.foreRoll]).reshape((-1))
             return input_sequence, output_sequence
 
+    def convert(self, input, output):
+        assert len(input) == len(output)
+        samples = len(input) - self.mback - self.mfore - self.shift + self.samples
+        keys = input.keys()
+        features = len(keys)
+        # Create output DFs
+        inputKeys = []
+        outputKeys = []
+        for i in self.backVec:
+            [inputKeys.append(x + '_' + str(i)) for x in keys]
+        for i in self.foreVec:
+            [outputKeys.append(x + '_' + str(i)) for x in keys]
+        inputDF = pd.DataFrame(columns=inputKeys)
+        outputDF = pd.DataFrame(columns=outputKeys)
+
+
+        return 0
+
+
 
     def revert(self, differenced, original):
+        # unsequenced integrating loop: d = np.hstack((d[0], d[0] + np.cumsum(dd)))
         if self.nfore == 1:
             differenced = differenced.reshape((-1, 1))
         output = np.zeros_like(differenced)
@@ -568,6 +576,7 @@ class Sequence(object):
             for i in range(self.nfore):
                 output[:, i] = original[self.mback + self.foreRoll[i]:-self.foreVec[i]] + differenced[:, i]
             return output
+
 
 class GridSearch(object):
 
@@ -638,6 +647,8 @@ class GridSearch(object):
         return pd.DataFrame(self.result)
 
 
+
+# Objects for Hyperparameter Optimization
 class LSTM(object):
 
     def __init__(self, dense=[1], stacked=[100, 100], bidirectional=False,
@@ -695,6 +706,7 @@ class LSTM(object):
 
     def predict(self, input):
         return self.model.predict(input)
+
 
 
 
