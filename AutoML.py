@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import ppscore as pps
 import seaborn as sns
+from tqdm import tqdm
 from datetime import datetime
 import matplotlib.pyplot as plt
 
@@ -38,7 +39,7 @@ class Pipeline(object):
         assert info_threshold > 0 and info_threshold < 1;
         assert max_diff < 5;
         assert max(shift) >= 0 and min(shift) < 50;
-        self.target = target
+        self.target = re.sub('[^a-zA-Z0-9 \n\.]', '_', target.lower())
         self.max_lags = max_lags
         self.info_threshold = info_threshold
         self.max_diff = max_diff
@@ -54,27 +55,14 @@ class Pipeline(object):
         self.regression = True
 
     def fit(self, data):
+        # Clean
+        self.prep = Preprocessing(missingValues='interpolate')
+        data = self.prep.clean(data)
+
         # Check whether is classification
         if len(set(data[self.target])) == 2:
             self.classification = True
             self.regression = False
-
-        # Identify Categorical & Datetime Columns
-        self.catKeys = list(data.keys()[data.dtypes == object])
-        self.dateKeys = list(data.keys()[[pd.to_datetime(val) >
-                                     pd.to_datetime('2000-01-01')
-                                     for val in data.iloc[10]]])
-        nCat = len(self.catKeys)
-        nDate = len(self.dateKeys)
-        nNum = len(data.keys()) - nCat - nDate
-        print('Found %i categorical, %i date and %i numerical variables.' %
-              (nCat, nDate, nNum))
-
-        # Clean
-        self.prep = Preprocessing(missingValues='interpolate',
-                             datesCols=self.dateKeys,
-                             stringCols=self.catKeys)
-        data = self.prep.clean(data)
 
         # Normalize
         data = self.norm.convert(data)
@@ -90,9 +78,10 @@ class Pipeline(object):
             self.diff = 'none'
         else:
             self.diff = 'diff'
-        print('Applied Differencing order: %i' % self.diffOrder)
+        print('[autoML] Optimal Differencing order: %i' % self.diffOrder)
 
         # Differencing, shifting, lagging
+        n_features = len(data.keys())
         self.seq = Sequence(back=self.max_lags, forward=self.shift)
         if self.shift != 0 and self.diffOrder != 0:
             self.seq.diff = 'diff'
@@ -104,6 +93,7 @@ class Pipeline(object):
         elif self.diffOrder != 0:
             for i in range(self.diffOrder):
                 data = data.diff(1)[1:]
+        print('[autoML] Added %i lags' % (len(data.keys()) - n_features))
 
         # Cross Correlation
         # cors = np.zeros((self.max_lags, len(input.keys())))
@@ -113,13 +103,26 @@ class Pipeline(object):
         #     cors[j, :] /= max(cors[j, :])
 
         # Remove Colinearity
-        corr_mat = data.corr().abs()
+        print('[autoML] Removing Co-Linearity')
+        nk = len(data.keys())
+        norm = (data - data.mean(skipna=True, numeric_only=True)).to_numpy()
+        ss = np.sqrt(np.sum(norm ** 2, axis=0))
+        corr_mat = np.eye(nk)
+        for i in range(nk):
+            for j in range(nk):
+                if i == j:
+                    continue
+                if corr_mat[i, j] == 0:
+                    c = abs(np.sum(norm[:, i] * norm[:, j]) / (ss[i] * ss[j]))
+                    corr_mat[i, j] = c
+                    corr_mat[j, i] = c
+        # Crashes here 'Pipeline' object has no attribute 'data'
         upper = corr_mat.where(np.triu(np.ones(corr_mat.shape), k=1).astype(np.bool))
         col_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
         if self.target in col_drop:
             col_drop.remove(self.target)
         minimal_rep = self.data.drop(self.data[col_drop], axis=1)
-        print('Dropped %i Co-Linear variables.' % len(col_drop))
+        print('[autoML] Dropped %i Co-Linear variables.' % len(col_drop))
 
         # Keep based on PPScore
         pp_score = pps.score(lagged, self.target)
@@ -139,8 +142,6 @@ class Preprocessing(object):
                  inputPath=None,
                  outputPath=None,
                  indexCol=None,
-                 datesCols=None,
-                 stringCols=None,
                  missingValues='interpolate',
                  outlierRemoval='none',
                  zScoreThreshold=4,
@@ -175,18 +176,13 @@ class Preprocessing(object):
         self.zScoreThreshold = zScoreThreshold
 
         ### Columns
+        self.numCols = []
+        self.catCols = []
+        self.dateCols = []
         if indexCol:
             self.indexCol = [re.sub('[^a-zA-Z0-9 \n\.]', '_', x.lower()) for x in indexCols]
         else:
             self.indexCol = None
-        if datesCols:
-            self.datesCols = [re.sub('[^a-zA-Z0-9 \n\.]', '_', x.lower()) for x in datesCols]
-        else:
-            self.datesCols = None
-        if stringCols:
-            self.stringCols = [re.sub('[^a-zA-Z0-9 \n\.]', '_', x.lower()) for x in stringCols]
-        else:
-            self.stringCols = None
 
         ### If inputPath:
         if self.inputPath:
@@ -199,28 +195,54 @@ class Preprocessing(object):
 
 
     def clean(self, data):
+        print('[preprocessing] Data Cleaning Started')
         # Clean column names
         newKeys = {}
         for key in data.keys():
             newKeys[key] = re.sub('[^a-zA-Z0-9 \n\.]', '_', key.lower())
         data = data.rename(columns=newKeys)
 
-        # Convert dtypes
-        keys = data.keys()
-        if self.datesCols:
-            [keys.remove(i) for i in self.datesCols]
-        if self.stringCols:
-            for key in self.stringCols:
-                keys.remove(key)
-                data = pd.concat([data, pd.get_dummies(data[key])], axis=1)
-                data = pd.drop([key], axis=1)
-        for key in keys:
-            data[key] = pd.to_numeric(data[key], errors='coerce').astype('float32')
+        # Identify data types & convert
+        missingThreshold = 0.5
+        integerThreshold = 0.01
+        for key in data.keys():
+            # Check for numeric first
+            numeric = pd.to_numeric(data[key], errors='coerce')
+            if numeric.isna().sum() < len(data) * missingThreshold:
+                if numeric.max() > 943920000:
+                    dates = pd.to_datetime(data[key], errors='coerce', infer_datetime_format=True)
+                    if np.logical_and(dates > pd.to_datetime('2000-01-01'),
+                        dates < datetime.now()).sum() > len(data) * missingThreshold:
+                        self.dateCols.append(key)
+                        data[key] = pd.to_datetime(data[key])
+                        continue
+                self.numCols.append(key)
+                data[key] = numeric
+            else:
+                dates = pd.to_datetime(data[key], errors='coerce', infer_datetime_format=True)
+                if np.logical_and(dates > pd.to_datetime('2000-01-01'),
+                    dates < datetime.now()).sum() > len(data) * missingThreshold:
+                    self.dateCols.append(key)
+                    data[key] = pd.to_datetime(data[key])
+                    continue
+                try:
+                    dummies = pd.get_dummies(data[key])
+                    data = data.drop(key, axis=1).join(dummies)
+                    self.catCols.extend(dummies.keys())
+                except:
+                    data = data.drop(key, axis=1)
+        print('[preprocessing] Found %i variables, %i numeric, %i dates, %i categorical' % (
+            len(data.keys()), len(self.numCols), len(self.dateCols), len(self.catCols)))
 
         # Duplicates
+        n_samples = len(data)
         data = data.drop_duplicates()
+        diff = len(data) - n_samples
+        if diff > 0:
+            print('[preprocessing] Dropped %i duplicate rows' % diff)
 
         # Remove Anomalies
+        n_nans = data.isna().sum().sum()
         if self.outlierRemoval == 'boxplot':
             Q1 = data.quantile(0.25)
             Q3 = data.quantile(0.75)
@@ -233,8 +255,12 @@ class Preprocessing(object):
             Zscore = (data - data.mean(skipna=True, numeric_only=True)) \
                      / np.sqrt(data.var(skipna=True, numeric_only=True))
             data[Zscore > self.zScoreThreshold] = np.nan
+        diff = data.isna().sum().sum() - n_nans
+        if diff > 0:
+            print('[preprocessing] Removed %i outliers.' % diff)
 
-        # Missing values etc.
+        # Missing Values
+        # todo check for big chunks of missing data
         data = data.replace([np.inf, -np.inf], np.nan)
         if self.missingValues == 'remove':
             data = data[data.isna().sum(axis=1) == 0]
@@ -244,10 +270,12 @@ class Preprocessing(object):
                 data = data.fillna(0)
         elif self.missingValues == 'mean':
             data = data.fillna(data.mean())
+        if n_nans + diff > 0:
+            print('[preprocessing] Filled %i NaN with %s' % (n_nans + diff, self.missingValues))
 
         # Save
         if self.outputPath:
-            print('Saving to: ', self.outputPath + path)
+            print('[preprocessing] Saving to: ', self.outputPath + path)
             data.to_csv(self.outputPath + path, index=self.indexCol is not None)
         return data
 
