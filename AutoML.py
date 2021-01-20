@@ -5,6 +5,7 @@ import ppscore as pps
 import seaborn as sns
 from tqdm import tqdm
 from datetime import datetime
+import matplotlib
 import matplotlib.pyplot as plt
 
 import sklearn
@@ -29,6 +30,7 @@ class Pipeline(object):
                  max_lags=15,
                  info_threshold=0.9,
                  max_diff=1,
+                 include_output=False,
                  shift=[0]):
         print('\n\n*** Start Amplo PM Model Builder ***\n\n')
         assert type(target) == str;
@@ -43,6 +45,7 @@ class Pipeline(object):
         self.max_lags = max_lags
         self.info_threshold = info_threshold
         self.max_diff = max_diff
+        self.include_output = include_output
         self.shift = shift
         self.catKeys = []
         self.dateKeys = []
@@ -59,55 +62,47 @@ class Pipeline(object):
         self.prep = Preprocessing(missingValues='interpolate')
         data = self.prep.clean(data)
 
+        # Split data
+        output = data[self.target]
+        input = data
+        if self.include_output is False:
+            input = input.drop(self.target, axis=1)
+
         # Check whether is classification
-        if len(set(data[self.target])) == 2:
+        if len(set(output)) == 2:
             self.classification = True
             self.regression = False
 
         # Normalize
-        data = self.norm.convert(data)
+        input, output = self.norm.convert(input, output=output)
 
         # Stationarity Check
-        varVec = np.zeros((self.max_diff + 1, len(data.keys())))
-        diffData = data.copy(deep=True)
-        for i in range(self.max_diff + 1):
-            varVec[i, :] = diffData.std()
-            diffData = diffData.diff(1)[1:]
-        self.diffOrder = np.argmin(np.sum(varVec, axis=1))
-        if self.diffOrder == 0:
-            self.diff = 'none'
+        if self.max_diff != 0:
+            varVec = np.zeros((self.max_diff + 1, len(data.keys())))
+            diffData = data.copy(deep=True)
+            for i in range(self.max_diff + 1):
+                varVec[i, :] = diffData.std()
+                diffData = diffData.diff(1)[1:]
+            self.diffOrder = np.argmin(np.sum(varVec, axis=1))
+            if self.diffOrder == 0:
+                self.diff = 'none'
+            else:
+                self.diff = 'diff'
+            print('[autoML] Optimal Differencing order: %i' % self.diffOrder)
         else:
-            self.diff = 'diff'
-        print('[autoML] Optimal Differencing order: %i' % self.diffOrder)
+            self.diff = 'none'
 
         # Differencing, shifting, lagging
-        n_features = len(data.keys())
-        self.seq = Sequence(back=self.max_lags, forward=self.shift)
-        if self.shift != 0 and self.diffOrder != 0:
-            self.seq.diff = 'diff'
-            data, output = self.seq.convert_pandas(data, data[[self.target]])
-            data[self.target] = output
-        elif self.shift != 0:
-            data[self.target] = data[self.target].shift(-self.shift)
-            data = data.iloc[:-self.shift]
-        elif self.diffOrder != 0:
-            for i in range(self.diffOrder):
-                data = data.diff(1)[1:]
-        print('[autoML] Added %i lags' % (len(data.keys()) - n_features))
-
-        # Cross Correlation
-        # cors = np.zeros((self.max_lags, len(input.keys())))
-        # for i, key in enumerate(input.keys()):
-        #     for j, lag in enumerate(range(self.max_lags)):
-        #         cors[j, i] = np.correlate(input[key][:-1-j], output.iloc[j+1:])
-        #     cors[j, :] /= max(cors[j, :])
+        n_features = len(input.keys())
+        self.seq = Sequence(back=self.max_lags, forward=self.shift, diff=self.diff)
+        input, output = self.seq.convert_pandas(input, output) # Double brackets keep it DataFrame
+        print('[autoML] Added %i lags' % (len(input.keys()) - n_features))
 
         # Remove Colinearity
-        print('[autoML] Removing Co-Linearity')
-        nk = len(data.keys())
-        norm = (data - data.mean(skipna=True, numeric_only=True)).to_numpy()
+        nk = len(input.keys())
+        norm = (input - input.mean(skipna=True, numeric_only=True)).to_numpy()
         ss = np.sqrt(np.sum(norm ** 2, axis=0))
-        corr_mat = np.eye(nk)
+        corr_mat = np.zeros((nk, nk))
         for i in range(nk):
             for j in range(nk):
                 if i == j:
@@ -116,21 +111,20 @@ class Pipeline(object):
                     c = abs(np.sum(norm[:, i] * norm[:, j]) / (ss[i] * ss[j]))
                     corr_mat[i, j] = c
                     corr_mat[j, i] = c
-        # Crashes here 'Pipeline' object has no attribute 'data'
-        upper = corr_mat.where(np.triu(np.ones(corr_mat.shape), k=1).astype(np.bool))
-        col_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
-        if self.target in col_drop:
-            col_drop.remove(self.target)
-        minimal_rep = self.data.drop(self.data[col_drop], axis=1)
+        upper = np.triu(corr_mat)
+        col_drop = input.keys()[np.sum(upper > 0.975, axis=0) > 0]
+        input = input.drop(col_drop, axis=1)
         print('[autoML] Dropped %i Co-Linear variables.' % len(col_drop))
 
         # Keep based on PPScore
-        pp_score = pps.score(lagged, self.target)
-        col_keep = pp_score[pp_score['ppscore'] >= 0.9]['x'].tolist()
-        input = lagged[col_keep]
+        data = input.copy()
+        data['target'] = output.copy()
+        pp_score = pps.predictors(data, "target")
+        col_keep = pp_score['x'][pp_score['ppscore'] != 0].to_list()
+        input = input[col_keep]
 
         # Initial Modelling
-        init = Modelling(input,)
+        init = Modelling(input, output, regression=True, plot=True)
 
 
         # Hyperparameter Optimization
@@ -142,6 +136,7 @@ class Preprocessing(object):
                  inputPath=None,
                  outputPath=None,
                  indexCol=None,
+                 parseDates=False,
                  missingValues='interpolate',
                  outlierRemoval='none',
                  zScoreThreshold=4,
@@ -174,6 +169,7 @@ class Preprocessing(object):
         self.missingValues = missingValues
         self.outlierRemoval = outlierRemoval
         self.zScoreThreshold = zScoreThreshold
+        self.parseDates = parseDates
 
         ### Columns
         self.numCols = []
@@ -195,7 +191,7 @@ class Preprocessing(object):
 
 
     def clean(self, data):
-        print('[preprocessing] Data Cleaning Started')
+        print('[preprocessing] Data Cleaning Started, %i samples' % len(data))
         # Clean column names
         newKeys = {}
         for key in data.keys():
@@ -203,25 +199,28 @@ class Preprocessing(object):
         data = data.rename(columns=newKeys)
 
         # Identify data types & convert
+        ''' First checks for numeric (fastest). 
+        If numeric, it
+        '''
         missingThreshold = 0.5
         integerThreshold = 0.01
         for key in data.keys():
             # Check for numeric first
             numeric = pd.to_numeric(data[key], errors='coerce')
             if numeric.isna().sum() < len(data) * missingThreshold:
-                if numeric.max() > 943920000:
-                    dates = pd.to_datetime(data[key], errors='coerce', infer_datetime_format=True)
-                    if np.logical_and(dates > pd.to_datetime('2000-01-01'),
-                        dates < datetime.now()).sum() > len(data) * missingThreshold:
+                if numeric.max() > 943920000 and self.parseDates:
+                    dates = pd.to_datetime(data[key], errors='coerce', infer_datetime_format=True, utc=True)
+                    if np.logical_and(dates.dt.date > pd.to_datetime('2000-01-01'),
+                        dates.dt.date < pd.to_datetime('today')).sum() > len(data) * missingThreshold:
                         self.dateCols.append(key)
-                        data[key] = pd.to_datetime(data[key])
+                        data[key] = dates
                         continue
                 self.numCols.append(key)
                 data[key] = numeric
             else:
-                dates = pd.to_datetime(data[key], errors='coerce', infer_datetime_format=True)
-                if np.logical_and(dates > pd.to_datetime('2000-01-01'),
-                    dates < datetime.now()).sum() > len(data) * missingThreshold:
+                dates = pd.to_datetime(data[key], errors='coerce', infer_datetime_format=True, utc=True)
+                if np.logical_and(dates.dt.date > pd.to_datetime('2000-01-01'),
+                                  dates.dt.date < pd.to_datetime('today')).sum() > len(data) * missingThreshold:
                     self.dateCols.append(key)
                     data[key] = pd.to_datetime(data[key])
                     continue
@@ -233,6 +232,9 @@ class Preprocessing(object):
                     data = data.drop(key, axis=1)
         print('[preprocessing] Found %i variables, %i numeric, %i dates, %i categorical' % (
             len(data.keys()), len(self.numCols), len(self.dateCols), len(self.catCols)))
+
+        # Drop constant columns
+        data = data.drop(data.keys()[data.min() == data.max()], axis=1)
 
         # Duplicates
         n_samples = len(data)
@@ -265,7 +267,8 @@ class Preprocessing(object):
         if self.missingValues == 'remove':
             data = data[data.isna().sum(axis=1) == 0]
         elif self.missingValues == 'interpolate':
-            data = data.interpolate()
+            ik = np.setdiff1d(data.keys(), self.dateCols)
+            data[ik] = data[ik].interpolate(limit_direction='both')
             if data.isna().sum().sum() != 0:
                 data = data.fillna(0)
         elif self.missingValues == 'mean':
@@ -274,6 +277,7 @@ class Preprocessing(object):
             print('[preprocessing] Filled %i NaN with %s' % (n_nans + diff, self.missingValues))
 
         # Save
+        print('[preprocessing] Completed, %i samples returned' % len(data))
         if self.outputPath:
             print('[preprocessing] Saving to: ', self.outputPath + path)
             data.to_csv(self.outputPath + path, index=self.indexCol is not None)
@@ -303,17 +307,21 @@ class Normalize(object):
         :param data: Pandas DataFrame.
         :return:
         '''
+        # Note Stats
         self.mean = data.mean()
         self.var = data.var()
         self.min = data.min()
         self.max = data.max()
+        # Drop constants
+        data = data.drop(data.keys()[data.max() == data.min()], axis=1)
+        # Normalize
         if self.type == 'normal':
             data -= self.mean
             data /= np.sqrt(self.var)
         elif self.type == 'minmax':
             data -= self.min
             data /= self.max - self.min
-        if output:
+        if output is not None:
             self.output_mean = output.mean()
             self.output_var = output.var()
             self.output_min = output.min()
@@ -331,7 +339,7 @@ class Normalize(object):
 
 class ExploratoryDataAnalysis(object):
 
-    def __init__(self, data, differ=0, pretag=None, output=None, maxSamples=10000, seasonPeriods=[24 * 60, 7 * 24 * 60], lags=60):
+    def __init__(self, data, differ=0, pretag='', output=None, maxSamples=10000, seasonPeriods=[24 * 60, 7 * 24 * 60], lags=60):
         '''
         Doing all the fun EDA in an automized script :)
         :param data: Pandas Dataframe
@@ -340,8 +348,6 @@ class ExploratoryDataAnalysis(object):
         :param lags: Lags for (P)ACF and
         '''
         # Register data
-        matplotlib.use('Agg')
-        matplotlib.rcParams['agg.path.chunksize'] = 1000000
         self.differ = differ
         self.tag = pretag
         self.maxSamples = maxSamples
@@ -352,22 +358,23 @@ class ExploratoryDataAnalysis(object):
 
         # Create dirs
         self.createDirs()
+        self.run()
 
 
     def run(self):
         # Run all functions
-        print('Generating Timeplots')
+        print('[EDA] Generating Timeplots')
         self.timeplots()
-        print('Generating Boxplots')
+        print('[EDA] Generating Boxplots')
         self.boxplots()
         # self.seasonality()
-        print('Generating Colinearity Plots')
+        print('[EDA] Generating Colinearity Plots')
         self.colinearity()
-        print('Generating Diff Var Plot')
+        print('[EDA] Generating Diff Var Plot')
         self.differencing()
-        print('Generating ACF Plots')
+        print('[EDA] Generating ACF Plots')
         self.completeAutoCorr()
-        print('Generating PACF Plots')
+        print('[EDA] Generating PACF Plots')
         self.partialAutoCorr()
         if self.output is not None:
             print('Generating CCF Plots')
@@ -393,6 +400,7 @@ class ExploratoryDataAnalysis(object):
 
     def boxplots(self):
         for key in self.data.keys():
+            print('[EDA] Boxplot: ', key)
             fig = plt.figure(figsize=[24, 16])
             plt.boxplot(self.data[key])
             plt.title(key)
@@ -400,19 +408,23 @@ class ExploratoryDataAnalysis(object):
             plt.close()
 
     def timeplots(self):
+        matplotlib.use('Agg')
+        matplotlib.rcParams['agg.path.chunksize'] = 20000000 # 20M
         # Undersample
         data = self.data.iloc[np.linspace(0, len(self.data) - 1, self.maxSamples).astype('int')]
         # Plot
         for key in data.keys():
+            print('[EDA] Timeplot: ', key)
             fig = plt.figure(figsize=[24, 16])
             plt.plot(data.index, data[key])
             plt.title(key)
-            fig.savefig('EDA/Timeplots/' + self.tag + key + '.png', format='png', dpi=300)
-            plt.close()
+            fig.savefig('EDA/Timeplots/' + self.tag + key + '.png', format='png', dpi=100)
+            plt.close(fig)
 
     def seasonality(self):
-        for period in self.seasonPeriods:
-            for key in self.data.keys():
+        for key in self.data.keys():
+            print('[EDA] Seasonality: ', key)
+            for period in self.seasonPeriods:
                 seasonality = STL(self.data[key], period=period).fit()
                 fig = plt.figure(figsize=[24, 16])
                 plt.plot(range(len(self.data)), self.data[key])
@@ -454,6 +466,7 @@ class ExploratoryDataAnalysis(object):
         for i in range(self.differ):
             self.data = self.data.diff(1)[1:]
         for key in self.data.keys():
+            print('[EDA] ACF: ', key)
             fig = plot_acf(self.data[key], fft=True)
             plt.title(key)
             fig.savefig('EDA/Correlation/ACF/' + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
@@ -461,13 +474,15 @@ class ExploratoryDataAnalysis(object):
 
     def partialAutoCorr(self):
         for key in self.data.keys():
-            fig = plot_pacf(self.data[key], fft=True)
+            print('[EDA] PACF: ', key)
+            fig = plot_pacf(self.data[key])
             fig.savefig('EDA/Correlation/PACF/' + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
             plt.title(key)
             plt.close()
 
     def crossCorr(self):
         for key in self.data.keys():
+            print('[EDA] Cross-Correlation: ', key)
             fig = plt.figure(figsiz=[24, 16])
             plt.xcorr(self.data[key], self.output, maxlags=self.lags)
             plt.title(key)
@@ -490,7 +505,10 @@ class ExploratoryDataAnalysis(object):
 
 class Modelling(object):
 
-    def __init__(self, input, output, regression=False, classification=False):
+    def __init__(self, input, output, regression=False, classification=False, shuffle=False, split=0.2, plot=False):
+        self.shuffle = shuffle
+        self.split = split
+        self.plot = plot
         if regression:
             self.regression(input, output)
         if classification:
@@ -501,8 +519,51 @@ class Modelling(object):
         return 0
 
     def regression(self, input, output):
-        # Ridge, Lasso, SGD, KNN, DT, AdaBoost, GradBoost, RF, MLP, lightGBM, HistGradBoost, XG Boost, LSTM
-        return 0
+        # Data
+        print('[modelling] Splitting data (shuffle=%s, split=%i %%)' % (str(self.shuffle), int(self.split * 100)))
+        from sklearn import model_selection
+        ti, vi, to, vo = model_selection.train_test_split(input, output, test_size=self.split, shuffle=self.shuffle)
+
+        # Fix plot
+        if self.plot:
+            plt.figure()
+            plt.plot(np.array(vo))
+
+        # Models
+        print('[modelling] Initiating all model instances')
+        acc = []
+        from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
+        from sklearn.experimental import enable_hist_gradient_boosting
+        ridge = linear_model.Ridge()
+        lasso = linear_model.Lasso()
+        sgd = linear_model.SGDRegressor()
+        knr = neighbors.KNeighborsRegressor()
+        dtr = tree.DecisionTreeRegressor()
+        ada = ensemble.AdaBoostRegressor()
+        gbr = ensemble.GradientBoostingRegressor()
+        hgbr = ensemble.HistGradientBoostingRegressor()
+        rfr = ensemble.RandomForestRegressor()
+        mlp = neural_network.MLPRegressor()
+        models = [ridge, lasso, sgd, knr, dtr, ada, gbr, hgbr, mlp]
+        for model in models:
+            t = time.time()
+            model.fit(ti, to)
+            tp = model.predict(ti)
+            p = model.predict(vi)
+            acc.append(Metrics.mae(vo, p))
+            if self.plot:
+                plt.plot(p, alpha=0.2)
+            print('[modelling] %s MAE in/out: %.2f %.2f, training time: %.1f s' % (model.__module__[8:].ljust(60), Metrics.mae(to, tp), Metrics.mae(vo, p), time.time() - t))
+        if self.plot:
+            ind = np.where(acc == np.min(acc))
+            p = model.predict(vi)
+            plt.plot(p)
+            plt.title('Predictions')
+            plt.legend(['True output', 'Ridge', 'Lasso', 'SGD', 'KNR', 'DTR', 'ADA', 'GBR', 'HGBR', 'MLP', 'Best'])
+            plt.ylabel('Output')
+            plt.xlabel('Samples')
+            plt.show()
+        return self
 
 
 class Metrics(object):
@@ -528,9 +589,15 @@ class Metrics(object):
         return 1 - res / tot
 
     def mae(ytrue, ypred):
-        ytrue = ytrue.reshape((-1))
-        ypred = ypred.reshape((-1))
-        return np.mean(abs(ytrue - ypred))
+        # if isinstance(ytrue, pd.core.series.Series) and isinstance(ypred, pd.core.series.Series):
+        #     return np.mean(abs(ytrue - ypred))
+        # elif isinstance(ytrue, np.ndarray) and isinstance(ypred, np.ndarray):
+        #     ytrue = ytrue.reshape((-1))
+        #     ypred = ypred.reshape((-1))
+        #     return np.mean(abs(ytrue - ypred))
+        # else:
+        return np.mean(abs(np.array(ytrue).reshape((-1)) - np.array(ypred).reshape((-1))))
+
 
     def mse(ytrue, ypred):
         ytrue = ytrue.reshape((-1))
@@ -587,6 +654,12 @@ class Sequence(object):
         if diff not in ['none', 'diff', 'logdiff']:
             raise ValueError('Type should be in [None, diff, logdiff, frac]')
 
+    def convert(self, input, output, flat=False):
+        assert type(input) == type(output)
+        if isinstance(input, pd.DataFrame) or isinstance(input, pd.core.series.Series):
+            self.convert_pandas(input, output)
+        if isinstance(input, np.ndarray):
+            self.convert_numpy(input, output, flat=flat)
 
     def convert_numpy(self, input, output, flat=False):
         if input.ndim == 1:
@@ -615,31 +688,56 @@ class Sequence(object):
             return input_sequence, output_sequence
 
     def convert_pandas(self, input, output):
+
+        # Check inputs
+        if isinstance(input, pd.core.series.Series):
+            input = input.to_frame()
+        if isinstance(output, pd.core.series.Series):
+            output = output.to_frame()
         assert len(input) == len(output)
+        assert isinstance(input, pd.DataFrame)
+        assert isinstance(output, pd.DataFrame)
+
+        # Keys
         inputKeys = input.keys()
         outputKeys = output.keys()
+
+        # No Differencing
         if self.diff == 'none':
+            # Input
             for lag in self.backVec:
                 keys = [key + '_' + str(lag) for key in inputKeys]
-                input.iloc[:, keys] = input.iloc[:, inputKeys].shift(lag)
+                input[keys] = input[inputKeys].shift(lag)
+
+            # Output
             for shift in self.foreVec:
                 keys = [key + '_' + str(shift) for key in outputKeys]
-                output.iloc[:, keys] = output.iloc[:, outputKeys].shift(-shift)
+                output[keys] = output[outputKeys].shift(-shift)
+
+        # With differencing
         elif self.diff[-4:] == 'diff':
+            # Input
             for lag in self.backVec:
+                # Shifted
                 keys = [key + '_' + str(lag) for key in inputKeys]
-                dkeys = [key + '_d_' + str(lag) for key in inputKeys]
                 input[keys] = input[inputKeys].shift(lag)
+
+                # Differenced
+                dkeys = [key + '_d_' + str(lag) for key in inputKeys]
                 input[dkeys] = input[inputKeys].shift(lag) - input[inputKeys]
+
+            # Output
             for shift in self.foreVec:
+                # Only differenced
                 keys = [key + '_' + str(shift) for key in outputKeys]
                 output[keys] = output[outputKeys].shift(lag) - output[outputKeys]
+
+        # Drop _0 (same as original)
         input = input.drop([key for key in input.keys() if '_0' in key], axis=1)
         output = output.drop([key for key in output.keys() if '_0' in key], axis=1)
-        return input.iloc[lag:-shift], output.iloc[lag:-shift]
 
-
-
+        # Return (first lags are NaN, last shifts are NaN
+        return input.iloc[lag:-shift if shift>0 else None], output.iloc[lag:-shift if shift>0 else None]
 
     def revert(self, differenced, original):
         # unsequenced integrating loop: d = np.hstack((d[0], d[0] + np.cumsum(dd)))
