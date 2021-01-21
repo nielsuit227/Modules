@@ -7,6 +7,7 @@ from tqdm import tqdm
 from datetime import datetime
 import matplotlib
 import matplotlib.pyplot as plt
+import multiprocessing as mp
 
 import sklearn
 from sklearn.model_selection import StratifiedKFold, KFold
@@ -189,9 +190,21 @@ class Pipeline(object):
             self.grid = GridSearch(self.best_model, params,
                                    cv=cv, scoring=Metrics.mae)
             results = self.grid.fit(self.input, self.output)
-            results = results.sort_values('mean_score', ascending=False)
+            results['worst_case'] = results['mean_score'] + results['std_score']
+            results = results.sort_values('worst_case')
             results.to_csv('AutoML/Hyper Parameter Opt/Results.csv', index_label='index')
             print(results.head())
+
+            # Retrain and save
+            print('[AutoML] Retraining with optimal parameters.')
+            params = json.loads(results.loc[0, 'params'].replace("'", '"').lower())
+            self.best_model.set_params(**params)
+            self.best_model.fit(self.input, self.output)
+            joblib.dump(self.best_model, 'AutoML/OptimalModel.joblib')
+
+            print('\n\n[AutoML] Completed, score: %.4f \uB001 %.4f' % (results.loc[0, 'mean_score'], results.loc[0, 'std_score']))
+
+
 
     def predict(self, sample):
         normed = self.norm.convert(sample)
@@ -205,6 +218,45 @@ class Pipeline(object):
                 'learning_rate': [0.001, 0.01, 0.1, 0.2, 0.4],
                 'n_estimators': [100, 300, 500],
                 'max_depth': [3, 5, 10],
+            }
+        elif isinstance(self.best_model, sklearn.linear_model.Lasso) or \
+            isinstance(self.best_model, sklearn.linear_model.Ridge):
+            return {
+                'alpha': [0.001, 0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 2, 3, 4, 5]
+            }
+        elif isinstance(self.best_model, sklearn.linear_model.SGDRegressor):
+            return {
+                'loss': ['squared_loss', 'huber', 'epsilon_insensitive', 'squared_epsilon_insensitive'],
+                'penalty': ['l2', 'l1', 'elasticnet'],
+                'alpha': [0.001, 0.01, 0.1, 0.5, 1, 2],
+            }
+        elif isinstance(self.best_model, sklearn.neighbors.KNeighborsRegressor):
+            return {
+                'n_neighbors': [5, 10, 25, 50],
+                'weights': ['uniform', 'distance'],
+                'leaf_size': [10, 30, 50, 100],
+                'n_jobs': [mp.cpu_count()],
+            }
+        elif isinstance(self.best_model, sklearn.tree.DecisionTreeRegressor):
+            return {
+                'criterion': ['mse', 'friedman_mse', 'mae', 'poisson'],
+                'max_depth': [None, 5, 10, 25, 50],
+            }
+        elif isinstance(self.best_model, sklearn.ensemble.AdaBoostRegressor):
+            return {
+                'n_estimators': [25, 50, 100, 250],
+                'loss': ['linear', 'square', 'exponential'],
+                'learning_rate': [0.5, 0.75, 0.9, 0.95, 1]
+            }
+        elif isinstance(self.best_model, sklearn.ensemble.HistGradientBoostingRegressor):
+            return {
+        'max_iter': [100, 250],
+        'max_bins': [100, 255],
+        'loss': ['least_squares', 'least_absolute_deviation'],
+        'l2_regularization': [0.001, 0.005, 0.01, 0.05],
+        'learning_rate': [0.01, 0.1, 0.25, 0.4],
+        'max_leaf_nodes': [31, 50, 75, 150],
+        'early_stopping': [True]
             }
         else:
             raise NotImplementedError('Hyperparameter tuning not implemented for ', self.best_model.__module__)
