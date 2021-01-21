@@ -1,4 +1,4 @@
-import os, time, itertools, re, joblib, pickle
+import os, time, itertools, re, joblib, json
 import numpy as np
 import pandas as pd
 import ppscore as pps
@@ -144,12 +144,16 @@ class Pipeline(object):
             input = input.drop(col_drop, axis=1)
             print('[AutoML] Dropped %i Co-Linear variables.' % len(col_drop))
 
+            # Keep all
+            col_keep = [input.keys()]
+            input.to_csv('AutoML/Data/All_selected_data.csv')
+
             # Keep based on PPScore
             data = input.copy()
             data['target'] = output.copy()
             pp_score = pps.predictors(data, "target")
-            col_keep = [pp_score['x'][pp_score['ppscore'] != 0].to_list()]
-            pp_data = input[col_keep[0]]
+            col_keep.append(pp_score['x'][pp_score['ppscore'] != 0].to_list())
+            pp_data = input[col_keep[1]]
             pp_data[self.target] = output
             pp_data.to_csv('AutoML/Data/pp_selected_data.csv')
 
@@ -160,7 +164,7 @@ class Pipeline(object):
             ind = np.flip(np.argsort(fi))
             ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.info_threshold * sfi]
             col_keep.append(list(input.keys()[ind_keep]))
-            rf_data = input[col_keep[1]]
+            rf_data = input[col_keep[2]]
             rf_data[self.target] = output
             rf_data.to_csv('AutoML/Data/rf_selected_data.csv')
 
@@ -183,7 +187,7 @@ class Pipeline(object):
 
         # Hyperparameter optimization
         if self.prev and len(os.listdir('AutoML/Hyperparameter Opt/')) != 0:
-            print('[AutoML] Already conducted & stored full AutoML cycle.')
+            pass
         else:
             params = self.get_hyper_params()
             cv = KFold(n_splits=3)
@@ -192,19 +196,20 @@ class Pipeline(object):
             results = self.grid.fit(self.input, self.output)
             results['worst_case'] = results['mean_score'] + results['std_score']
             results = results.sort_values('worst_case')
-            results.to_csv('AutoML/Hyper Parameter Opt/Results.csv', index_label='index')
-            print(results.head())
+            results.to_csv('AutoML/Hyperparameter Opt/Results.csv', index_label='index')
 
-            # Retrain and save
+        # Retrain and save
+        if self.prev and 'OptimalModel.joblib'in os.listdir('AutoML/'):
+            print('[AutoML] Already conducted & stored full AutoML cycle.')
+        else:
             print('[AutoML] Retraining with optimal parameters.')
-            params = json.loads(results.loc[0, 'params'].replace("'", '"').lower())
+            results = pd.read_csv('AutoML/Hyperparameter Opt/Results.csv')
+            params = json.loads(results.iloc[0]['params'].replace("'", '"').lower())
             self.best_model.set_params(**params)
             self.best_model.fit(self.input, self.output)
             joblib.dump(self.best_model, 'AutoML/OptimalModel.joblib')
 
-            print('\n\n[AutoML] Completed, score: %.4f \uB001 %.4f' % (results.loc[0, 'mean_score'], results.loc[0, 'std_score']))
-
-
+            print('\n\n[AutoML] Completed, score: %.4f \u00B1 %.4f' % (results.iloc[0]['mean_score'], results.iloc['std_score']))
 
     def predict(self, sample):
         normed = self.norm.convert(sample)
@@ -604,7 +609,7 @@ class ExploratoryDataAnalysis(object):
         threshold = 0.95
         fig = plt.figure(figsize=[24, 16])
         sns.heatmap(abs(self.data.corr()) < threshold, annot=False, cmap='Greys')
-        fig.savefig('EDA/Colinearity/' + self.tag + 'All_Features.png', format='png', dpi=300)
+        fig.savefig(self.folder + 'EDA/Colinearity/' + self.tag + 'All_Features.png', format='png', dpi=300)
         # Minimum representation
         corr_mat = self.data.corr().abs()
         upper = corr_mat.where(np.triu(np.ones(corr_mat.shape), k=1).astype(np.bool))
