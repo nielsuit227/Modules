@@ -1,4 +1,4 @@
-import os, time, itertools, re
+import os, time, itertools, re, joblib
 import numpy as np
 import pandas as pd
 import ppscore as pps
@@ -41,6 +41,9 @@ class Pipeline(object):
         assert info_threshold > 0 and info_threshold < 1;
         assert max_diff < 5;
         assert max(shift) >= 0 and min(shift) < 50;
+        self.input = None
+        self.output = None
+        self.best_model = None
         self.target = re.sub('[^a-zA-Z0-9 \n\.]', '_', target.lower())
         self.max_lags = max_lags
         self.info_threshold = info_threshold
@@ -52,6 +55,7 @@ class Pipeline(object):
         self.norm = Normalize(type='minmax')
         self.prep = None
         self.seq = None
+        self.grid = None
         self.diff = 'none'
         self.diffOrder = 0
         self.classification = False
@@ -120,14 +124,50 @@ class Pipeline(object):
         data = input.copy()
         data['target'] = output.copy()
         pp_score = pps.predictors(data, "target")
-        col_keep = pp_score['x'][pp_score['ppscore'] != 0].to_list()
-        input = input[col_keep]
+        col_keep = [pp_score['x'][pp_score['ppscore'] != 0].to_list()]
+
+        # Keep based on RF
+        rf = RandomForestRegressor().fit(input, output)
+        fi = rf.feature_importances_
+        sfi = fi.sum()
+        ind = np.flip(np.argsort(fi))
+        ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= 0.975 * sfi]
+        col_keep.append(list(input.keys()[ind_keep]))
 
         # Initial Modelling
-        init = Modelling(input, output, regression=True, plot=True)
+        init = []
+        for cols in col_keep:
+            init.append(Modelling(input[cols], output, regression=True, plot=True))
 
+        # Find best Dataset / Model
+        data_ind = np.argmin([min(x.acc) for x in init])
+        model_ind = np.argmin(init[data_ind].acc)
 
-        # Hyperparameter Optimization
+        # Store
+        self.output = output
+        self.input = input[col_keep[data_ind]]
+        self.best_model = init[data_ind].models[model_ind]
+
+        # Hyperparameter optimization
+        params = self.get_hyper_params()
+        self.grid = GridSearch(self.best_model, params, scoring=Metrics.mae)
+
+    def predict(self, sample):
+        normed = self.norm.convert(sample)
+        pred = self.best_model.predict(normed)
+        return self.norm.revert_output(pred)
+
+    def get_hyper_params(self):
+        if isinstance(self.best_model, sklearn.ensemble._gb.GradientBoostingRegressor):
+            return {
+                'loss': ['ls', 'lad', 'huber'],
+                'learning_rate': [0.001, 0.01, 0.1, 0.2, 0.4],
+                'n_estimators': [100, 300, 500],
+                'max_depth': [3, 5, 10],
+            }
+        else:
+            raise NotImplementedError('Hyperparameter tuning not implemented for optimal model.')
+
 
 
 class Preprocessing(object):
@@ -297,6 +337,10 @@ class Normalize(object):
         self.var = None
         self.max = None
         self.min = None
+        self.output_mean = None
+        self.output_var = None
+        self.output_min = None
+        self.output_max = None
         normalizationTypes = ['normal', 'minmax']
         if type not in normalizationTypes:
             raise ValueError('Type not implemented. Should be in ' + str(normalizationTypes))
@@ -336,10 +380,31 @@ class Normalize(object):
         else:
             return data
 
+    def revert(self, data):
+        if self.type == 'normal':
+            data *= np.sqrt(self.var)
+            data += self.mean
+        elif self.type == 'minmax':
+            data *= self.max - self.min
+            data += data.min
+        return data
+
+    def revert_output(self, output):
+        if self.type == 'normal':
+            assert self.output_mean != None and self.output_var != None
+            output *= np.sqrt(self.output_var)
+            output += self.output_mean
+        elif self.type == 'minmax':
+            assert self.output_min != None and self.output_max != None
+            output *= self.output_max - self.output_min
+            output += self.output_min
+        return output
+
 
 class ExploratoryDataAnalysis(object):
 
-    def __init__(self, data, differ=0, pretag='', output=None, maxSamples=10000, seasonPeriods=[24 * 60, 7 * 24 * 60], lags=60):
+    def __init__(self, data, differ=0, pretag='', output=None, maxSamples=10000, seasonPeriods=[24 * 60, 7 * 24 * 60],
+                 lags=60, skip_completed=True):
         '''
         Doing all the fun EDA in an automized script :)
         :param data: Pandas Dataframe
@@ -355,6 +420,7 @@ class ExploratoryDataAnalysis(object):
         self.output = output
         self.seasonPeriods = seasonPeriods
         self.lags = lags
+        self.skip = skip_completed
 
         # Create dirs
         self.createDirs()
@@ -377,9 +443,9 @@ class ExploratoryDataAnalysis(object):
         print('[EDA] Generating PACF Plots')
         self.partialAutoCorr()
         if self.output is not None:
-            print('Generating CCF Plots')
+            print('[EDA] Generating CCF Plots')
             self.crossCorr()
-            print('Generating Feature Ranking Plot')
+            print('[EDA] Generating Feature Ranking Plot')
             self.featureRanking()
 
     def createDirs(self):
@@ -400,6 +466,8 @@ class ExploratoryDataAnalysis(object):
 
     def boxplots(self):
         for key in self.data.keys():
+            if self.tag + key + '.png' in os.listdir('EDA/Boxplots/'):
+                continue
             print('[EDA] Boxplot: ', key)
             fig = plt.figure(figsize=[24, 16])
             plt.boxplot(self.data[key])
@@ -414,6 +482,8 @@ class ExploratoryDataAnalysis(object):
         data = self.data.iloc[np.linspace(0, len(self.data) - 1, self.maxSamples).astype('int')]
         # Plot
         for key in data.keys():
+            if self.tag + key + '.png' in os.listdir('EDA/Timeplots/'):
+                continue
             print('[EDA] Timeplot: ', key)
             fig = plt.figure(figsize=[24, 16])
             plt.plot(data.index, data[key])
@@ -425,6 +495,8 @@ class ExploratoryDataAnalysis(object):
         for key in self.data.keys():
             print('[EDA] Seasonality: ', key)
             for period in self.seasonPeriods:
+                if self.tag + key + '.png' in os.listdir('EDA/Seasonality/'):
+                    continue
                 seasonality = STL(self.data[key], period=period).fit()
                 fig = plt.figure(figsize=[24, 16])
                 plt.plot(range(len(self.data)), self.data[key])
@@ -434,6 +506,8 @@ class ExploratoryDataAnalysis(object):
                 plt.close()
 
     def colinearity(self):
+        if self.tag + 'Minimum_Representation.png' in os.listdir('EDA/Colinearity/'):
+            pass
         threshold = 0.95
         fig = plt.figure(figsize=[24, 16])
         sns.heatmap(abs(self.data.corr()) < threshold, annot=False, cmap='Greys')
@@ -448,6 +522,8 @@ class ExploratoryDataAnalysis(object):
         fig.savefig('EDA/Colinearity/' + self.tag + 'Minimum_Representation.png', format='png', dpi=300)
 
     def differencing(self):
+        if self.tag + 'Variance.png' in os.listdir('EDA/Lags/'):
+            pass
         max_lags = 4
         varVec = np.zeros((max_lags, len(self.data.keys())))
         diffData = self.data / np.sqrt(self.data.var())
@@ -466,37 +542,47 @@ class ExploratoryDataAnalysis(object):
         for i in range(self.differ):
             self.data = self.data.diff(1)[1:]
         for key in self.data.keys():
+            if self.tag + key + '_differ_' + str(self.differ) + '.png' in os.listdir('EDA/Correlation/ACF/'):
+                continue
             print('[EDA] ACF: ', key)
             fig = plot_acf(self.data[key], fft=True)
             plt.title(key)
-            fig.savefig('EDA/Correlation/ACF/' + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
+            fig.savefig('EDA/Correlation/ACF/' + self.tag + key + '_differ_' + str(self.differ) + '.png', format='png', dpi=300)
             plt.close()
 
     def partialAutoCorr(self):
         for key in self.data.keys():
+            if self.tag + key + '_differ_' + str(self.differ) + '.png' in os.listdir('EDA/Correlation/PACF/'):
+                continue
+
             print('[EDA] PACF: ', key)
             fig = plot_pacf(self.data[key])
-            fig.savefig('EDA/Correlation/PACF/' + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
+            fig.savefig('EDA/Correlation/PACF/' + self.tag + key + '_differ_' + str(self.differ) + '.png', format='png', dpi=300)
             plt.title(key)
             plt.close()
 
     def crossCorr(self):
+        folder = 'EDA/Correlation/Cross/'
         for key in self.data.keys():
+            if self.tag + key + '_differ_ ' + str(self.differ) + '.png' in os.listdir(folder):
+                continue
             print('[EDA] Cross-Correlation: ', key)
-            fig = plt.figure(figsiz=[24, 16])
+            fig = plt.figure(figsize=[24, 16])
             plt.xcorr(self.data[key], self.output, maxlags=self.lags)
             plt.title(key)
-            fig.savefig('EDA/Correlation/Cross/' + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
+            fig.savefig(folder + self.tag + key + '_differ_ ' + str(self.differ) + '.png', format='png', dpi=300)
             plt.close()
 
     def featureRanking(self, args={}):
+        if self.tag + 'RF.png' in os.listdir('EDA/Nonlinear Correlation'):
+            pass
         if set(self.output) == {1, -1}:
             model = RandomForestClassifier(**args).fit(self.data, self.output)
         else:
             model = RandomForestRegressor(**args).fit(self.data, self.output)
         fig = plt.figure(figsize=[24, 16])
         ind = np.flip(np.argsort(model.feature_importances_))
-        plt.bar(range(max(ind) + 1), height=model.feature_importances_)
+        plt.bar(list(self.data.keys()[ind]), height=model.feature_importances_[ind])
         plt.xticks(rotation=60)
         np.save('EDA/Nonlinear Correlation/' + self.tag + '.npy', model.feature_importances_)
         fig.savefig('EDA/Nonlinear Correlation/' + self.tag + 'RF.png', format='png', dpi=300)
@@ -509,6 +595,7 @@ class Modelling(object):
         self.shuffle = shuffle
         self.split = split
         self.plot = plot
+        self.acc = []
         if regression:
             self.regression(input, output)
         if classification:
@@ -527,11 +614,10 @@ class Modelling(object):
         # Fix plot
         if self.plot:
             plt.figure()
-            plt.plot(np.array(vo))
+            plt.plot(np.array(vo), c='#FFA62B')
 
         # Models
         print('[modelling] Initiating all model instances')
-        acc = []
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
         from sklearn.experimental import enable_hist_gradient_boosting
         ridge = linear_model.Ridge()
@@ -544,20 +630,21 @@ class Modelling(object):
         hgbr = ensemble.HistGradientBoostingRegressor()
         rfr = ensemble.RandomForestRegressor()
         mlp = neural_network.MLPRegressor()
-        models = [ridge, lasso, sgd, knr, dtr, ada, gbr, hgbr, mlp]
-        for model in models:
+        self.models = [ridge, lasso, sgd, knr, dtr, ada, gbr, hgbr, mlp]
+        for model in self.models:
             t = time.time()
             model.fit(ti, to)
             tp = model.predict(ti)
             p = model.predict(vi)
-            acc.append(Metrics.mae(vo, p))
+            self.acc.append(Metrics.mae(vo, p))
+            joblib.dump(model, 'Models/AutoML_IM_' + model.__module__ + '_mae_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
             print('[modelling] %s MAE in/out: %.2f %.2f, training time: %.1f s' % (model.__module__[8:].ljust(60), Metrics.mae(to, tp), Metrics.mae(vo, p), time.time() - t))
         if self.plot:
-            ind = np.where(acc == np.min(acc))
-            p = model.predict(vi)
-            plt.plot(p)
+            ind = np.where(self.acc == np.min(self.acc))[0][0]
+            p = self.models[ind].predict(vi)
+            plt.plot(p, color='#2369ec')
             plt.title('Predictions')
             plt.legend(['True output', 'Ridge', 'Lasso', 'SGD', 'KNR', 'DTR', 'ADA', 'GBR', 'HGBR', 'MLP', 'Best'])
             plt.ylabel('Output')
@@ -821,8 +908,6 @@ class GridSearch(object):
                 'params': param
             })
         return pd.DataFrame(self.result)
-
-
 
 # Objects for Hyperparameter Optimization
 class LSTM(object):
