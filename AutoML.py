@@ -308,7 +308,7 @@ class Preprocessing(object):
         self.catCols = []
         self.dateCols = []
         if indexCol:
-            self.indexCol = re.sub('[^a-zA-Z0-9 \n\.]', '_', x.lower()) for x in indexCol
+            self.indexCol = re.sub('[^a-zA-Z0-9 \n\.]', '_', indexCol.lower())
         else:
             self.indexCol = None
 
