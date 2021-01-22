@@ -32,7 +32,8 @@ class Pipeline(object):
                  info_threshold=0.975,
                  max_diff=1,
                  include_output=False,
-                 use_prev=True,
+                 use_prev_data=True,
+                 use_prev_mod=True,
                  shift=[0]):
         print('\n\n*** Start Amplo PM Model Builder ***\n\n')
         assert type(target) == str;
@@ -51,7 +52,8 @@ class Pipeline(object):
         self.info_threshold = info_threshold
         self.max_diff = max_diff
         self.include_output = include_output
-        self.prev = use_prev
+        self.prev_data = use_prev_data
+        self.prev_mod = use_prev_mod
         self.shift = shift
         self.catKeys = []
         self.dateKeys = []
@@ -75,12 +77,11 @@ class Pipeline(object):
                 pass
 
     def fit(self, data):
-        # Check if data is already available
+        # Data preparation
         files = os.listdir('AutoML/Data/')
-        if self.prev and len(files) != 0:
+        if self.prev_data and len(files) != 0:
             self.input = pd.read_csv('AutoML/Data/Selected.csv', index_col='index')
             self.output = pd.read_csv('AutoML/Data/Output.csv', index_col='index')
-            self.best_model = joblib.load('AutoML/Models/best_model.joblib')
         else:
 
             # Clean
@@ -168,16 +169,28 @@ class Pipeline(object):
             rf_data[self.target] = output
             rf_data.to_csv('AutoML/Data/rf_selected_data.csv')
 
+        # Initial Modelling
+        if self.prev_mod and os.path.exists('AutoML/Models/best_model.joblib'):
+            self.best_model = joblib.load('AutoML/Models/best_model.joblib')
+        else:
+            # Load col keep
+            if not col_keep in locals():
+                col_keep = np.load('AutoML/Data/Col_Keep.py')
+
             # Initial Modelling
             init = []
             for cols in col_keep:
-                init.append(Modelling(input[cols], output, regression=True, plot=True, store_folder='AutoML/Models/'))
+                init.append(Modelling(input[cols], output,
+                                      regression=self.regression,
+                                      classification=self.classification,
+                                      store_folder='AutoML/Models/'))
 
             # Find best Dataset / Model
             data_ind = np.argmin([min(x.acc) for x in init])
             model_ind = np.argmin(init[data_ind].acc)
 
             # Store
+            np.save(col_keep, 'AutoML/Data/Col_Keep.npy')
             self.output = output
             self.output.to_csv('AutoML/Data/Output.csv', index_label='index')
             self.input = input[col_keep[data_ind]]
@@ -186,7 +199,7 @@ class Pipeline(object):
             joblib.dump(self.best_model, 'AutoML/Models/best_model.joblib')
 
         # Hyperparameter optimization
-        if self.prev and len(os.listdir('AutoML/Hyperparameter Opt/')) != 0:
+        if self.prev_mod and len(os.listdir('AutoML/Hyperparameter Opt/')) != 0:
             pass
         else:
             params = self.get_hyper_params()
@@ -199,7 +212,7 @@ class Pipeline(object):
             results.to_csv('AutoML/Hyperparameter Opt/Results.csv', index_label='index')
 
         # Retrain and save
-        if self.prev and 'OptimalModel.joblib'in os.listdir('AutoML/'):
+        if self.prev_mod and 'OptimalModel.joblib'in os.listdir('AutoML/'):
             print('[AutoML] Already conducted & stored full AutoML cycle.')
         else:
             print('[AutoML] Retraining with optimal parameters.')
@@ -294,8 +307,11 @@ class Preprocessing(object):
         :param zScoreThreshold: If outlierRemoval='zscore', the threshold is adaptable, default=4.
         '''
         ### Data
-        self.inputPath = inputPath if inputPath[-1] == '/' else inputPath + '/'
-        self.outputPath = outputPath if outputPath[-1] == '/' else outputPath + '/'
+        self.inputPath, self.outputPath = None, None
+        if inputPath:
+            self.inputPath = inputPath if inputPath[-1] == '/' else inputPath + '/'
+        if outputPath:
+            self.outputPath = outputPath if outputPath[-1] == '/' else outputPath + '/'
 
         ### Algorithms
         missingValuesImplemented = ['remove', 'interpolate', 'mean']
@@ -375,11 +391,11 @@ class Preprocessing(object):
                     self.dateCols.append(key)
                     data[key] = pd.to_datetime(data[key])
                     continue
-                try:
+                if len(set(data[key])) <= 15:
                     dummies = pd.get_dummies(data[key])
                     data = data.drop(key, axis=1).join(dummies)
                     self.catCols.extend(dummies.keys())
-                except:
+                else:
                     data = data.drop(key, axis=1)
         print('[preprocessing] Found %i variables, %i numeric, %i dates, %i categorical' % (
             len(data.keys()), len(self.numCols), len(self.dateCols), len(self.catCols)))
@@ -412,7 +428,7 @@ class Preprocessing(object):
         if self.missingValues == 'remove':
             data = data[data.isna().sum(axis=1) == 0]
         elif self.missingValues == 'interpolate':
-            ik = np.setdiff1d(data.keys(), self.dateCols)
+            ik = np.setdiff1d(data.keys().to_list(), self.dateCols)
             data[ik] = data[ik].interpolate(limit_direction='both')
             if data.isna().sum().sum() != 0:
                 data = data.fillna(0)
@@ -710,7 +726,54 @@ class Modelling(object):
             self.classification(input, output)
 
     def classification(self, input, output):
-        # LDA, QDA, LSVM, KNN, RBF SVM, DT, RF, ANN, LSTM, AdaBoost,
+        # Data
+        print('[modelling] Splitting data (shuffle=%s, split=%i %%)' % (str(self.shuffle), int(self.split * 100)))
+        from sklearn import model_selection
+        ti, vi, to, vo = model_selection.train_test_split(input, output, test_size=self.split, shuffle=self.shuffle)
+
+        # Fix plot
+        if self.plot:
+            plt.figure()
+            plt.plot(np.array(vo), c='#FFA62B')
+
+        # Models
+        print('[modelling] Initiating all model instances')
+        from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
+        from sklearn.experimental import enable_hist_gradient_boosting
+        ridge = linear_model.RidgeClassifier()
+        lasso = linear_model.Lasso()
+        sgd = linear_model.SGDClassifier()
+        svc = svm.SVC(kernel='rbf')
+        knc = neighbors.KNeighborsClassifier()
+        dtc = tree.DecisionTreeClassifier()
+        ada = ensemble.AdaBoostClassifier()
+        bag = ensemble.BaggingClassifier()
+        gbc = ensemble.GradientBoostingClassifier()
+        hgbc = ensemble.HistGradientBoostingClassifier()
+        rfc = ensemble.RandomForestClassifier()
+        mlp = neural_network.MLPClassifier()
+        self.models = [ridge, lasso, sgd, svc, knc, dtc, ada, gbc, hgbc, mlp]
+        for model in self.models:
+            t = time.time()
+            model.fit(ti, to)
+            tp = model.predict(ti)
+            p = model.predict(vi)
+            self.acc.append(Metrics.mae(vo, p))
+            joblib.dump(model, self.store + '/AutoML_IM_' + model.__module__ + '_mae_%.5f.joblib' % self.acc[-1])
+            if self.plot:
+                plt.plot(p, alpha=0.2)
+            print('[modelling] %s MAE in/out: %.2f %.2f, training time: %.1f s' % (model.__module__[8:].ljust(60), Metrics.mae(to, tp), Metrics.mae(vo, p), time.time() - t))
+        if self.plot:
+            ind = np.where(self.acc == np.min(self.acc))[0][0]
+            p = self.models[ind].predict(vi)
+            plt.plot(p, color='#2369ec')
+            plt.title('Predictions')
+            plt.legend(['True output', 'Ridge', 'Lasso', 'SGD', 'KNR', 'DTR', 'ADA', 'GBR', 'HGBR', 'MLP', 'Best'])
+            plt.ylabel('Output')
+            plt.xlabel('Samples')
+            plt.show()
+        return self
+
         return 0
 
     def regression(self, input, output):
@@ -731,6 +794,7 @@ class Modelling(object):
         ridge = linear_model.Ridge()
         lasso = linear_model.Lasso()
         sgd = linear_model.SGDRegressor()
+        svr = svm.SVR(kernel='rbf')
         knr = neighbors.KNeighborsRegressor()
         dtr = tree.DecisionTreeRegressor()
         ada = ensemble.AdaBoostRegressor()
@@ -738,7 +802,7 @@ class Modelling(object):
         hgbr = ensemble.HistGradientBoostingRegressor()
         rfr = ensemble.RandomForestRegressor()
         mlp = neural_network.MLPRegressor()
-        self.models = [ridge, lasso, sgd, knr, dtr, ada, gbr, hgbr, mlp]
+        self.models = [ridge, lasso, sgd, svr, knr, dtr, ada, gbr, hgbr, mlp]
         for model in self.models:
             t = time.time()
             model.fit(ti, to)
