@@ -209,7 +209,7 @@ class Pipeline(object):
             self.best_model.fit(self.input, self.output)
             joblib.dump(self.best_model, 'AutoML/OptimalModel.joblib')
 
-            print('\n\n[AutoML] Completed, score: %.4f \u00B1 %.4f' % (results.iloc[0]['mean_score'], results.iloc['std_score']))
+            print('\n\n[AutoML] Completed, score: %.4f \u00B1 %.4f' % (results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
 
     def predict(self, sample):
         normed = self.norm.convert(sample)
