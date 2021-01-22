@@ -163,7 +163,7 @@ class Pipeline(object):
                         corr_mat[i, j] = c
                         corr_mat[j, i] = c
             upper = np.triu(corr_mat)
-            col_drop = input.keys()[np.sum(upper > self.info_threshold, axis=0) > 0]
+            col_drop = input.keys()[np.sum(upper > self.info_threshold, axis=0) > 0].to_list()
             input = input.drop(col_drop, axis=1)
             print('[AutoML] Dropped %i Co-Linear variables.' % len(col_drop))
 
@@ -569,15 +569,21 @@ class ExploratoryDataAnalysis(object):
         :param seasonPeriods: List of periods to check for seasonality
         :param lags: Lags for (P)ACF and
         '''
+        assert isinstance(data, pd.DataFrame)
+
         # Register data
-        self.differ = differ
-        self.tag = pretag
-        self.folder = folder if folder[-1] == '/' else folder + '/'
-        self.maxSamples = maxSamples
         self.data = data
         self.output = output
+
+        # General settings
         self.seasonPeriods = seasonPeriods
-        self.lags = lags
+        self.maxSamples = maxSamples        # Timeseries
+        self.differ = differ                # Correlations
+        self.lags = lags                    # Correlations
+
+        # Storage settings
+        self.tag = pretag
+        self.folder = folder if folder[-1] == '/' else folder + '/'
         self.skip = skip_completed
 
         # Create dirs
@@ -605,6 +611,8 @@ class ExploratoryDataAnalysis(object):
             self.crossCorr()
             print('[EDA] Generating Feature Ranking Plot')
             self.featureRanking()
+            print('[EDA] Predictive Power Score Plot')
+            self.predictivePowerScore()
 
     def createDirs(self):
         dirs = ['EDA', 'EDA/Boxplots', 'EDA/Seasonality', 'EDA/Colinearity', 'EDA/Lags', 'EDA/Correlation',
@@ -733,7 +741,7 @@ class ExploratoryDataAnalysis(object):
 
     def featureRanking(self, args={}):
         if self.tag + 'RF.png' in os.listdir(self.folder + 'EDA/Nonlinear Correlation'):
-            pass
+            return
         if set(self.output) == {1, -1}:
             model = RandomForestClassifier(**args).fit(self.data, self.output)
         else:
@@ -744,6 +752,20 @@ class ExploratoryDataAnalysis(object):
         plt.xticks(rotation=60)
         np.save(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + '.npy', model.feature_importances_)
         fig.savefig(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'RF.png', format='png', dpi=300)
+        plt.close()
+
+    def predictivePowerScore(self):
+        if self.tag + 'Ppscore.png' in os.listdir(self.folder + 'EDA/Nonlinear Correlation'):
+            return
+        data = self.data.copy()
+        if isinstance(self.output, pd.core.series.Series):
+            data.loc[:, 'target'] = self.output
+        elif isinstance(self.output, pd.DataFrame):
+            data.loc[:, 'target'] = self.output.loc[:, self.output.keys()[0]]
+        pp_score = pps.predictors(data, 'target')
+        fig = plt.figure(figsize=[24, 16])
+        sns.barplot(data=pp_score, x='x', y='ppscore')
+        fig.savefig(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'Ppscore.png', format='png', dpi=300)
         plt.close()
 
 
@@ -763,8 +785,12 @@ class Modelling(object):
             self.classification(input, output)
 
     def classification(self, input, output):
+        # Convert to NumPy
+        input = np.array(input)
+        output = np.array(output)
+
         # Data
-        print('[modelling] Splitting data (shuffle=%s, splits=%i %%)' % (str(self.shuffle), self.n_splits))
+        print('[modelling] Splitting data (shuffle=%s, splits=%i)' % (str(self.shuffle), self.n_splits))
         from sklearn.model_selection import StratifiedKFold
         cv = StratifiedKFold(n_splits=self.n_splits, shuffle=self.shuffle)
 
@@ -795,21 +821,23 @@ class Modelling(object):
         for master_model in self.models:
 
             # Time & loops through Cross-Validation
-            t = time.time()
+            t_start = time.time()
             v_acc = []
             t_acc = []
             for t, v in cv.split(input, output):
+                ti, vi, to, vo = input[t], input[v], output[t], output[v]
                 model = sklearn.base.clone(master_model)
                 model.fit(ti, to)
                 v_acc.append(Metrics.acc(vo, model.predict(vi)))
                 t_acc.append(Metrics.acc(to, model.predict(ti)))
 
             # Results
+            self.acc.append(np.mean(v_acc))
             joblib.dump(model, self.store + '/AutoML_IM_' + model.__module__ + '_mae_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
-            print('[modelling] %s ACC train/val: %.2f %.2f, training time: %.1f s' %
-                  (model.__module__[8:].ljust(60), np.mean(t_acc), np.mean(v_acc), time.time() - t))
+            print('[modelling] %s ACC train/val: %.1f %% / %.1f %%, training time: %.1f s' %
+                  (model.__module__[8:].ljust(60), np.mean(t_acc) * 100, np.mean(v_acc) * 100, time.time() - t_start))
         if self.plot:
             ind = np.where(self.acc == np.min(self.acc))[0][0]
             p = self.models[ind].predict(vi)
@@ -822,6 +850,10 @@ class Modelling(object):
         return self
 
     def regression(self, input, output):
+        # Convert to NumPy
+        input = np.array(input)
+        output = np.array(output)
+
         # Data
         print('[modelling] Splitting data (shuffle=%s, split=%i %%)' % (str(self.shuffle), int(self.split * 100)))
         from sklearn import model_selection
