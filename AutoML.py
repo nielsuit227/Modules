@@ -16,26 +16,31 @@ from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
-# todo multiprocessing for EDA RF, GridSearch
-# todo seq with pandas
-# todo flat=bool for sequence (needed for lightGBM)
-# todo implement PPS in EDA
-# todo implement SHAP in EDA
-# todo EDA to pandas
-# todo implement autoencoder for Feature Extraction
+# Priority
+# Add classification hyperparameters
+# Add cross-validation options to pipeline
+# Add cross-validation options to modelling
 
-# todo Determine Lag based on Auto/Cross Correlations
+# Nicety
+# todo multiprocessing for EDA RF, GridSearch
+# todo flat=bool for sequence (needed for lightGBM)
+# todo implement SHAP in EDA
+# todo implement autoencoder for Feature Extraction
 
 class Pipeline(object):
     def __init__(self, target,
                  max_lags=15,
                  info_threshold=0.975,
                  max_diff=1,
+                 shuffle=False,
+                 n_splits=1,
                  include_output=False,
                  use_prev_data=True,
                  use_prev_mod=True,
                  shift=[0]):
         print('\n\n*** Start Amplo PM Model Builder ***\n\n')
+
+        # Checks
         assert type(target) == str;
         assert type(shift) == list;
         assert type(info_threshold) == float;
@@ -44,16 +49,24 @@ class Pipeline(object):
         assert info_threshold > 0 and info_threshold < 1;
         assert max_diff < 5;
         assert max(shift) >= 0 and min(shift) < 50;
-        self.input = None
-        self.output = None
-        self.best_model = None
-        self.target = re.sub('[^a-zA-Z0-9 \n\.]', '_', target.lower())
+
+        # Data prep params
         self.max_lags = max_lags
         self.info_threshold = info_threshold
         self.max_diff = max_diff
         self.include_output = include_output
         self.prev_data = use_prev_data
+
+        # Modelling Params
+        self.shuffle = shuffle
         self.prev_mod = use_prev_mod
+        self.n_splits = n_splits
+
+        # Instance initiating
+        self.input = None
+        self.output = None
+        self.best_model = None
+        self.target = re.sub('[^a-zA-Z0-9 \n\.]', '_', target.lower())
         self.shift = shift
         self.catKeys = []
         self.dateKeys = []
@@ -82,6 +95,15 @@ class Pipeline(object):
         if self.prev_data and len(files) != 0:
             self.input = pd.read_csv('AutoML/Data/Selected.csv', index_col='index')
             self.output = pd.read_csv('AutoML/Data/Output.csv', index_col='index')
+            if len(set(self.output[self.target])) == 2:
+                self.classification = True
+                self.regression = False
+            if self.classification:
+                output_set = set(self.output[self.target])
+                if output_set != {-1, 1}:
+                    print('[AutoML] WARNING: Classification labels should be {-1, 1}, AutoML changed them.')
+                    self.output.loc[self.output.loc[:, self.target] == list(output_set)[0], self.target] = -1
+                    self.output.loc[self.output.loc[:, self.target] == list(output_set)[0], self.target] = 1
         else:
 
             # Clean
@@ -146,8 +168,9 @@ class Pipeline(object):
             print('[AutoML] Dropped %i Co-Linear variables.' % len(col_drop))
 
             # Keep all
-            col_keep = [input.keys()]
+            col_keep = [input.keys().to_list()]
             input.to_csv('AutoML/Data/All_selected_data.csv')
+            output.to_csv('AutoML/Data/Output.csv')
 
             # Keep based on PPScore
             data = input.copy()
@@ -155,45 +178,58 @@ class Pipeline(object):
             pp_score = pps.predictors(data, "target")
             col_keep.append(pp_score['x'][pp_score['ppscore'] != 0].to_list())
             pp_data = input[col_keep[1]]
-            pp_data[self.target] = output
+            pp_data.loc[:, self.target] = output.loc[:, self.target]
             pp_data.to_csv('AutoML/Data/pp_selected_data.csv')
 
             # Keep based on RF
-            rf = RandomForestRegressor().fit(input, output)
+            if self.regression:
+                rf = RandomForestRegressor().fit(input, output[self.target])
+            elif self.classification:
+                rf = RandomForestClassifier().fit(input, output[self.target])
             fi = rf.feature_importances_
             sfi = fi.sum()
             ind = np.flip(np.argsort(fi))
             ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.info_threshold * sfi]
-            col_keep.append(list(input.keys()[ind_keep]))
+            col_keep.append(input.keys()[ind_keep].to_list())
             rf_data = input[col_keep[2]]
-            rf_data[self.target] = output
+            rf_data.loc[:, self.target] = output.loc[:, self.target]
             rf_data.to_csv('AutoML/Data/rf_selected_data.csv')
+
+            # Store to self
+            self.input = input
+            self.output = output
 
         # Initial Modelling
         if self.prev_mod and os.path.exists('AutoML/Models/best_model.joblib'):
             self.best_model = joblib.load('AutoML/Models/best_model.joblib')
         else:
             # Load col keep
-            if not col_keep in locals():
-                col_keep = np.load('AutoML/Data/Col_Keep.py')
+            if not 'col_keep' in locals():
+                with open('AutoML/Data/Col_keep.json', 'r') as f:
+                    col_keep = json.load(f)
 
             # Initial Modelling
             init = []
             for cols in col_keep:
-                init.append(Modelling(input[cols], output,
+                init.append(Modelling(self.input.loc[:, cols], self.output.loc[:, self.target],
                                       regression=self.regression,
+                                      shuffle=self.shuffle,
+                                      n_splits=self.n_splits,
                                       classification=self.classification,
                                       store_folder='AutoML/Models/'))
 
             # Find best Dataset / Model
-            data_ind = np.argmin([min(x.acc) for x in init])
-            model_ind = np.argmin(init[data_ind].acc)
+            if self.regression:
+                data_ind = np.argmin([min(x.acc) for x in init])
+                model_ind = np.argmin(init[data_ind].acc)
+            elif self.classification:
+                data_ind = np.argmax([max(x.acc) for x in init])
+                model_ind = np.argmax(init[data_ind].acc)
 
             # Store
-            np.save(col_keep, 'AutoML/Data/Col_Keep.npy')
-            self.output = output
-            self.output.to_csv('AutoML/Data/Output.csv', index_label='index')
-            self.input = input[col_keep[data_ind]]
+            with open('AutoML/Data/Col_keep.json', 'w') as f:
+                json.dump(col_keep, f)
+            self.input = self.input[col_keep[data_ind]]
             self.input.to_csv('AutoML/Data/Selected.csv', index_label='index')
             self.best_model = init[data_ind].models[model_ind]
             joblib.dump(self.best_model, 'AutoML/Models/best_model.joblib')
@@ -714,11 +750,12 @@ class ExploratoryDataAnalysis(object):
 class Modelling(object):
 
     def __init__(self, input, output, regression=False, classification=False, shuffle=False, split=0.2, plot=False,
-                 store_folder=''):
+                 store_folder='', n_splits=3):
         self.shuffle = shuffle
         self.split = split
         self.plot = plot
         self.acc = []
+        self.n_splits = n_splits
         self.store = store_folder if store_folder[-1] != '/' else store_folder[:-1]
         if regression:
             self.regression(input, output)
@@ -727,9 +764,9 @@ class Modelling(object):
 
     def classification(self, input, output):
         # Data
-        print('[modelling] Splitting data (shuffle=%s, split=%i %%)' % (str(self.shuffle), int(self.split * 100)))
-        from sklearn import model_selection
-        ti, vi, to, vo = model_selection.train_test_split(input, output, test_size=self.split, shuffle=self.shuffle)
+        print('[modelling] Splitting data (shuffle=%s, splits=%i %%)' % (str(self.shuffle), self.n_splits))
+        from sklearn.model_selection import StratifiedKFold
+        cv = StratifiedKFold(n_splits=self.n_splits, shuffle=self.shuffle)
 
         # Fix plot
         if self.plot:
@@ -753,16 +790,26 @@ class Modelling(object):
         rfc = ensemble.RandomForestClassifier()
         mlp = neural_network.MLPClassifier()
         self.models = [ridge, lasso, sgd, svc, knc, dtc, ada, gbc, hgbc, mlp]
-        for model in self.models:
+
+        # Loop through models
+        for master_model in self.models:
+
+            # Time & loops through Cross-Validation
             t = time.time()
-            model.fit(ti, to)
-            tp = model.predict(ti)
-            p = model.predict(vi)
-            self.acc.append(Metrics.mae(vo, p))
+            v_acc = []
+            t_acc = []
+            for t, v in cv.split(input, output):
+                model = sklearn.base.clone(master_model)
+                model.fit(ti, to)
+                v_acc.append(Metrics.acc(vo, model.predict(vi)))
+                t_acc.append(Metrics.acc(to, model.predict(ti)))
+
+            # Results
             joblib.dump(model, self.store + '/AutoML_IM_' + model.__module__ + '_mae_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
-            print('[modelling] %s MAE in/out: %.2f %.2f, training time: %.1f s' % (model.__module__[8:].ljust(60), Metrics.mae(to, tp), Metrics.mae(vo, p), time.time() - t))
+            print('[modelling] %s ACC train/val: %.2f %.2f, training time: %.1f s' %
+                  (model.__module__[8:].ljust(60), np.mean(t_acc), np.mean(v_acc), time.time() - t))
         if self.plot:
             ind = np.where(self.acc == np.min(self.acc))[0][0]
             p = self.models[ind].predict(vi)
@@ -773,8 +820,6 @@ class Modelling(object):
             plt.xlabel('Samples')
             plt.show()
         return self
-
-        return 0
 
     def regression(self, input, output):
         # Data
@@ -812,7 +857,7 @@ class Modelling(object):
             joblib.dump(model, self.store + '/AutoML_IM_' + model.__module__ + '_mae_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
-            print('[modelling] %s MAE in/out: %.2f %.2f, training time: %.1f s' % (model.__module__[8:].ljust(60), Metrics.mae(to, tp), Metrics.mae(vo, p), time.time() - t))
+            print('[modelling] %s MAE train/val: %.2f %.2f, training time: %.1f s' % (model.__module__[8:].ljust(60), Metrics.mae(to, tp), Metrics.mae(vo, p), time.time() - t))
         if self.plot:
             ind = np.where(self.acc == np.min(self.acc))[0][0]
             p = self.models[ind].predict(vi)
@@ -857,11 +902,13 @@ class Metrics(object):
         # else:
         return np.mean(abs(np.array(ytrue).reshape((-1)) - np.array(ypred).reshape((-1))))
 
-
     def mse(ytrue, ypred):
         ytrue = ytrue.reshape((-1))
         ypred = ypred.reshape((-1))
         return np.mean((ytrue - ypred) ** 2)
+
+    def acc(ytrue, ypred):
+        return (np.array(np.sign(ytrue)).reshape((-1)) == np.array(np.sign(ypred)).reshape((-1))).sum() / len(np.array(ytrue))
 
 
 class Sequence(object):
