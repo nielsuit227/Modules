@@ -277,6 +277,7 @@ class Preprocessing(object):
                  missingValues='interpolate',
                  outlierRemoval='none',
                  zScoreThreshold=4,
+                 remove_constants=True
                  ):
         '''
         Preprocessing Class. Deals with Outliers, Missing Values, duplicate rows, data types (floats, categorical and dates),
@@ -293,8 +294,8 @@ class Preprocessing(object):
         :param zScoreThreshold: If outlierRemoval='zscore', the threshold is adaptable, default=4.
         '''
         ### Data
-        self.inputPath = inputPath
-        self.outputPath = outputPath
+        self.inputPath = inputPath if inputPath[-1] == '/' else inputPath + '/'
+        self.outputPath = outputPath if outputPath[-1] == '/' else outputPath + '/'
 
         ### Algorithms
         missingValuesImplemented = ['remove', 'interpolate', 'mean']
@@ -307,6 +308,7 @@ class Preprocessing(object):
         self.outlierRemoval = outlierRemoval
         self.zScoreThreshold = zScoreThreshold
         self.parseDates = parseDates
+        self.removeConstants = remove_constants
 
         ### Columns
         self.numCols = []
@@ -319,21 +321,33 @@ class Preprocessing(object):
 
         ### If inputPath:
         if self.inputPath:
-            files = os.listdir(inputPath)
-            for file in files:
-                data = pd.read_csv(self.inputPath + path,
+            for file in os.listdir(inputPath):
+                print('[preprocessing] %s%s' % (inputPath, file))
+                data = pd.read_csv(self.inputPath + file,
                                    index_col=self.indexCol,
-                                   parse_dates=self.datesCols)
-                self.clean(data)
+                                   parse_dates=self.dateCols)
+                self.clean(data, file=file)
 
 
-    def clean(self, data):
+    def clean(self, data, file=None):
         print('[preprocessing] Data Cleaning Started, %i samples' % len(data))
         # Clean column names
         newKeys = {}
         for key in data.keys():
             newKeys[key] = re.sub('[^a-zA-Z0-9 \n\.]', '_', key.lower())
         data = data.rename(columns=newKeys)
+
+        # Duplicates
+        n_samples = len(data)
+        data = data.drop_duplicates()
+        diff = len(data) - n_samples
+        if diff > 0:
+            print('[preprocessing] Dropped %i duplicate rows' % diff)
+        n_cols = len(data.keys())
+        data = data.loc[:,~data.columns.duplicated()]
+        diff = len(data.keys()) - n_cols
+        if diff > 0:
+            print('[preprocessing] Dropped %i duplicate columns' % diff)
 
         # Identify data types & convert
         ''' First checks for numeric (fastest). 
@@ -371,14 +385,8 @@ class Preprocessing(object):
             len(data.keys()), len(self.numCols), len(self.dateCols), len(self.catCols)))
 
         # Drop constant columns
-        data = data.drop(data.keys()[data.min() == data.max()], axis=1)
-
-        # Duplicates
-        n_samples = len(data)
-        data = data.drop_duplicates()
-        diff = len(data) - n_samples
-        if diff > 0:
-            print('[preprocessing] Dropped %i duplicate rows' % diff)
+        if self.removeConstants:
+            data = data.drop(data.keys()[data.min() == data.max()], axis=1)
 
         # Remove Anomalies
         n_nans = data.isna().sum().sum()
@@ -416,8 +424,8 @@ class Preprocessing(object):
         # Save
         print('[preprocessing] Completed, %i samples returned' % len(data))
         if self.outputPath:
-            print('[preprocessing] Saving to: ', self.outputPath + path)
-            data.to_csv(self.outputPath + path, index=self.indexCol is not None)
+            print('[preprocessing] Saving to: ', self.outputPath + file)
+            data.to_csv(self.outputPath + file, index=self.indexCol is not None)
         return data
 
 
