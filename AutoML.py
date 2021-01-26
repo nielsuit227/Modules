@@ -232,7 +232,7 @@ class Pipeline(object):
             rf_data.to_csv('AutoML/Data/rf_selected_data.csv', index_label='index')
 
             # Store to self
-            json.dump(col_keep, open('AutoML/Data/Col_keep.json', 'w'))
+            json.dump(self.col_keep, open('AutoML/Data/Col_keep.json', 'w'))
             pickle.dump(self.prep, open('AutoML/Data/Preprocessing.pickle', 'wb'))
             pickle.dump(self.norm, open('AutoML/Data/Normalization.pickle', 'wb'))
 
@@ -990,7 +990,7 @@ class Modelling(object):
         output = np.array(output)
 
         # Data
-        print('[modelling] Splitting data (shuffle=%s, splits=%i)' % (str(self.shuffle), self.n_splits))
+        print('[modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.n_splits, len(input[0])))
         from sklearn.model_selection import StratifiedKFold
         cv = StratifiedKFold(n_splits=self.n_splits, shuffle=self.shuffle)
 
