@@ -1,4 +1,4 @@
-import os, time, itertools, re, joblib, json
+import os, time, itertools, re, joblib, json, pickle
 import numpy as np
 import pandas as pd
 import ppscore as pps
@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import multiprocessing as mp
 
 import sklearn
+from sklearn import neural_network
+from sklearn.metrics import plot_roc_curve, auc
 from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 
@@ -17,18 +19,19 @@ from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 # Priority
-# Add classification hyperparameters
-# Add cross-validation options to pipeline
-# Add cross-validation options to modelling
+# Regression Validation Pipeline
+# todo implement SHAP in EDA
+# Add CatBoost to Modelling & get_hyper_params
 
 # Nicety
+# todo preprocessing check for big chunks of missing data
 # todo multiprocessing for EDA RF, GridSearch
 # todo flat=bool for sequence (needed for lightGBM)
-# todo implement SHAP in EDA
 # todo implement autoencoder for Feature Extraction
 
 class Pipeline(object):
     def __init__(self, target,
+                 missing_values='interpolate',
                  max_lags=15,
                  info_threshold=0.975,
                  max_diff=1,
@@ -51,6 +54,7 @@ class Pipeline(object):
         assert max(shift) >= 0 and min(shift) < 50;
 
         # Data prep params
+        self.missing_values = missing_values
         self.max_lags = max_lags
         self.info_threshold = info_threshold
         self.max_diff = max_diff
@@ -66,6 +70,8 @@ class Pipeline(object):
         self.input = None
         self.output = None
         self.best_model = None
+        self.col_keep = None
+        self.best_features = None
         self.target = re.sub('[^a-zA-Z0-9 \n\.]', '_', target.lower())
         self.shift = shift
         self.catKeys = []
@@ -90,47 +96,79 @@ class Pipeline(object):
                 pass
 
     def fit(self, data):
-        # Data preparation
+        # Data preparation -- Creates/Loads All_selected, output, pp_selected, rf_selected
+        self.data_preparation(data)
+        # Initial Modelling
+        self.initial_modelling()
+        # Hyperparameter optimization
+        self.grid_search()
+
+        # Retrain and save
+        if self.prev_mod and 'OptimalModel.joblib'in os.listdir('AutoML/'):
+            print('[autoML] Already conducted & stored full AutoML cycle.')
+        else:
+            print('[autoML] Retraining with optimal parameters.')
+            f = 'AutoML/Hyperparameter Opt/'
+            for file in os.listdir(f):
+                results = pd.read_csv(f + file)
+                params = json.loads(results.iloc[0]['params'].replace("'", '"'))
+                self.best_model.set_params(**params)
+                self.best_model.fit(self.input, self.output)
+                joblib.dump(self.best_model, 'AutoML/%s.joblib' % file[:file.find('.csv')])
+
+            print('\n\n[autoML] Completed, score: %.4f \u00B1 %.4f' % (results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
+
+        # Validation
+        self.validate()
+
+    def predict(self, sample):
+        normed = self.norm.convert(sample)
+        pred = self.best_model.predict(normed)
+        return self.norm.revert_output(pred)
+
+    def data_preparation(self, data):
         files = os.listdir('AutoML/Data/')
         if self.prev_data and len(files) != 0:
-            self.input = pd.read_csv('AutoML/Data/Selected.csv', index_col='index')
+            self.input = pd.read_csv('AutoML/Data/All_selected_data.csv', index_col='index')
             self.output = pd.read_csv('AutoML/Data/Output.csv', index_col='index')
             if len(set(self.output[self.target])) == 2:
                 self.classification = True
                 self.regression = False
-            if self.classification:
-                output_set = set(self.output[self.target])
-                if output_set != {-1, 1}:
-                    print('[AutoML] WARNING: Classification labels should be {-1, 1}, AutoML changed them.')
-                    self.output.loc[self.output.loc[:, self.target] == list(output_set)[0], self.target] = -1
-                    self.output.loc[self.output.loc[:, self.target] == list(output_set)[0], self.target] = 1
         else:
-
             # Clean
-            self.prep = Preprocessing(missingValues='interpolate')
+            self.prep = Preprocessing(missingValues=self.missing_values)
             data = self.prep.clean(data)
 
             # Split data
-            output = data[self.target]
-            input = data
+            self.output = data[self.target]
+            self.input = data
             if self.include_output is False:
-                input = input.drop(self.target, axis=1)
+                self.input = self.input.drop(self.target, axis=1)
 
             # EDA
-            self.eda = ExploratoryDataAnalysis(input, output=output, folder='AutoML/')
+            self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder='AutoML/')
 
             # Check whether is classification
-            if len(set(output)) == 2:
+            if len(set(self.output)) == 2:
                 self.classification = True
                 self.regression = False
+            if self.classification:
+                output_set = set(self.output)
+                if output_set != {-1, 1}:
+                    print('[autoML] WARNING: Classification labels should be {-1, 1}, AutoML changed them.')
+                    self.output.loc[self.output == list(output_set)[0]] = -1
+                    self.output.loc[self.output == list(output_set)[1]] = 1
 
             # Normalize
-            input, output = self.norm.convert(input, output=output)
+            if self.regression:
+                self.input, self.output = self.norm.convert(self.input, output=self.output)
+            elif self.classification:
+                self.input = self.norm.convert(self.input)
 
             # Stationarity Check
             if self.max_diff != 0:
-                varVec = np.zeros((self.max_diff + 1, len(data.keys())))
-                diffData = data.copy(deep=True)
+                varVec = np.zeros((self.max_diff + 1, len(self.input.keys())))
+                diffData = self.input.copy(deep=True)
                 for i in range(self.max_diff + 1):
                     varVec[i, :] = diffData.std()
                     diffData = diffData.diff(1)[1:]
@@ -139,19 +177,19 @@ class Pipeline(object):
                     self.diff = 'none'
                 else:
                     self.diff = 'diff'
-                print('[autoML] Optimal Differencing order: %i' % self.diffOrder)
+                    print('[autoML] Optimal Differencing order: %i' % self.diffOrder)
             else:
                 self.diff = 'none'
 
             # Differencing, shifting, lagging
-            n_features = len(input.keys())
+            n_features = len(self.input.keys())
             self.seq = Sequence(back=self.max_lags, forward=self.shift, diff=self.diff)
-            input, output = self.seq.convert_pandas(input, output) # Double brackets keep it DataFrame
-            print('[AutoML] Added %i lags' % (len(input.keys()) - n_features))
+            self.input, self.output = self.seq.convert_pandas(self.input, self.output) # Double brackets keep it DataFrame
+            print('[autoML] Added %i lags' % (len(self.input.keys()) - n_features))
 
             # Remove Colinearity
-            nk = len(input.keys())
-            norm = (input - input.mean(skipna=True, numeric_only=True)).to_numpy()
+            nk = len(self.input.keys())
+            norm = (self.input - self.input.mean(skipna=True, numeric_only=True)).to_numpy()
             ss = np.sqrt(np.sum(norm ** 2, axis=0))
             corr_mat = np.zeros((nk, nk))
             for i in range(nk):
@@ -163,55 +201,57 @@ class Pipeline(object):
                         corr_mat[i, j] = c
                         corr_mat[j, i] = c
             upper = np.triu(corr_mat)
-            col_drop = input.keys()[np.sum(upper > self.info_threshold, axis=0) > 0].to_list()
-            input = input.drop(col_drop, axis=1)
-            print('[AutoML] Dropped %i Co-Linear variables.' % len(col_drop))
+            col_drop = self.input.keys()[np.sum(upper > self.info_threshold, axis=0) > 0].to_list()
+            self.input = self.input.drop(col_drop, axis=1)
+            print('[autoML] Dropped %i Co-Linear variables.' % len(col_drop))
 
             # Keep all
-            col_keep = [input.keys().to_list()]
-            input.to_csv('AutoML/Data/All_selected_data.csv')
-            output.to_csv('AutoML/Data/Output.csv')
+            self.col_keep = [self.input.keys().to_list()]
+            self.input.to_csv('AutoML/Data/All_selected_data.csv', index_label='index')
+            self.output.to_csv('AutoML/Data/Output.csv', index_label='index')
 
             # Keep based on PPScore
-            data = input.copy()
-            data['target'] = output.copy()
+            data = self.input.copy()
+            data['target'] = self.output.copy()
             pp_score = pps.predictors(data, "target")
-            col_keep.append(pp_score['x'][pp_score['ppscore'] != 0].to_list())
-            pp_data = input[col_keep[1]]
-            pp_data.loc[:, self.target] = output.loc[:, self.target]
-            pp_data.to_csv('AutoML/Data/pp_selected_data.csv')
+            self.col_keep.append(pp_score['x'][pp_score['ppscore'] != 0].to_list())
+            pp_data = self.input[self.col_keep[-1]]
+            pp_data.to_csv('AutoML/Data/pp_selected_data.csv', index_label='index')
 
             # Keep based on RF
             if self.regression:
-                rf = RandomForestRegressor().fit(input, output[self.target])
+                rf = RandomForestRegressor().fit(self.input, self.output[self.target])
             elif self.classification:
-                rf = RandomForestClassifier().fit(input, output[self.target])
+                rf = RandomForestClassifier().fit(self.input, self.output[self.target])
             fi = rf.feature_importances_
             sfi = fi.sum()
             ind = np.flip(np.argsort(fi))
             ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.info_threshold * sfi]
-            col_keep.append(input.keys()[ind_keep].to_list())
-            rf_data = input[col_keep[2]]
-            rf_data.loc[:, self.target] = output.loc[:, self.target]
-            rf_data.to_csv('AutoML/Data/rf_selected_data.csv')
+            self.col_keep.append(self.input.keys()[ind_keep].to_list())
+            rf_data = self.input[self.col_keep[-1]]
+            rf_data.to_csv('AutoML/Data/rf_selected_data.csv', index_label='index')
 
             # Store to self
-            self.input = input
-            self.output = output
+            json.dump(col_keep, open('AutoML/Data/Col_keep.json', 'w'))
+            pickle.dump(self.prep, open('AutoML/Data/Preprocessing.pickle', 'wb'))
+            pickle.dump(self.norm, open('AutoML/Data/Normalization.pickle', 'wb'))
 
-        # Initial Modelling
+    def initial_modelling(self):
+        # Check if not already completed
         if self.prev_mod and os.path.exists('AutoML/Models/best_model.joblib'):
             self.best_model = joblib.load('AutoML/Models/best_model.joblib')
+            with open('AutoML/Data/best_features.json', 'r') as f:
+                self.best_features = json.load(f)
         else:
             # Load col keep
-            if not 'col_keep' in locals():
+            if self.col_keep is None:
                 with open('AutoML/Data/Col_keep.json', 'r') as f:
-                    col_keep = json.load(f)
+                    self.col_keep = json.load(f)
 
             # Initial Modelling
             init = []
-            for cols in col_keep:
-                init.append(Modelling(self.input.loc[:, cols], self.output.loc[:, self.target],
+            for cols in self.col_keep:
+                init.append(Modelling(self.input.reindex(columns=cols), self.output.loc[:, self.target],
                                       regression=self.regression,
                                       shuffle=self.shuffle,
                                       n_splits=self.n_splits,
@@ -227,93 +267,251 @@ class Pipeline(object):
                 model_ind = np.argmax(init[data_ind].acc)
 
             # Store
-            with open('AutoML/Data/Col_keep.json', 'w') as f:
-                json.dump(col_keep, f)
-            self.input = self.input[col_keep[data_ind]]
+            with open('AutoML/Data/best_features.json', 'w') as f:
+                json.dump(self.col_keep[data_ind], f)
+            self.input = self.input[self.col_keep[data_ind]]
             self.input.to_csv('AutoML/Data/Selected.csv', index_label='index')
             self.best_model = init[data_ind].models[model_ind]
             joblib.dump(self.best_model, 'AutoML/Models/best_model.joblib')
 
-        # Hyperparameter optimization
-        if self.prev_mod and len(os.listdir('AutoML/Hyperparameter Opt/')) != 0:
-            pass
-        else:
-            params = self.get_hyper_params()
-            cv = KFold(n_splits=3)
-            self.grid = GridSearch(self.best_model, params,
-                                   cv=cv, scoring=Metrics.mae)
-            results = self.grid.fit(self.input, self.output)
-            results['worst_case'] = results['mean_score'] + results['std_score']
-            results = results.sort_values('worst_case')
-            results.to_csv('AutoML/Hyperparameter Opt/Results.csv', index_label='index')
-
-        # Retrain and save
-        if self.prev_mod and 'OptimalModel.joblib'in os.listdir('AutoML/'):
-            print('[AutoML] Already conducted & stored full AutoML cycle.')
-        else:
-            print('[AutoML] Retraining with optimal parameters.')
-            results = pd.read_csv('AutoML/Hyperparameter Opt/Results.csv')
-            params = json.loads(results.iloc[0]['params'].replace("'", '"').lower())
-            self.best_model.set_params(**params)
-            self.best_model.fit(self.input, self.output)
-            joblib.dump(self.best_model, 'AutoML/OptimalModel.joblib')
-
-            print('\n\n[AutoML] Completed, score: %.4f \u00B1 %.4f' % (results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
-
-    def predict(self, sample):
-        normed = self.norm.convert(sample)
-        pred = self.best_model.predict(normed)
-        return self.norm.revert_output(pred)
-
     def get_hyper_params(self):
-        if isinstance(self.best_model, sklearn.ensemble._gb.GradientBoostingRegressor):
-            return {
-                'loss': ['ls', 'lad', 'huber'],
-                'learning_rate': [0.001, 0.01, 0.1, 0.2, 0.4],
-                'n_estimators': [100, 300, 500],
-                'max_depth': [3, 5, 10],
-            }
-        elif isinstance(self.best_model, sklearn.linear_model.Lasso) or \
+        print('[autoML] Getting Hyperparameters for ', type(self.best_model).__name__)
+        # Parameters for both Regression / Classification
+        if isinstance(self.best_model, sklearn.linear_model.Lasso) or \
             isinstance(self.best_model, sklearn.linear_model.Ridge):
             return {
                 'alpha': [0.001, 0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 2, 3, 4, 5]
             }
-        elif isinstance(self.best_model, sklearn.linear_model.SGDRegressor):
+        elif isinstance(self.best_model, sklearn.svm.SVC) or \
+                isinstance(self.best_model, sklearn.svm.SVR):
             return {
-                'loss': ['squared_loss', 'huber', 'epsilon_insensitive', 'squared_epsilon_insensitive'],
-                'penalty': ['l2', 'l1', 'elasticnet'],
-                'alpha': [0.001, 0.01, 0.1, 0.5, 1, 2],
+                'gamma': [0.001, 0.01, 0.1, 0.5, 1],
+                'C': [0.01, 0.1, 0.2, 0.5],
             }
-        elif isinstance(self.best_model, sklearn.neighbors.KNeighborsRegressor):
+        elif isinstance(self.best_model, sklearn.neighbors.KNeighborsRegressor) or \
+                isinstance(self.best_model, sklearn.neighbors.KNeighborsClassifier):
             return {
                 'n_neighbors': [5, 10, 25, 50],
                 'weights': ['uniform', 'distance'],
                 'leaf_size': [10, 30, 50, 100],
-                'n_jobs': [mp.cpu_count()],
+                'n_jobs': [mp.cpu_count()-1],
             }
-        elif isinstance(self.best_model, sklearn.tree.DecisionTreeRegressor):
+        elif isinstance(self.best_model, sklearn.neural_network._multilayer_perceptron.MLPClassifier) or \
+            isinstance(self.best_model, sklearn.neural_network._multilayer_perceptron.MLPRegressor):
             return {
-                'criterion': ['mse', 'friedman_mse', 'mae', 'poisson'],
-                'max_depth': [None, 5, 10, 25, 50],
+                'hidden_layer_sizes': [(100,), (100, 100), (100, 50), (200, 200), (200, 100), (200, 50), (50, 50, 50, 50)]
             }
-        elif isinstance(self.best_model, sklearn.ensemble.AdaBoostRegressor):
-            return {
-                'n_estimators': [25, 50, 100, 250],
-                'loss': ['linear', 'square', 'exponential'],
-                'learning_rate': [0.5, 0.75, 0.9, 0.95, 1]
-            }
-        elif isinstance(self.best_model, sklearn.ensemble.HistGradientBoostingRegressor):
-            return {
-        'max_iter': [100, 250],
-        'max_bins': [100, 255],
-        'loss': ['least_squares', 'least_absolute_deviation'],
-        'l2_regularization': [0.001, 0.005, 0.01, 0.05],
-        'learning_rate': [0.01, 0.1, 0.25, 0.4],
-        'max_leaf_nodes': [31, 50, 75, 150],
-        'early_stopping': [True]
-            }
+
+        # Regressor specific hyperparameters
+        elif self.regression:
+            if isinstance(self.best_model, sklearn.linear_model.SGDRegressor):
+                return {
+                    'loss': ['squared_loss', 'huber', 'epsilon_insensitive', 'squared_epsilon_insensitive'],
+                    'penalty': ['l2', 'l1', 'elasticnet'],
+                    'alpha': [0.001, 0.01, 0.1, 0.5, 1, 2],
+                }
+            elif isinstance(self.best_model, sklearn.tree.DecisionTreeRegressor):
+                return {
+                    'criterion': ['mse', 'friedman_mse', 'mae', 'poisson'],
+                    'max_depth': [None, 5, 10, 25, 50],
+                }
+            elif isinstance(self.best_model, sklearn.ensemble.AdaBoostRegressor):
+                return {
+                    'n_estimators': [25, 50, 100, 250],
+                    'loss': ['linear', 'square', 'exponential'],
+                    'learning_rate': [0.5, 0.75, 0.9, 0.95, 1]
+                }
+            elif isinstance(self.best_model, sklearn.ensemble.GradientBoostingRegressor):
+                return {
+                    'loss': ['ls', 'lad', 'huber'],
+                    'learning_rate': [0.001, 0.01, 0.1, 0.2, 0.4],
+                    'n_estimators': [100, 300, 500],
+                    'max_depth': [3, 5, 10],
+                }
+            elif isinstance(self.best_model, sklearn.ensemble.HistGradientBoostingRegressor):
+                return {
+                    'max_iter': [100, 250],
+                    'max_bins': [100, 255],
+                    'loss': ['least_squares', 'least_absolute_deviation'],
+                    'l2_regularization': [0.001, 0.005, 0.01, 0.05],
+                    'learning_rate': [0.01, 0.1, 0.25, 0.4],
+                    'max_leaf_nodes': [31, 50, 75, 150],
+                    'early_stopping': [True]
+                }
+            elif isinstance(self.best_model, sklearn.ensemble.RandomForestRegressor):
+                return {
+                    'criterion': ['mse', 'mae'],
+                    'max_depth': [None, 5, 10, 25, 50],
+                }
+
+        # Classification specific hyperparameters
+        elif self.classification:
+            if isinstance(self.best_model, sklearn.linear_model.SGDClassifier):
+                return {
+                    'loss': ['hinge', 'log' 'modified_huber', 'squared_hinge'],
+                    'penalty': ['l2', 'l1', 'elasticnet'],
+                    'alpha': [0.001, 0.01, 0.1, 0.5, 1, 2],
+                }
+            elif isinstance(self.best_model, sklearn.tree.DecisionTreeClassifier):
+                return {
+                    'criterion': ['gini', 'entropy'],
+                    'max_depth': [None, 5, 10, 25, 50],
+                }
+            elif isinstance(self.best_model, sklearn.ensemble.AdaBoostClassifier):
+                return {
+                    'n_estimators': [25, 50, 100, 250],
+                    'learning_rate': [0.5, 0.75, 0.9, 0.95, 1]
+                }
+            elif isinstance(self.best_model, sklearn.ensemble.GradientBoostingClassifier):
+                return {
+                    'loss': ['deviance', 'exponential'],
+                    'learning_rate': [0.001, 0.01, 0.1, 0.2, 0.4],
+                    'n_estimators': [100, 300, 500],
+                    'max_depth': [None, 3, 5, 10],
+                }
+            elif isinstance(self.best_model, sklearn.ensemble.HistGradientBoostingClassifier):
+                return {
+                    'max_iter': [100, 250],
+                    'max_bins': [100, 255],
+                    'loss': ['deviance', 'exponential'],
+                    'l2_regularization': [0.001, 0.005, 0.01, 0.05],
+                    'learning_rate': [0.01, 0.1, 0.25, 0.4],
+                    'max_leaf_nodes': [31, 50, 75, 150],
+                    'early_stopping': [True]
+                }
+            elif isinstance(self.best_model, sklearn.ensemble.RandomForestClassifier):
+                return {
+                    'criterion': ['gini', 'entropy'],
+                    'max_depth': [None, 5, 10, 25, 50],
+                }
+
+        # Raise error if nothing is returned
+        raise NotImplementedError('Hyperparameter tuning not implemented for ', type(self.best_model).__name__)
+
+    def grid_search(self, model=None, params=None):
+        # Optional Argument
+        if model is not None:
+            self.best_model = model
+
+        # Check if Optimization is not already completed
+        if self.prev_mod and type(self.best_model).__name__ + '.csv' in os.listdir('AutoML/Hyperparameter Opt/'):
+            # Need to load optimal model here, need to check which hyperparameters are best :(
+            score = None
+            for file in os.listdir('AutoML/Hyperparameter Opt/'):
+                hp_opt = pd.read_csv('AutoML/Hyperparameter Opt/' + file)
+                if score is not None:
+                    if hp_opt.loc[0, 'worst_case'] < score:
+                        continue
+                score = hp_opt.loc[0, 'worst_case']
+                model = file[:file.find('.csv')]
+                params = json.loads(hp_opt.loc[0, 'params'].replace("'", '"'))
+            model_file = [x for x in os.listdir('AutoML') if model in x][0]
+            self.best_model = joblib.load('AutoML/' + model_file)
+            self.best_model.set_params(**params)
         else:
-            raise NotImplementedError('Hyperparameter tuning not implemented for ', self.best_model.__module__)
+            # Get parameters
+            print('[autoML] Starting Hyperparameter Optimization (%i sample, %i features)' %
+                  (len(self.input), len(self.input.keys())))
+            if params is None:
+                params = self.get_hyper_params()
+
+            # Set up Cross-Validation
+            if self.regression:
+                self.grid = GridSearch(self.best_model, params,
+                                       cv=KFold(n_splits=self.n_splits),
+                                       scoring=Metrics.mae)
+                results = self.grid.fit(self.input, self.output)
+                results['worst_case'] = results['mean_score'] + results['std_score']
+                results = results.sort_values('worst_case')
+            elif self.classification:
+                self.grid = GridSearch(self.best_model, params,
+                                       cv=StratifiedKFold(n_splits=self.n_splits),
+                                       scoring=Metrics.acc)
+                results = self.grid.fit(self.input, self.output)
+                results['worst_case'] = results['mean_score'] - results['std_score']
+                results = results.sort_values('worst_case', ascending=False)
+            results.to_csv('AutoML/Hyperparameter Opt/%s.csv' % type(self.best_model).__name__, index_label='index')
+
+    def validate(self):
+        print('\n\n[autoML] Validating results for %s' % type(self.best_model).__name__)
+        if not os.path.exists('AutoML/Validation/'): os.mkdir('AutoML/Validation')
+
+        # For classification
+        if self.classification:
+            # Initiating
+            acc = []
+            prec = []
+            rec = []
+            spec = []
+            cm = np.zeros((2, 2))
+            vals = np.zeros((2))
+            aucs = []
+            tprs = []
+            fig, ax = plt.subplots(figsize=[16, 12])
+            mean_fpr = np.linspace(0, 1, 100)
+
+            # Modelling
+            cv = StratifiedKFold(n_splits=self.n_splits)
+            input, output = np.array(self.input), np.array(self.output)
+            for i, (t, v) in enumerate(cv.split(self.input, self.output)):
+                n = len(v)
+                ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
+                model = sklearn.base.clone(self.best_model)
+                model.fit(ti, to)
+                predictions = model.predict(vi)
+
+                # ROC Plot
+                viz = plot_roc_curve(model, vi, vo, name='ROC fold {}'.format(i), alpha=0.3, ax=ax)
+                interp_tpr = np.interp(mean_fpr, viz.fpr, viz.tpr)
+                interp_tpr[0] = 0.0
+                tprs.append(interp_tpr)
+                aucs.append(viz.roc_auc)
+
+                # Metrics
+                vals += np.array([(vo == 1).sum(), (vo == -1).sum()]) / self.n_splits
+                tp = np.logical_and(np.sign(predictions) == 1, vo == 1).sum()
+                tn = np.logical_and(np.sign(predictions) == -1, vo == -1).sum()
+                fp = np.logical_and(np.sign(predictions) == 1, vo == -1).sum()
+                fn = np.logical_and(np.sign(predictions) == -1, vo == 1).sum()
+                acc.append((tp + tn) / n * 100)
+                prec.append(tp / (tp + fp) * 100)
+                rec.append(tp / (tp + fn) * 100)
+                spec.append(tn / (tn + fp) * 100)
+                cm += np.array([[tp, fp], [fn, tn]]) / self.n_splits
+
+            # Plot
+            ax.plot([0, 1], [0, 1], linestyle='--', lw=2, color='#ffa62b',
+                    label='Chance', alpha=.8)
+            mean_tpr = np.mean(tprs, axis=0)
+            mean_tpr[-1] = 1.0
+            mean_auc = auc(mean_fpr, mean_tpr)
+            std_auc = np.std(aucs)
+            ax.plot(mean_fpr, mean_tpr, color='#2369ec',
+                    label=r'Mean ROC (AUC = %0.2f $\pm$ %0.2f)' % (mean_auc, std_auc),
+                    lw=2, alpha=.8)
+            std_tpr = np.std(tprs, axis=0)
+            tprs_upper = np.minimum(mean_tpr + std_tpr, 1)
+            tprs_lower = np.maximum(mean_tpr - std_tpr, 0)
+            ax.fill_between(mean_fpr, tprs_lower, tprs_upper, color='#729ce9', alpha=.2,
+                            label=r'$\pm$ 1 std. dev.')
+            ax.set(xlim=[-0.05, 1.05], ylim=[-0.05, 1.05],
+                   title="Receiver operating characteristic example")
+            ax.legend(loc="lower right")
+            fig.savefig('AutoML/Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
+            plt.show()
+            # Results
+            f1 = [2 * prec[i] * rec[i] / (prec[i] + rec[i]) for i in range(self.n_splits)]
+            p = np.mean(prec)
+            r = np.mean(rec)
+            print('[autoML] Accuracy:        %.2f \u00B1 %.2f %%' % (np.mean(acc), np.std(acc)))
+            print('[autoML] Precision:       %.2f \u00B1 %.2f %%' % (p, np.std(prec)))
+            print('[autoML] Recall:          %.2f \u00B1 %.2f %%' % (r, np.std(rec)))
+            print('[autoML] Specificity:     %.2f \u00B1 %.2f %%' % (np.mean(spec), np.std(spec)))
+            print('[autoML] F1-score:        %.2f \u00B1 %.2f %%' % (np.mean(f1), np.std(f1)))
+            print('[autoML] Confusion Matrix:')
+            print('[autoML] Pred \ true  |  ISO faulty   |   ISO operational      ')
+            print('[autoML]  ISO faulty  |  %s|  %s' % (('%.1f' % cm[0, 0]).ljust(13), cm[0, 1]))
+            print('[autoML]  ISO oper.   |  %s|  %s' % (('%.1f' % cm[1, 0]).ljust(13), cm[1, 1]))
 
 
 class Preprocessing(object):
@@ -350,7 +548,7 @@ class Preprocessing(object):
             self.outputPath = outputPath if outputPath[-1] == '/' else outputPath + '/'
 
         ### Algorithms
-        missingValuesImplemented = ['remove', 'interpolate', 'mean']
+        missingValuesImplemented = ['remove_rows', 'remove_cols', 'interpolate', 'mean', 'zero']
         outlierRemovalImplemented = ['boxplot', 'zscore', 'none']
         if outlierRemoval not in outlierRemovalImplemented:
             raise ValueError("Outlier Removal Algo not implemented. Should be in " + str(outlierRemovalImplemented))
@@ -402,9 +600,6 @@ class Preprocessing(object):
             print('[preprocessing] Dropped %i duplicate columns' % diff)
 
         # Identify data types & convert
-        ''' First checks for numeric (fastest). 
-        If numeric, it
-        '''
         missingThreshold = 0.5
         integerThreshold = 0.01
         for key in data.keys():
@@ -459,10 +654,13 @@ class Preprocessing(object):
             print('[preprocessing] Removed %i outliers.' % diff)
 
         # Missing Values
-        # todo check for big chunks of missing data
         data = data.replace([np.inf, -np.inf], np.nan)
-        if self.missingValues == 'remove':
+        if self.missingValues == 'remove_rows':
             data = data[data.isna().sum(axis=1) == 0]
+        elif self.missingValues == 'remove_cols':
+            data = data.loc[:, data.isna().sum(axis=0) == 0]
+        elif self.missingValues == 'zero':
+            data = data.fillna(0)
         elif self.missingValues == 'interpolate':
             ik = np.setdiff1d(data.keys().to_list(), self.dateCols)
             data[ik] = data[ik].interpolate(limit_direction='both')
@@ -643,7 +841,7 @@ class ExploratoryDataAnalysis(object):
 
     def timeplots(self):
         matplotlib.use('Agg')
-        matplotlib.rcParams['agg.path.chunksize'] = 20000000 # 20M
+        matplotlib.rcParams['agg.path.chunksize'] = 200000
         # Undersample
         data = self.data.iloc[np.linspace(0, len(self.data) - 1, self.maxSamples).astype('int')]
         # Plot
@@ -749,8 +947,8 @@ class ExploratoryDataAnalysis(object):
         fig = plt.figure(figsize=[24, 16])
         ind = np.flip(np.argsort(model.feature_importances_))
         plt.bar(list(self.data.keys()[ind]), height=model.feature_importances_[ind])
-        plt.xticks(rotation=60)
-        np.save(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + '.npy', model.feature_importances_)
+        plt.xticks(rotation=60, ha='right')
+        np.save(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'RF.npy', model.feature_importances_)
         fig.savefig(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'RF.png', format='png', dpi=300)
         plt.close()
 
@@ -765,7 +963,9 @@ class ExploratoryDataAnalysis(object):
         pp_score = pps.predictors(data, 'target')
         fig = plt.figure(figsize=[24, 16])
         sns.barplot(data=pp_score, x='x', y='ppscore')
+        plt.xticks(rotation=60, ha='right')
         fig.savefig(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'Ppscore.png', format='png', dpi=300)
+        pp_score.to_csv(self.folder + 'EDA/Nonlinear Correlation/pp_score.csv')
         plt.close()
 
 
@@ -815,7 +1015,7 @@ class Modelling(object):
         hgbc = ensemble.HistGradientBoostingClassifier()
         rfc = ensemble.RandomForestClassifier()
         mlp = neural_network.MLPClassifier()
-        self.models = [ridge, lasso, sgd, svc, knc, dtc, ada, gbc, hgbc, mlp]
+        self.models = [ridge, lasso, sgd, svc, knc, dtc, ada, bag, gbc, hgbc, mlp]
 
         # Loop through models
         for master_model in self.models:
@@ -833,11 +1033,11 @@ class Modelling(object):
 
             # Results
             self.acc.append(np.mean(v_acc))
-            joblib.dump(model, self.store + '/AutoML_IM_' + model.__module__ + '_mae_%.5f.joblib' % self.acc[-1])
+            joblib.dump(model, self.store + '/AutoML_IM_' + type(model).__name__ + '_mae_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
             print('[modelling] %s ACC train/val: %.1f %% / %.1f %%, training time: %.1f s' %
-                  (model.__module__[8:].ljust(60), np.mean(t_acc) * 100, np.mean(v_acc) * 100, time.time() - t_start))
+                  (type(model).__name__.ljust(60), np.mean(t_acc) * 100, np.mean(v_acc) * 100, time.time() - t_start))
         if self.plot:
             ind = np.where(self.acc == np.min(self.acc))[0][0]
             p = self.models[ind].predict(vi)
@@ -886,10 +1086,10 @@ class Modelling(object):
             tp = model.predict(ti)
             p = model.predict(vi)
             self.acc.append(Metrics.mae(vo, p))
-            joblib.dump(model, self.store + '/AutoML_IM_' + model.__module__ + '_mae_%.5f.joblib' % self.acc[-1])
+            joblib.dump(model, self.store + '/AutoML_IM_' + type(model).__name__ + '_mae_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
-            print('[modelling] %s MAE train/val: %.2f %.2f, training time: %.1f s' % (model.__module__[8:].ljust(60), Metrics.mae(to, tp), Metrics.mae(vo, p), time.time() - t))
+            print('[modelling] %s MAE train/val: %.2f %.2f, training time: %.1f s' % (type(model).__name__.ljust(60), Metrics.mae(to, tp), Metrics.mae(vo, p), time.time() - t))
         if self.plot:
             ind = np.where(self.acc == np.min(self.acc))[0][0]
             p = self.models[ind].predict(vi)
@@ -1106,10 +1306,10 @@ class GridSearch(object):
         self.scoring = scoring
         self._parse_params()
 
-        if scoring == Metrics.r2score:
-            self.best = [-np.inf, 0]
-        else:
+        if scoring == Metrics.mae or scoring == Metrics.mse:
             self.best = [np.inf, 0]
+        else:
+            self.best = [-np.inf, 0]
 
 
     def _parse_params(self):
@@ -1127,11 +1327,13 @@ class GridSearch(object):
             input = np.array(input)
         if isinstance(output, pd.DataFrame) or isinstance(output, pd.core.series.Series):
             output = np.array(output).reshape((-1))
+
+        # Loop through parameters
         for i, param in enumerate(self.parsed_params):
             print('[GridSearch] ', param)
             scoring = []
             timing = []
-            for train_ind, val_ind in self.cv.split(input):
+            for train_ind, val_ind in self.cv.split(input, output):
                 # Start Timer
                 t = time.time()
 
@@ -1143,14 +1345,19 @@ class GridSearch(object):
                 model = sklearn.base.clone(self.model, safe=True)
                 model.set_params(**param)
                 model.fit(xtrain, ytrain)
+
+                # Results
                 scoring.append(self.scoring(model.predict(xval), yval))
                 timing.append(time.time() - t)
-            if self.scoring == Metrics.r2score:
-                if np.mean(scoring) - np.std(scoring) > self.best[0] - self.best[1]:
-                    self.best = [np.mean(scoring), np.std(scoring)]
-            else:
+
+            # Compare scores
+            if scoring == Metrics.mae or scoring == Metrics.mse:
                 if np.mean(scoring) + np.std(scoring) <= self.best[0] + self.best[1]:
                     self.best = [np.mean(scoring), np.std(scoring)]
+            else:
+                if np.mean(scoring) - np.std(scoring) > self.best[0] - self.best[1]:
+                    self.best = [np.mean(scoring), np.std(scoring)]
+
             print('[GridSearch] [%s] Score: %.4f \u00B1 %.4f (in %.1f seconds) (Best score so-far: %.4f \u00B1 %.4f) (%i / %i)' %
                   (datetime.now().strftime('%H:%M'), np.mean(scoring), np.std(scoring), np.mean(timing), self.best[0], self.best[1], i + 1, len(self.parsed_params)))
             self.result.append({
