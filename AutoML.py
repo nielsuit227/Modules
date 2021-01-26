@@ -93,7 +93,7 @@ class Pipeline(object):
             try:
                 os.mkdir(dir)
             except:
-                pass
+                continue
 
     def fit(self, data):
         # Data preparation -- Creates/Loads All_selected, output, pp_selected, rf_selected
@@ -102,24 +102,6 @@ class Pipeline(object):
         self.initial_modelling()
         # Hyperparameter optimization
         self.grid_search()
-
-        # Retrain and save
-        if self.prev_mod and 'OptimalModel.joblib'in os.listdir('AutoML/'):
-            print('[autoML] Already conducted & stored full AutoML cycle.')
-        else:
-            print('[autoML] Retraining with optimal parameters.')
-            f = 'AutoML/Hyperparameter Opt/'
-            for file in os.listdir(f):
-                results = pd.read_csv(f + file)
-                params = json.loads(results.iloc[0]['params'].replace("'", '"'))
-                self.best_model.set_params(**params)
-                self.best_model.fit(self.input, self.output)
-                joblib.dump(self.best_model, 'AutoML/%s.joblib' % file[:file.find('.csv')])
-
-            print('\n\n[autoML] Completed, score: %.4f \u00B1 %.4f' % (results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
-
-        # Validation
-        self.validate()
 
     def predict(self, sample):
         normed = self.norm.convert(sample)
@@ -131,6 +113,7 @@ class Pipeline(object):
         if self.prev_data and len(files) != 0:
             self.input = pd.read_csv('AutoML/Data/All_selected_data.csv', index_col='index')
             self.output = pd.read_csv('AutoML/Data/Output.csv', index_col='index')
+            self.col_keep = json.load(open('AutoML/Data/Col_keep.json', 'r'))
             if len(set(self.output[self.target])) == 2:
                 self.classification = True
                 self.regression = False
@@ -161,9 +144,9 @@ class Pipeline(object):
 
             # Normalize
             if self.regression:
-                self.input, self.output = self.norm.convert(self.input, output=self.output)
+                self.input, self.output = self.norm.fit(self.input, output=self.output)
             elif self.classification:
-                self.input = self.norm.convert(self.input)
+                self.input = self.norm.fit(self.input)
 
             # Stationarity Check
             if self.max_diff != 0:
@@ -240,8 +223,8 @@ class Pipeline(object):
         # Check if not already completed
         if self.prev_mod and os.path.exists('AutoML/Models/best_model.joblib'):
             self.best_model = joblib.load('AutoML/Models/best_model.joblib')
-            with open('AutoML/Data/best_features.json', 'r') as f:
-                self.best_features = json.load(f)
+            self.best_features = json.load(open('AutoML/Data/best_features.json', 'r'))
+            self.input = self.input.reindex(columns=self.best_features)
         else:
             # Load col keep
             if self.col_keep is None:
@@ -250,7 +233,9 @@ class Pipeline(object):
 
             # Initial Modelling
             init = []
-            for cols in self.col_keep:
+            ds = ['All', 'PPS Selected', 'RF Selected']
+            for i, cols in enumerate(self.col_keep):
+                print('[autoML] Initial Modelling for %s features (%i)' % (ds[i], len(cols)))
                 init.append(Modelling(self.input.reindex(columns=cols), self.output.loc[:, self.target],
                                       regression=self.regression,
                                       shuffle=self.shuffle,
@@ -267,15 +252,16 @@ class Pipeline(object):
                 model_ind = np.argmax(init[data_ind].acc)
 
             # Store
-            with open('AutoML/Data/best_features.json', 'w') as f:
-                json.dump(self.col_keep[data_ind], f)
-            self.input = self.input[self.col_keep[data_ind]]
+            self.best_features = self.col_keep[data_ind]
+            self.input = self.input[self.best_features]
             self.input.to_csv('AutoML/Data/Selected.csv', index_label='index')
             self.best_model = init[data_ind].models[model_ind]
+            json.dump(self.best_features, open('AutoML/Data/best_features.json', 'w'))
             joblib.dump(self.best_model, 'AutoML/Models/best_model.joblib')
+            print('[autoML] Storing %s features with %s model' % (ds[data_ind], type(self.best_model).__name__))
 
     def get_hyper_params(self):
-        print('[autoML] Getting Hyperparameters for ', type(self.best_model).__name__)
+        print('[autoML] Getting Hyperparameters for', type(self.best_model).__name__)
         # Parameters for both Regression / Classification
         if isinstance(self.best_model, sklearn.linear_model.Lasso) or \
             isinstance(self.best_model, sklearn.linear_model.Ridge):
@@ -285,8 +271,8 @@ class Pipeline(object):
         elif isinstance(self.best_model, sklearn.svm.SVC) or \
                 isinstance(self.best_model, sklearn.svm.SVR):
             return {
-                'gamma': [0.001, 0.01, 0.1, 0.5, 1],
-                'C': [0.01, 0.1, 0.2, 0.5],
+                'gamma': ['scale', 'auto', 0.001, 0.01, 0.1, 0.5, 1],
+                'C': [0.01, 0.1, 0.2, 0.5, 1, 2, 5],
             }
         elif isinstance(self.best_model, sklearn.neighbors.KNeighborsRegressor) or \
                 isinstance(self.best_model, sklearn.neighbors.KNeighborsClassifier):
@@ -392,48 +378,57 @@ class Pipeline(object):
         # Optional Argument
         if model is not None:
             self.best_model = model
-
-        # Check if Optimization is not already completed
-        if self.prev_mod and type(self.best_model).__name__ + '.csv' in os.listdir('AutoML/Hyperparameter Opt/'):
-            # Need to load optimal model here, need to check which hyperparameters are best :(
-            score = None
-            for file in os.listdir('AutoML/Hyperparameter Opt/'):
-                hp_opt = pd.read_csv('AutoML/Hyperparameter Opt/' + file)
-                if score is not None:
-                    if hp_opt.loc[0, 'worst_case'] < score:
-                        continue
-                score = hp_opt.loc[0, 'worst_case']
-                model = file[:file.find('.csv')]
-                params = json.loads(hp_opt.loc[0, 'params'].replace("'", '"'))
-            model_file = [x for x in os.listdir('AutoML') if model in x][0]
-            self.best_model = joblib.load('AutoML/' + model_file)
-            self.best_model.set_params(**params)
         else:
-            # Get parameters
-            print('[autoML] Starting Hyperparameter Optimization (%i sample, %i features)' %
-                  (len(self.input), len(self.input.keys())))
-            if params is None:
-                params = self.get_hyper_params()
+            # Check if Optimization is not already completed
+            if self.prev_mod and type(self.best_model).__name__ + '.csv' in os.listdir('AutoML/Hyperparameter Opt/'):
+                # Need to load optimal model here, need to check which hyperparameters are best :(
+                score = None
+                for file in os.listdir('AutoML/Hyperparameter Opt/'):
+                    hp_opt = pd.read_csv('AutoML/Hyperparameter Opt/' + file)
+                    if score is not None:
+                        if hp_opt.loc[0, 'worst_case'] < score:
+                            continue
+                    score = hp_opt.loc[0, 'worst_case']
+                    model = file[:file.find('.csv')]
+                    params = json.loads(hp_opt.loc[0, 'params'].replace("'", '"'))
+                model_file = [x for x in os.listdir('AutoML') if model in x][0]
+                self.best_model = joblib.load('AutoML/' + model_file)
+                self.best_model.set_params(**params)
+                return
+        # Get parameters
+        print('[autoML] Starting Hyperparameter Optimization %s (%i sample, %i features)' %
+              (type(self.best_model).__name__, len(self.input), len(self.best_features)))
+        if params is None:
+            params = self.get_hyper_params()
 
-            # Set up Cross-Validation
-            if self.regression:
-                self.grid = GridSearch(self.best_model, params,
-                                       cv=KFold(n_splits=self.n_splits),
-                                       scoring=Metrics.mae)
-                results = self.grid.fit(self.input, self.output)
-                results['worst_case'] = results['mean_score'] + results['std_score']
-                results = results.sort_values('worst_case')
-            elif self.classification:
-                self.grid = GridSearch(self.best_model, params,
-                                       cv=StratifiedKFold(n_splits=self.n_splits),
-                                       scoring=Metrics.acc)
-                results = self.grid.fit(self.input, self.output)
-                results['worst_case'] = results['mean_score'] - results['std_score']
-                results = results.sort_values('worst_case', ascending=False)
-            results.to_csv('AutoML/Hyperparameter Opt/%s.csv' % type(self.best_model).__name__, index_label='index')
+        # Set up Cross-Validation
+        if self.regression:
+            self.grid = GridSearch(self.best_model, params,
+                                   cv=KFold(n_splits=self.n_splits),
+                                   scoring=Metrics.mae)
+            results = self.grid.fit(self.input, self.output)
+            results['worst_case'] = results['mean_score'] + results['std_score']
+            results = results.sort_values('worst_case')
+        elif self.classification:
+            self.grid = GridSearch(self.best_model, params,
+                                   cv=StratifiedKFold(n_splits=self.n_splits),
+                                   scoring=Metrics.acc)
+            results = self.grid.fit(self.input, self.output)
+            results['worst_case'] = results['mean_score'] - results['std_score']
+            results = results.sort_values('worst_case', ascending=False)
+        results.to_csv('AutoML/Hyperparameter Opt/%s.csv' % type(self.best_model).__name__, index_label='index')
+
+        # Retrain and save
+        params = results.iloc[0]['params']
+        self.best_model.set_params(**params)
+        self.best_model.fit(self.input, self.output)
+        joblib.dump(self.best_model, 'AutoML/%s.joblib' % type(self.best_model).__name__)
+
+        # Validation
+        self.validate()
 
     def validate(self):
-        print('\n\n[autoML] Validating results for %s' % type(self.best_model).__name__)
+        print('\n\n[autoML] Validating results for %s (%s)' % (type(self.best_model).__name__, self.best_model.get_params()))
         if not os.path.exists('AutoML/Validation/'): os.mkdir('AutoML/Validation')
 
         # For classification
@@ -457,6 +452,7 @@ class Pipeline(object):
                 n = len(v)
                 ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
                 model = sklearn.base.clone(self.best_model)
+                # model.set_param
                 model.fit(ti, to)
                 predictions = model.predict(vi)
 
@@ -510,8 +506,8 @@ class Pipeline(object):
             print('[autoML] F1-score:        %.2f \u00B1 %.2f %%' % (np.mean(f1), np.std(f1)))
             print('[autoML] Confusion Matrix:')
             print('[autoML] Pred \ true  |  ISO faulty   |   ISO operational      ')
-            print('[autoML]  ISO faulty  |  %s|  %s' % (('%.1f' % cm[0, 0]).ljust(13), cm[0, 1]))
-            print('[autoML]  ISO oper.   |  %s|  %s' % (('%.1f' % cm[1, 0]).ljust(13), cm[1, 1]))
+            print('[autoML]  ISO faulty  |  %s|  %.1f' % (('%.1f' % cm[0, 0]).ljust(13), cm[0, 1]))
+            print('[autoML]  ISO oper.   |  %s|  %.1f' % (('%.1f' % cm[1, 0]).ljust(13), cm[1, 1]))
 
 
 class Preprocessing(object):
@@ -700,12 +696,7 @@ class Normalize(object):
         if type not in normalizationTypes:
             raise ValueError('Type not implemented. Should be in ' + str(normalizationTypes))
 
-    def convert(self, data, output=None):
-        '''
-        Actual Conversion
-        :param data: Pandas DataFrame.
-        :return:
-        '''
+    def fit(self, data, output=None):
         # Note Stats
         self.mean = data.mean()
         self.var = data.var()
@@ -725,6 +716,25 @@ class Normalize(object):
             self.output_var = output.var()
             self.output_min = output.min()
             self.output_max = output.max()
+            if self.type == 'normal':
+                output -= self.output_mean
+                output /= np.sqrt(self.output_var)
+            elif self.type == 'minmax':
+                output -= self.output_min
+                output /= self.output_max - self.output_min
+            return data, output
+        else:
+            return data
+
+    def convert(self, data, output=None):
+        # Normalize
+        if self.type == 'normal':
+            data -= self.mean
+            data /= np.sqrt(self.var)
+        elif self.type == 'minmax':
+            data -= self.min
+            data /= self.max - self.min
+        if output is not None:
             if self.type == 'normal':
                 output -= self.output_mean
                 output /= np.sqrt(self.output_var)
@@ -871,7 +881,7 @@ class ExploratoryDataAnalysis(object):
 
     def colinearity(self):
         if self.tag + 'Minimum_Representation.png' in os.listdir(self.folder + 'EDA/Colinearity/'):
-            pass
+            return
         threshold = 0.95
         fig = plt.figure(figsize=[24, 16])
         sns.heatmap(abs(self.data.corr()) < threshold, annot=False, cmap='Greys')
@@ -887,7 +897,7 @@ class ExploratoryDataAnalysis(object):
 
     def differencing(self):
         if self.tag + 'Variance.png' in os.listdir(self.folder + 'EDA/Lags/'):
-            pass
+            return
         max_lags = 4
         varVec = np.zeros((max_lags, len(self.data.keys())))
         diffData = self.data / np.sqrt(self.data.var())
@@ -948,7 +958,8 @@ class ExploratoryDataAnalysis(object):
         ind = np.flip(np.argsort(model.feature_importances_))
         plt.bar(list(self.data.keys()[ind]), height=model.feature_importances_[ind])
         plt.xticks(rotation=60, ha='right')
-        np.save(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'RF.npy', model.feature_importances_)
+        results = pd.DataFrame({'x': self.data.keys(), 'score': model.feature_importances_})
+        results.to_csv(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'RF.csv')
         fig.savefig(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'RF.png', format='png', dpi=300)
         plt.close()
 
@@ -1000,7 +1011,6 @@ class Modelling(object):
             plt.plot(np.array(vo), c='#FFA62B')
 
         # Models
-        print('[modelling] Initiating all model instances')
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
         from sklearn.experimental import enable_hist_gradient_boosting
         ridge = linear_model.RidgeClassifier()
@@ -1037,7 +1047,7 @@ class Modelling(object):
             if self.plot:
                 plt.plot(p, alpha=0.2)
             print('[modelling] %s ACC train/val: %.1f %% / %.1f %%, training time: %.1f s' %
-                  (type(model).__name__.ljust(60), np.mean(t_acc) * 100, np.mean(v_acc) * 100, time.time() - t_start))
+                  (type(model).__name__.ljust(40), np.mean(t_acc) * 100, np.mean(v_acc) * 100, time.time() - t_start))
         if self.plot:
             ind = np.where(self.acc == np.min(self.acc))[0][0]
             p = self.models[ind].predict(vi)
