@@ -71,7 +71,7 @@ class Pipeline(object):
         self.output = None
         self.best_model = None
         self.col_keep = None
-        self.best_features = None
+        self.data_ind = None
         self.target = re.sub('[^a-zA-Z0-9 \n\.]', '_', target.lower())
         self.shift = shift
         self.catKeys = []
@@ -223,7 +223,9 @@ class Pipeline(object):
         # Check if not already completed
         if self.prev_mod and os.path.exists('AutoML/Initial Modelling/best_model.joblib'):
             self.best_model = joblib.load('AutoML/Initial Modelling/best_model.joblib')
-            self.best_features = json.load(open('AutoML/Data/best_features.json', 'r'))
+            best_features = json.load(open('AutoML/Data/best_features.json', 'r'))
+            try: self.data_ind = self.col_keep.index(best_features)
+            except: self.data_ind = 0
             self.input = self.input.reindex(columns=self.best_features)
         else:
             # Load col keep
@@ -247,18 +249,17 @@ class Pipeline(object):
 
             # Find best Dataset / Model
             if self.regression:
-                data_ind = np.argmin([min(x.acc) for x in init])
+                self.data_ind = np.argmin([min(x.acc) for x in init])
                 model_ind = np.argmin(init[data_ind].acc)
             elif self.classification:
-                data_ind = np.argmax([max(x.acc) for x in init])
+                self.data_ind = np.argmax([max(x.acc) for x in init])
                 model_ind = np.argmax(init[data_ind].acc)
 
             # Store
-            self.best_features = self.col_keep[data_ind]
-            self.input = self.input[self.best_features]
+            self.input = self.input[self.col_keep[data_ind]]
             self.input.to_csv('AutoML/Data/Selected.csv', index_label='index')
             self.best_model = init[data_ind].models[model_ind]
-            json.dump(self.best_features, open('AutoML/Data/best_features.json', 'w'))
+            json.dump(self.col_keep[data_ind], open('AutoML/Data/best_features.json', 'w'))
             joblib.dump(self.best_model, 'AutoML/Initial Modelling/best_model.joblib')
             print('[autoML] Storing %s features with %s model' % (ds[data_ind], type(self.best_model).__name__))
 
@@ -376,8 +377,10 @@ class Pipeline(object):
         # Raise error if nothing is returned
         raise NotImplementedError('Hyperparameter tuning not implemented for ', type(self.best_model).__name__)
 
-    def grid_search(self, model=None, params=None):
+    def grid_search(self, model=None, params=None, data_ind=None):
         # Optional Argument
+        if data_ind is not None:
+            self.best_features = self.col_keep[data_ind]
         if model is not None:
             self.best_model = model
         else:
@@ -424,7 +427,7 @@ class Pipeline(object):
         params = results.iloc[0]['params']
         self.best_model.set_params(**params)
         self.best_model.fit(self.input, self.output)
-        joblib.dump(self.best_model, 'AutoML/%s.joblib' % type(self.best_model).__name__)
+        joblib.dump(self.best_model, 'AutoML/%s_%s.joblib' % (type(self.best_model).__name__, str(self.data_ind)))
 
         # Validation
         self.validate()
@@ -1050,8 +1053,9 @@ class Modelling(object):
 
             # Results
             results = results.append({'date': datetime.today().strftime('%d %b %Y'), 'model': type(model).__name__,
-                'dataset': self.dataset, 'params': model.get_params(), 'mean_score': np.mean(v_acc),
-                'std_score': np.std(v_acc), 'mean_time': np.mean(t_train), 'std_time': np.std(t_train)})
+                'data_set': self.dataset, 'params': model.get_params(), 'mean_score': np.mean(v_acc),
+                'std_score': np.std(v_acc), 'mean_time': np.mean(t_train), 'std_time': np.std(t_train)},
+                                     ignore_index=True)
             self.acc.append(np.mean(v_acc))
             if self.store:
                 joblib.dump(model, self.folder + type(model).__name__ + '_acc_%.5f.joblib' % self.acc[-1])
@@ -1061,7 +1065,7 @@ class Modelling(object):
                   (type(model).__name__.ljust(40), np.mean(t_acc) * 100, np.mean(v_acc) * 100, time.time() - t_start))
 
         # Store CSV
-        results.to_csv(self.folder + 'Initial_Models.csv')
+        results.to_csv(self.folder + 'Initial_Models.csv', index=False)
 
         # Plot
         if self.plot:
@@ -1125,7 +1129,7 @@ class Modelling(object):
 
             # Results
             results = results.append({'date': datetime.today().strftime('%d %b %Y'), 'model': type(model).__name__,
-                                      'dataset': self.dataset, 'params': model.get_params(),
+                                      'data_set': self.dataset, 'params': model.get_params(),
                                       'mean_score': np.mean(v_acc),
                                       'std_score': np.std(v_acc), 'mean_time': np.mean(t_train),
                                       'std_time': np.std(t_train)})
