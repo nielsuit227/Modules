@@ -87,7 +87,7 @@ class Pipeline(object):
         self.create_dirs()
 
     def create_dirs(self):
-        dirs = ['AutoML/', 'AutoML/Models/', 'AutoML/Data/', 'AutoML/Hyperparameter Opt/',
+        dirs = ['AutoML/', 'AutoML/Initial Modelling/', 'AutoML/Data/', 'AutoML/Hyperparameter Opt/',
                 'AutoML/Instances/']
         for dir in dirs:
             try:
@@ -221,8 +221,8 @@ class Pipeline(object):
 
     def initial_modelling(self):
         # Check if not already completed
-        if self.prev_mod and os.path.exists('AutoML/Models/best_model.joblib'):
-            self.best_model = joblib.load('AutoML/Models/best_model.joblib')
+        if self.prev_mod and os.path.exists('AutoML/Initial Modelling/best_model.joblib'):
+            self.best_model = joblib.load('AutoML/Initial Modelling/best_model.joblib')
             self.best_features = json.load(open('AutoML/Data/best_features.json', 'r'))
             self.input = self.input.reindex(columns=self.best_features)
         else:
@@ -233,7 +233,7 @@ class Pipeline(object):
 
             # Initial Modelling
             init = []
-            ds = ['All', 'PPS Selected', 'RF Selected']
+            ds = ['All', 'PPS', 'RF']
             for i, cols in enumerate(self.col_keep):
                 print('[autoML] Initial Modelling for %s features (%i)' % (ds[i], len(cols)))
                 init.append(Modelling(self.input.reindex(columns=cols), self.output.loc[:, self.target],
@@ -241,7 +241,9 @@ class Pipeline(object):
                                       shuffle=self.shuffle,
                                       n_splits=self.n_splits,
                                       classification=self.classification,
-                                      store_folder='AutoML/Models/'))
+                                      dataset=ds[i],
+                                      store_models=False,
+                                      store_folder='AutoML/Initial Modelling/'))
 
             # Find best Dataset / Model
             if self.regression:
@@ -257,7 +259,7 @@ class Pipeline(object):
             self.input.to_csv('AutoML/Data/Selected.csv', index_label='index')
             self.best_model = init[data_ind].models[model_ind]
             json.dump(self.best_features, open('AutoML/Data/best_features.json', 'w'))
-            joblib.dump(self.best_model, 'AutoML/Models/best_model.joblib')
+            joblib.dump(self.best_model, 'AutoML/Initial Modelling/best_model.joblib')
             print('[autoML] Storing %s features with %s model' % (ds[data_ind], type(self.best_model).__name__))
 
     def get_hyper_params(self):
@@ -983,13 +985,15 @@ class ExploratoryDataAnalysis(object):
 class Modelling(object):
 
     def __init__(self, input, output, regression=False, classification=False, shuffle=False, split=0.2, plot=False,
-                 store_folder='', n_splits=3):
+                 store_folder='', n_splits=3, dataset=0, store_models=True):
         self.shuffle = shuffle
         self.split = split
         self.plot = plot
         self.acc = []
         self.n_splits = n_splits
-        self.store = store_folder if store_folder[-1] != '/' else store_folder[:-1]
+        self.dataset = str(dataset)
+        self.store = store_models
+        self.folder = store_folder if store_folder[-1] == '/' else store_folder + '/'
         if regression:
             self.regression(input, output)
         if classification:
@@ -1004,6 +1008,12 @@ class Modelling(object):
         print('[modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.n_splits, len(input[0])))
         from sklearn.model_selection import StratifiedKFold
         cv = StratifiedKFold(n_splits=self.n_splits, shuffle=self.shuffle)
+
+        # Dataframe for storage
+        if 'Initial_Models.csv' in os.listdir(self.folder):
+            results = pd.read_csv(self.folder + 'Initial_Models.csv')
+        else:
+            results = pd.DataFrame(columns=['date', 'model', 'data_set', 'params', 'mean_score', 'std_score', 'mean_time', 'std_time'])
 
         # Fix plot
         if self.plot:
@@ -1031,23 +1041,30 @@ class Modelling(object):
         for master_model in self.models:
 
             # Time & loops through Cross-Validation
-            t_start = time.time()
             v_acc = []
             t_acc = []
+            t_train = []
             for t, v in cv.split(input, output):
+                t_start = time.time()
                 ti, vi, to, vo = input[t], input[v], output[t], output[v]
                 model = sklearn.base.clone(master_model)
                 model.fit(ti, to)
                 v_acc.append(Metrics.acc(vo, model.predict(vi)))
                 t_acc.append(Metrics.acc(to, model.predict(ti)))
+                t_train.append(time.time() - t_start)
 
             # Results
+            results = results.append({'date': datetime.today().strftime('%d %b %Y'), 'model': type(model).__name__,
+                'dataset': self.dataset, 'params': model.get_params(), 'mean_score': np.mean(v_acc),
+                'std_score': np.std(v_acc), 'mean_time': np.mean(t_train), 'std_time': np.std(t_train)})
             self.acc.append(np.mean(v_acc))
-            joblib.dump(model, self.store + '/AutoML_IM_' + type(model).__name__ + '_mae_%.5f.joblib' % self.acc[-1])
+            if self.store:
+                joblib.dump(model, self.folder + type(model).__name__ + '_acc_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
             print('[modelling] %s ACC train/val: %.1f %% / %.1f %%, training time: %.1f s' %
                   (type(model).__name__.ljust(40), np.mean(t_acc) * 100, np.mean(v_acc) * 100, time.time() - t_start))
+        results.to_csv(self.folder + 'Initial_Models.csv')
         if self.plot:
             ind = np.where(self.acc == np.min(self.acc))[0][0]
             p = self.models[ind].predict(vi)
