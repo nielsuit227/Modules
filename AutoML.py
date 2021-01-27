@@ -1015,11 +1015,6 @@ class Modelling(object):
         else:
             results = pd.DataFrame(columns=['date', 'model', 'data_set', 'params', 'mean_score', 'std_score', 'mean_time', 'std_time'])
 
-        # Fix plot
-        if self.plot:
-            plt.figure()
-            plt.plot(np.array(vo), c='#FFA62B')
-
         # Models
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
         from sklearn.experimental import enable_hist_gradient_boosting
@@ -1064,8 +1059,13 @@ class Modelling(object):
                 plt.plot(p, alpha=0.2)
             print('[modelling] %s ACC train/val: %.1f %% / %.1f %%, training time: %.1f s' %
                   (type(model).__name__.ljust(40), np.mean(t_acc) * 100, np.mean(v_acc) * 100, time.time() - t_start))
+
+        # Store CSV
         results.to_csv(self.folder + 'Initial_Models.csv')
+
+        # Plot
         if self.plot:
+            plt.plot(vo, c='k')
             ind = np.where(self.acc == np.min(self.acc))[0][0]
             p = self.models[ind].predict(vi)
             plt.plot(p, color='#2369ec')
@@ -1082,17 +1082,16 @@ class Modelling(object):
         output = np.array(output)
 
         # Data
-        print('[modelling] Splitting data (shuffle=%s, split=%i %%)' % (str(self.shuffle), int(self.split * 100)))
-        from sklearn import model_selection
-        ti, vi, to, vo = model_selection.train_test_split(input, output, test_size=self.split, shuffle=self.shuffle)
+        print('[modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.n_split, len(input[0])))
+        from sklearn.model_selection import KFold
+        cv = KFold(n_splits=self.n_splits, shuffle=self.shuffle)
 
-        # Fix plot
-        if self.plot:
-            plt.figure()
-            plt.plot(np.array(vo), c='#FFA62B')
+        if 'Initial_Models.csv' in os.listdir(self.folder):
+            results = pd.read_csv(self.folder + 'Initial_Models.csv')
+        else:
+            results = pd.DataFrame(columns=['date', 'model', 'data_set', 'params', 'mean_score', 'std_score', 'mean_time', 'std_time'])
 
         # Models
-        print('[modelling] Initiating all model instances')
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
         from sklearn.experimental import enable_hist_gradient_boosting
         ridge = linear_model.Ridge()
@@ -1107,17 +1106,42 @@ class Modelling(object):
         rfr = ensemble.RandomForestRegressor()
         mlp = neural_network.MLPRegressor()
         self.models = [ridge, lasso, sgd, svr, knr, dtr, ada, gbr, hgbr, mlp]
-        for model in self.models:
-            t = time.time()
-            model.fit(ti, to)
-            tp = model.predict(ti)
-            p = model.predict(vi)
-            self.acc.append(Metrics.mae(vo, p))
-            joblib.dump(model, self.store + '/AutoML_IM_' + type(model).__name__ + '_mae_%.5f.joblib' % self.acc[-1])
+
+        # Loop through models
+        for master_model in self.models:
+
+            # Time & loops through Cross-Validation
+            v_acc = []
+            t_acc = []
+            t_train = []
+            for t, v in cv.split(input, output):
+                t_start = time.time()
+                ti, vi, to, vo = input[t], input[v], output[t], output[v]
+                model = sklearn.base.clone(master_model)
+                model.fit(ti, to)
+                v_acc.append(Metrics.mae(vo, model.predict(vi)))
+                t_acc.append(Metrics.mae(to, model.predict(ti)))
+                t_train.append(time.time() - t_start)
+
+            # Results
+            results = results.append({'date': datetime.today().strftime('%d %b %Y'), 'model': type(model).__name__,
+                                      'dataset': self.dataset, 'params': model.get_params(),
+                                      'mean_score': np.mean(v_acc),
+                                      'std_score': np.std(v_acc), 'mean_time': np.mean(t_train),
+                                      'std_time': np.std(t_train)})
+            self.acc.append(np.mean(v_acc))
+            if self.store:
+                joblib.dump(model, self.folder + '/AutoML_IM_' + type(model).__name__ + '_mae_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
             print('[modelling] %s MAE train/val: %.2f %.2f, training time: %.1f s' % (type(model).__name__.ljust(60), Metrics.mae(to, tp), Metrics.mae(vo, p), time.time() - t))
+
+        # Store CSV
+        results.to_csv(self.folder + 'Initial_Models.csv')
+
+        # Plot
         if self.plot:
+            plt.plot(vo, c='k')
             ind = np.where(self.acc == np.min(self.acc))[0][0]
             p = self.models[ind].predict(vi)
             plt.plot(p, color='#2369ec')
