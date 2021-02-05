@@ -9,6 +9,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import multiprocessing as mp
 
+import catboost
 import sklearn
 from sklearn import neural_network
 from sklearn.preprocessing import StandardScaler
@@ -19,7 +20,14 @@ from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
+import warnings
+warnings.filterwarnings("ignore")
+
 # Priority
+# todo add SHAP selected as 4th dataset
+# todo add a function to pipeline that prepares the files for production :) --> Ask for changelog!
+# todo merge Modelling Classification & Regression, make function cross_validator
+# todo Pipeline.validation() include regression
 
 # Nicety
 # todo preprocessing check for big chunks of missing data
@@ -79,8 +87,11 @@ class Pipeline(object):
         self.catKeys = []
         self.dateKeys = []
         self.prep = None
-        self.seq = None
+        self.sequencer = None
+        self.modelling = None
+        self.modelling_res = None
         self.grid = None
+        self.grid_res = None
         self.diff = 'none'
         self.diffOrder = 0
         self.classification = False
@@ -97,6 +108,15 @@ class Pipeline(object):
             except:
                 continue
 
+    def sort_results(self, results):
+        if self.regression:
+            results['worst_case'] = results['mean_score'] + results['std_score']
+            results = results.sort_values('worst_case', ascending=True)
+        elif self.classification:
+            results['worst_case'] = results['mean_score'] - results['std_score']
+            results = results.sort_values('worst_case', ascending=False)
+        return results
+
     def fit(self, data):
         # Data preparation -- Creates/Loads All_selected, output, pp_selected, rf_selected
         self.data_preparation(data)
@@ -108,7 +128,7 @@ class Pipeline(object):
     def data_preparation(self, data):
         files = os.listdir(self.mainDir + '/Data/')
         if self.prev_data and len(files) != 0:
-            self.input = pd.read_csv(self.mainDir + '/Data/All_selected_data.csv', index_col='index')
+            self.input = pd.read_csv(self.mainDir + '/Data/Input.csv', index_col='index')
             self.output = pd.read_csv(self.mainDir + '/Data/Output.csv', index_col='index')
             self.col_keep = json.load(open(self.mainDir + '/Data/Col_keep.json', 'r'))
             if len(set(self.output[self.target])) == 2:
@@ -166,8 +186,8 @@ class Pipeline(object):
 
             # Differencing, shifting, lagging
             n_features = len(self.input.keys())
-            self.seq = Sequence(back=self.max_lags, forward=self.shift, diff=self.diff)
-            self.input, self.output = self.seq.convert_pandas(self.input, self.output)
+            self.sequencer = Sequence(back=self.max_lags, forward=self.shift, diff=self.diff)
+            self.input, self.output = self.sequencer.convert(self.input, self.output)
             print('[autoML] Added %i lags' % (len(self.input.keys()) - n_features))
 
             # Remove Colinearity
@@ -191,7 +211,7 @@ class Pipeline(object):
 
             # Keep all
             self.col_keep = [self.input.keys().to_list()]
-            self.input.to_csv(self.mainDir + '/Data/All_selected_data.csv', index_label='index')
+            self.input.to_csv(self.mainDir + '/Data/Input.csv', index_label='index')
             self.output.to_csv(self.mainDir + '/Data/Output.csv', index_label='index')
 
             # Keep based on PPScore
@@ -199,8 +219,6 @@ class Pipeline(object):
             data['target'] = self.output.copy()
             pp_score = pps.predictors(data, "target")
             self.col_keep.append(pp_score['x'][pp_score['ppscore'] != 0].to_list())
-            pp_data = self.input[self.col_keep[-1]]
-            pp_data.to_csv(self.mainDir + '/Data/pp_selected_data.csv', index_label='index')
 
             # Keep based on RF
             if self.regression:
@@ -212,103 +230,69 @@ class Pipeline(object):
             ind = np.flip(np.argsort(fi))
             ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.info_threshold * sfi]
             self.col_keep.append(self.input.keys()[ind_keep].to_list())
-            rf_data = self.input[self.col_keep[-1]]
-            rf_data.to_csv(self.mainDir + '/Data/rf_selected_data.csv', index_label='index')
 
             # Store to self
-            json.dump(list(all_features), open(self.mainDir + '/Data/Input_Features.json', 'w'))
+            for i in range(3):
+                json.dump(self.col_keep[i], open(self.mainDir + '/Data/features_%i.json' % i, 'w'))
             json.dump(self.col_keep, open(self.mainDir + '/Data/Col_keep.json', 'w'))
             pickle.dump(self.prep, open(self.mainDir + '/Data/Preprocessing.pickle', 'wb'))
             pickle.dump(scaler, open(self.mainDir + '/Data/Normalization.pickle', 'wb'))
 
     def initial_modelling(self):
-        # Check if not already completed
-        if self.prev_mod:
-            # In case data_ind is not defined
-            if self.data_ind is None:
-                if os.path.exists(self.mainDir + '/Initial Modelling/best_model.joblib'):
-                    self.best_model = joblib.load(self.mainDir + '/Initial Modelling/best_model.joblib')
-                    best_features = json.load(open(self.mainDir + '/Data/best_features.json', 'r'))
-                    self.data_ind = self.col_keep.index(best_features)
-                    self.input = self.input.reindex(columns=self.col_keep[self.data_ind])
-            else:
-                if os.path.exists(self.mainDir + '/Initial Modelling/best_model_%s.joblib' % str(self.data_ind)):
-                    self.best_model = joblib.load(self.mainDir + '/Initial Modelling/best_model_%s.joblib' % str(self.data_ind))
-                    self.input = self.input.reindex(columns=self.col_keep[self.data_ind])
-        # In case no model was loaded
-        if self.best_model is None:
-            # Load col keep
-            if self.col_keep is None:
-                with open(self.mainDir + '/Data/Col_keep.json', 'r') as f:
-                    self.col_keep = json.load(f)
+        # Initialize modelling class
+        self.modelling = Modelling(regression=self.regression,
+                                   classification=self.classification,
+                                   shuffle=self.shuffle,
+                                   n_splits=self.n_splits,
+                                   store=False,)
 
+        # Check if not already completed
+        if self.prev_mod and os.path.exists(self.mainDir + '/Modelling.csv'):
+            self.modelling_res = pd.read_csv(self.mainDir + '/Modelling.csv')
+        else:
             # Initial Modelling
             init = []
             ds = ['All', 'PPS', 'RF']
             for i, cols in enumerate(self.col_keep):
                 print('[autoML] Initial Modelling for %s features (%i)' % (ds[i], len(cols)))
-                init.append(Modelling(self.input.reindex(columns=cols), self.output.loc[:, self.target],
-                                      regression=self.regression,
-                                      shuffle=self.shuffle,
-                                      n_splits=self.n_splits,
-                                      classification=self.classification,
-                                      dataset=ds[i],
-                                      store_models=False,
-                                      store_folder=self.mainDir + '/Initial Modelling/'))
+                self.modelling.dataset = ds[i]
+                if self.modelling_res is None:
+                    self.modelling_res = self.modelling.fit(self.input.reindex(columns=cols),
+                                                            self.output.loc[:, self.target])
+                else:
+                    self.modelling_res.append(self.modelling.fit(self.input.reindex(columns=cols),
+                                                                 self.output.loc[:, self.target]))
+            self.modelling_res = self.sort_results(self.modelling_res)
+            best_row = self.modelling_res.iloc[0]
+            print('[autoML] Init Modelling finished, best score: %.2f \u00B1 %.2f' %
+                  (best_row['mean_score'], best_row['std_score']))
+            print('[autoML] %s, on %s features' % (best_row['model'], best_row['dataset']))
+            self.modelling_res.to_csv(self.mainDir + '/Modelling.csv')
 
-            # Find best Dataset / Model & Store -- dependent on data_ind
-            if self.data_ind is None:
-                if self.regression:
-                    self.data_ind = np.argmin([min(x.acc) for x in init])
-                    model_ind = np.argmin(init[self.data_ind].acc)
-                elif self.classification:
-                    self.data_ind = np.argmax([max(x.acc) for x in init])
-                    model_ind = np.argmax(init[self.data_ind].acc)
-                # Store
-                self.input[self.col_keep[self.data_ind]].to_csv(self.mainDir + '/Data/Selected.csv', index_label='index')
-                self.best_model = init[self.data_ind].models[model_ind]
-                json.dump(self.col_keep[self.data_ind], open(self.mainDir + '/Data/best_features.json', 'w'))
-                json.dump(self.col_keep[self.data_ind], open(self.mainDir + '/Data/best_features_%s.json' % str(self.data_ind), 'w'))
-                joblib.dump(self.best_model, self.mainDir + '/Initial Modelling/best_model.joblib')
-                joblib.dump(self.best_model, self.mainDir + '/Initial Modelling/best_model_%s.joblib'% str(self.data_ind))
-
-            else:
-                if self.regression:
-                    model_ind = np.argmin(init[self.data_ind].acc)
-                elif self.classification:
-                    model_ind = np.argmax(init[self.data_ind].acc)
-                self.input[self.col_keep[self.data_ind]].to_csv(self.mainDir + '/Data/Selected_%s.csv' % str(self.data_ind), index_label='index')
-                self.best_model = init[self.data_ind].models[model_ind]
-                json.dump(self.col_keep[self.data_ind], open(self.mainDir + '/Data/best_features_%s.json' %
-                                                             str(self.data_ind), 'w'))
-                joblib.dump(self.best_model, self.mainDir + '/Initial Modelling/best_model_%s.joblib' %
-                            str(self.data_ind))
-            print('[autoML] Storing %s features with %s model' % (ds[self.data_ind], type(self.best_model).__name__))
-
-    def get_hyper_params(self):
-        print('[autoML] Getting Hyperparameters for', type(self.best_model).__name__)
+    def get_hyper_params(self, model):
+        print('[autoML] Getting Hyperparameters for', type(model).__name__)
         # Parameters for both Regression / Classification
-        if isinstance(self.best_model, sklearn.linear_model.Lasso) or \
-            isinstance(self.best_model, sklearn.linear_model.Ridge):
+        if isinstance(model, sklearn.linear_model.Lasso) or \
+            isinstance(model, sklearn.linear_model.Ridge):
             return {
                 'alpha': [0.001, 0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 2, 3, 4, 5]
             }
-        elif isinstance(self.best_model, sklearn.svm.SVC) or \
-                isinstance(self.best_model, sklearn.svm.SVR):
+        elif isinstance(model, sklearn.svm.SVC) or \
+                isinstance(model, sklearn.svm.SVR):
             return {
                 'gamma': ['scale', 'auto', 0.001, 0.01, 0.1, 0.5, 1],
                 'C': [0.01, 0.1, 0.2, 0.5, 1, 2, 5],
             }
-        elif isinstance(self.best_model, sklearn.neighbors.KNeighborsRegressor) or \
-                isinstance(self.best_model, sklearn.neighbors.KNeighborsClassifier):
+        elif isinstance(model, sklearn.neighbors.KNeighborsRegressor) or \
+                isinstance(model, sklearn.neighbors.KNeighborsClassifier):
             return {
                 'n_neighbors': [5, 10, 25, 50],
                 'weights': ['uniform', 'distance'],
                 'leaf_size': [10, 30, 50, 100],
                 'n_jobs': [mp.cpu_count()-1],
             }
-        elif isinstance(self.best_model, sklearn.neural_network._multilayer_perceptron.MLPClassifier) or \
-            isinstance(self.best_model, sklearn.neural_network._multilayer_perceptron.MLPRegressor):
+        elif isinstance(model, sklearn.neural_network._multilayer_perceptron.MLPClassifier) or \
+            isinstance(model, sklearn.neural_network._multilayer_perceptron.MLPRegressor):
             return {
                 'hidden_layer_sizes': [(100,), (100, 100), (100, 50), (200, 200), (200, 100), (200, 50), (50, 50, 50, 50)],
                 'learning_rate': ['adaptive', 'invscaling'],
@@ -318,31 +302,38 @@ class Pipeline(object):
 
         # Regressor specific hyperparameters
         elif self.regression:
-            if isinstance(self.best_model, sklearn.linear_model.SGDRegressor):
+            if isinstance(model, sklearn.linear_model.SGDRegressor):
                 return {
                     'loss': ['squared_loss', 'huber', 'epsilon_insensitive', 'squared_epsilon_insensitive'],
                     'penalty': ['l2', 'l1', 'elasticnet'],
                     'alpha': [0.001, 0.01, 0.1, 0.5, 1, 2],
                 }
-            elif isinstance(self.best_model, sklearn.tree.DecisionTreeRegressor):
+            elif isinstance(model, sklearn.tree.DecisionTreeRegressor):
                 return {
                     'criterion': ['mse', 'friedman_mse', 'mae', 'poisson'],
                     'max_depth': [None, 5, 10, 25, 50],
                 }
-            elif isinstance(self.best_model, sklearn.ensemble.AdaBoostRegressor):
+            elif isinstance(model, sklearn.ensemble.AdaBoostRegressor):
                 return {
                     'n_estimators': [25, 50, 100, 250],
                     'loss': ['linear', 'square', 'exponential'],
                     'learning_rate': [0.5, 0.75, 0.9, 0.95, 1]
                 }
-            elif isinstance(self.best_model, sklearn.ensemble.GradientBoostingRegressor):
+            elif isinstance(model, catboost.core.CatBoostRegressor):
+                return {
+                    'loss_function': ['MAE', 'RMSE'],
+                    'iterations': [500, 1000, 2000],
+                    'learning_rate': [0.001, 0.01, 0.03, 0.05, 0.1],
+                    'l2_leaf_reg': [1, 3, 5],
+                }
+            elif isinstance(model, sklearn.ensemble.GradientBoostingRegressor):
                 return {
                     'loss': ['ls', 'lad', 'huber'],
                     'learning_rate': [0.001, 0.01, 0.1, 0.2, 0.4],
                     'n_estimators': [100, 300, 500],
                     'max_depth': [3, 5, 10],
                 }
-            elif isinstance(self.best_model, sklearn.ensemble.HistGradientBoostingRegressor):
+            elif isinstance(model, sklearn.ensemble.HistGradientBoostingRegressor):
                 return {
                     'max_iter': [100, 250],
                     'max_bins': [100, 255],
@@ -352,7 +343,7 @@ class Pipeline(object):
                     'max_leaf_nodes': [31, 50, 75, 150],
                     'early_stopping': [True]
                 }
-            elif isinstance(self.best_model, sklearn.ensemble.RandomForestRegressor):
+            elif isinstance(model, sklearn.ensemble.RandomForestRegressor):
                 return {
                     'criterion': ['mse', 'mae'],
                     'max_depth': [None, 5, 10, 25, 50],
@@ -360,111 +351,138 @@ class Pipeline(object):
 
         # Classification specific hyperparameters
         elif self.classification:
-            if isinstance(self.best_model, sklearn.linear_model.SGDClassifier):
+            if isinstance(model, sklearn.linear_model.SGDClassifier):
                 return {
                     'loss': ['hinge', 'log', 'modified_huber', 'squared_hinge'],
                     'penalty': ['l2', 'l1', 'elasticnet'],
                     'alpha': [0.001, 0.01, 0.1, 0.5, 1, 2],
                     'max_iter': [1000, 2500, 5000],
                 }
-            elif isinstance(self.best_model, sklearn.tree.DecisionTreeClassifier):
+            elif isinstance(model, sklearn.tree.DecisionTreeClassifier):
                 return {
                     'criterion': ['gini', 'entropy'],
                     'max_depth': [None, 5, 10, 25, 50],
                 }
-            elif isinstance(self.best_model, sklearn.ensemble.AdaBoostClassifier):
+            elif isinstance(model, sklearn.ensemble.AdaBoostClassifier):
                 return {
                     'n_estimators': [25, 50, 100, 250],
                     'learning_rate': [0.5, 0.75, 0.9, 0.95, 1]
                 }
-            elif isinstance(self.best_model, sklearn.ensemble.GradientBoostingClassifier):
+            elif isinstance(model, catboost.core.CatBoostClassifier):
+                return {
+                    'loss_function': ['Logloss', 'MultiClass'],
+                    'iterations': [500, 1000, 2000],
+                    'learning_rate': [0.001, 0.01, 0.03, 0.05, 0.1],
+                    'l2_leaf_reg': [1, 3, 5],
+                }
+            elif isinstance(model, sklearn.ensemble.GradientBoostingClassifier):
                 return {
                     'loss': ['deviance', 'exponential'],
                     'learning_rate': [0.001, 0.01, 0.1, 0.2, 0.4],
                     'n_estimators': [100, 300, 500],
                     'max_depth': [None, 3, 5, 10],
                 }
-            elif isinstance(self.best_model, sklearn.ensemble.HistGradientBoostingClassifier):
+            elif isinstance(model, sklearn.ensemble.HistGradientBoostingClassifier):
                 return {
                     'max_iter': [100, 250],
-                    'max_bins': [100, 255],
-                    'l2_regularization': [0.001, 0.005, 0.01, 0.05],
-                    'learning_rate': [0.01, 0.1, 0.25, 0.4],
-                    'max_leaf_nodes': [31, 50, 75, 150],
-                    'early_stopping': [True]
+                    # 'max_bins': [100, 255],
+                    # 'l2_regularization': [0.001, 0.005, 0.01, 0.05],
+                    # 'learning_rate': [0.01, 0.1, 0.25, 0.4],
+                    # 'max_leaf_nodes': [31, 50, 75, 150],
+                    # 'early_stopping': [True]
                 }
-            elif isinstance(self.best_model, sklearn.ensemble.RandomForestClassifier):
+            elif isinstance(model, sklearn.ensemble.RandomForestClassifier):
                 return {
                     'criterion': ['gini', 'entropy'],
                     'max_depth': [None, 5, 10, 25, 50],
                 }
 
         # Raise error if nothing is returned
-        raise NotImplementedError('Hyperparameter tuning not implemented for ', type(self.best_model).__name__)
+        raise NotImplementedError('Hyperparameter tuning not implemented for ', type(model).__name__)
 
     def grid_search(self, model=None, params=None, data_ind=None):
-        # Optional Argument
-        if data_ind is not None:
-            self.data_ind = data_ind
+        """
+        Runs a grid search. By default, takes the self.modelling_res, and runs for the top 3 optimizations.
+        There is the option to provide a model & data_ind, but both have to be provided. In this case,
+        the model & data set combination will be optimized.
+        :param model:
+        :param params:
+        :param data_ind:
+        :return:
+        """
+        assert model is not None and data_ind is not None or model == data_ind, \
+            'Model & data_ind need to be either both None or both provided.'
+
+        # If arguments are provided
         if model is not None:
-            self.best_model = model
-        else:
-            # Check if Optimization is not already completed
-            if self.prev_mod and type(self.best_model).__name__ + '_%s.csv' % str(self.data_ind) in os.listdir(self.mainDir + '/Hyperparameter Opt/'):
-                # Need to load optimal model here, need to check which hyperparameters are best :(
-                score = None
-                for file in os.listdir(self.mainDir + '/Hyperparameter Opt/'):
-                    hp_opt = pd.read_csv(self.mainDir + '/Hyperparameter Opt/' + file)
-                    if score is not None:
-                        if hp_opt.loc[0, 'worst_case'] < score:
-                            continue
-                    score = hp_opt.loc[0, 'worst_case']
-                    model = file[:file.find('.csv')]
-                    params = json.loads(hp_opt.loc[0, 'params'].replace("'", '"'))
-                model_file = [x for x in os.listdir(self.mainDir + '') if model in x][0]
-                self.best_model = joblib.load(self.mainDir + '/' + model_file)
-                self.best_model.set_params(**params)
-                return
+            # Check if already completed
+            if self.prev_mod and type(model).__name__ + '_%s.csv' % str(self.data_ind) in \
+                    os.listdir(self.mainDir + '/Hyperparameter Opt'):
+                print('[autoML] Hyperparameter Optimization already completed.')
+            # Parameter check
+            if params is None:
+                params = self.get_hyper_params(model)
+            # Run Grid Search
+            results = self.sort_results(self._gridsearch(model))
+            results.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
+                           (type(model).__name__, str(data_ind)), index_label='index')
+            # Validate
+            self.validate(model, self.grid_res.iloc[0]['params'], data_ind)
 
-        # Get Params
-        if params is None:
-            params = self.get_hyper_params()
+        # If arguments aren't provided, do top 3 from self.modelling_res
+        datasets = ['All', 'PPS', 'RF']
+        models = self.modelling.return_models()
+        for iteration in range(3):
+            # Grab settings
+            settings = self.modelling_res.iloc[iteration]
+            model = models[[i for i in range(len(models)) if type(models[i]).__name__ == settings['model']][0]]
+            data_ind = [i for i in range(3) if datasets[i] == settings['dataset']][0]
+            # Check whether exists
+            if self.prev_mod and os.path.exists(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
+                           (type(model).__name__, str(data_ind))):
+                self.grid_res = pd.read_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
+                           (type(model).__name__, str(data_ind)))
+                # Validate
+                params = json.loads(self.grid_res.iloc[0]['params'].replace("'", '"'))
+            else:
+                # Grab parameters
+                params = self.get_hyper_params(model)
+                # Optimize
+                self.grid_res = self.sort_results(self._gridsearch(model, params, data_ind))
+                # Store
+                self.grid_res.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
+                               (type(model).__name__, str(data_ind)), index_label='index')
+                params = self.grid_res.iloc[0]['params']
+            # Validate
+            self.validate(model, params, data_ind)
 
+    def _gridsearch(self, model, params, data_ind):
+        """
+        INTERNAL | Grid search for defined model, parameter set and data_ind.
+        """
         # Select data
-        self.input = self.input[self.col_keep[self.data_ind]]
-
+        input = self.input[self.col_keep[data_ind]]
         # Grid Search
-        print('[autoML] Starting Hyperparameter Optimization %s (%i sample, %i features)' %
-              (type(self.best_model).__name__, len(self.input), len(self.input.keys())))
+        print('[autoML] Starting Hyperparameter Optimization %s (%i samples, %i features)' %
+              (type(model).__name__, len(input), len(input.keys())))
         if self.regression:
-            self.grid = GridSearch(self.best_model, params,
+            self.grid = GridSearch(model, params,
                                    cv=KFold(n_splits=self.n_splits),
                                    scoring=Metrics.mae)
-            results = self.grid.fit(self.input, self.output)
+            results = self.grid.fit(input, self.output)
             results['worst_case'] = results['mean_score'] + results['std_score']
             results = results.sort_values('worst_case')
         elif self.classification:
-            self.grid = GridSearch(self.best_model, params,
+            self.grid = GridSearch(model, params,
                                    cv=StratifiedKFold(n_splits=self.n_splits),
                                    scoring=Metrics.acc)
-            results = self.grid.fit(self.input, self.output)
+            results = self.grid.fit(input, self.output)
             results['worst_case'] = results['mean_score'] - results['std_score']
             results = results.sort_values('worst_case', ascending=False)
-        results.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
-                       (type(self.best_model).__name__, str(self.data_ind)), index_label='index')
+        return results
 
-        # Retrain and save
-        params = results.iloc[0]['params']
-        self.best_model.set_params(**params)
-        self.best_model.fit(self.input, self.output)
-        joblib.dump(self.best_model, self.mainDir + '/%s_%s.joblib' %
-                    (type(self.best_model).__name__, str(self.data_ind)))
-
-        # Validation
-        self.validate()
-
-    def validate(self):
-        print('\n\n[autoML] Validating results for %s (%s)' % (type(self.best_model).__name__, self.best_model.get_params()))
+    def validate(self, model, params, data_ind):
+        print('\n\n[autoML] Validating results for %s (%s)' % (type(model).__name__, params))
         if not os.path.exists(self.mainDir + '/Validation/'): os.mkdir(self.mainDir + '/Validation')
 
         # For classification
@@ -478,26 +496,18 @@ class Pipeline(object):
             vals = np.zeros((2))
             aucs = []
             tprs = []
-            fig, ax = plt.subplots()
             mean_fpr = np.linspace(0, 1, 100)
 
             # Modelling
             cv = StratifiedKFold(n_splits=self.n_splits)
-            input, output = np.array(self.input), np.array(self.output)
-            for i, (t, v) in enumerate(cv.split(self.input, self.output)):
+            input, output = np.array(self.input[self.col_keep[data_ind]]), np.array(self.output)
+            for i, (t, v) in enumerate(cv.split(input, output)):
                 n = len(v)
                 ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
-                model = sklearn.base.clone(self.best_model)
-                # model.set_param
+                model = copy.copy(model)
+                model.set_params(**params)
                 model.fit(ti, to)
                 predictions = model.predict(vi)
-
-                # ROC Plot
-                viz = plot_roc_curve(model, vi, vo, name='ROC fold {}'.format(i+1), alpha=0.3, ax=ax)
-                interp_tpr = np.interp(mean_fpr, viz.fpr, viz.tpr)
-                interp_tpr[0] = 0.0
-                tprs.append(interp_tpr)
-                aucs.append(viz.roc_auc)
 
                 # Metrics
                 vals += np.array([(vo == 1).sum(), (vo == -1).sum()]) / self.n_splits
@@ -511,7 +521,33 @@ class Pipeline(object):
                 spec.append(tn / (tn + fp) * 100)
                 cm += np.array([[tp, fp], [fn, tn]]) / self.n_splits
 
-            # Plot
+            # Results
+            f1 = [2 * prec[i] * rec[i] / (prec[i] + rec[i]) for i in range(self.n_splits)]
+            p = np.mean(prec)
+            r = np.mean(rec)
+            print('[autoML] Accuracy:        %.2f \u00B1 %.2f %%' % (np.mean(acc), np.std(acc)))
+            print('[autoML] Precision:       %.2f \u00B1 %.2f %%' % (p, np.std(prec)))
+            print('[autoML] Recall:          %.2f \u00B1 %.2f %%' % (r, np.std(rec)))
+            print('[autoML] Specificity:     %.2f \u00B1 %.2f %%' % (np.mean(spec), np.std(spec)))
+            print('[autoML] F1-score:        %.2f \u00B1 %.2f %%' % (np.mean(f1), np.std(f1)))
+            print('[autoML] Confusion Matrix:')
+            print('[autoML] Pred \ true  |  ISO faulty   |   ISO operational      ')
+            print('[autoML]  ISO faulty  |  %s|  %.1f' % (('%.1f' % cm[0, 0]).ljust(13), cm[0, 1]))
+            print('[autoML]  ISO oper.   |  %s|  %.1f' % (('%.1f' % cm[1, 0]).ljust(13), cm[1, 1]))
+
+            # Check whether plot is possible
+            if isinstance(model, sklearn.linear_model.Lasso) or isinstance(model, sklearn.linear_model.Ridge):
+                return
+
+            # Plot ROC
+            fig, ax = plt.subplots()
+            viz = plot_roc_curve(model, vi, vo, name='ROC fold {}'.format(i + 1), alpha=0.3, ax=ax)
+            interp_tpr = np.interp(mean_fpr, viz.fpr, viz.tpr)
+            interp_tpr[0] = 0.0
+            tprs.append(interp_tpr)
+            aucs.append(viz.roc_auc)
+
+            # Adjust plots
             ax.plot([0, 1], [0, 1], linestyle='--', lw=2, color='#ffa62b',
                     label='Chance', alpha=.8)
             mean_tpr = np.mean(tprs, axis=0)
@@ -531,26 +567,13 @@ class Pipeline(object):
             ax.legend(loc="lower right")
             fig.savefig(self.mainDir + '/Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
             plt.show()
-            # Results
-            f1 = [2 * prec[i] * rec[i] / (prec[i] + rec[i]) for i in range(self.n_splits)]
-            p = np.mean(prec)
-            r = np.mean(rec)
-            print('[autoML] Accuracy:        %.2f \u00B1 %.2f %%' % (np.mean(acc), np.std(acc)))
-            print('[autoML] Precision:       %.2f \u00B1 %.2f %%' % (p, np.std(prec)))
-            print('[autoML] Recall:          %.2f \u00B1 %.2f %%' % (r, np.std(rec)))
-            print('[autoML] Specificity:     %.2f \u00B1 %.2f %%' % (np.mean(spec), np.std(spec)))
-            print('[autoML] F1-score:        %.2f \u00B1 %.2f %%' % (np.mean(f1), np.std(f1)))
-            print('[autoML] Confusion Matrix:')
-            print('[autoML] Pred \ true  |  ISO faulty   |   ISO operational      ')
-            print('[autoML]  ISO faulty  |  %s|  %.1f' % (('%.1f' % cm[0, 0]).ljust(13), cm[0, 1]))
-            print('[autoML]  ISO oper.   |  %s|  %.1f' % (('%.1f' % cm[1, 0]).ljust(13), cm[1, 1]))
 
     def predict(self, sample):
         # todo asserts for sample
         cleaned = self.prep.clean(sample)
         normed = self.norm.convert(cleaned)
-        # todo difference, sequencing
-        selected = normed[self.col_keep[self.data_ind]]
+        sequenced = self.sequencer.convert(normed)
+        selected = sequenced[self.col_keep[self.data_ind]]
         pred = self.best_model.predict(selected)
         return self.norm.revert_output(pred)
 
@@ -1087,20 +1110,60 @@ class ExploratoryDataAnalysis(object):
 
 class Modelling(object):
 
-    def __init__(self, input, output, regression=False, classification=False, shuffle=False, split=0.2, plot=False,
-                 store_folder='', n_splits=3, dataset=0, store_models=True):
+    def __init__(self, regression=False, classification=False, shuffle=False, split=0.2, plot=False,
+                 store_folder='models/', n_splits=3, dataset=0, store=True):
+        assert regression != classification, 'Cannot do both regression AND classification.'
+        self.is_regression = regression
+        self.is_classification = classification
         self.shuffle = shuffle
         self.split = split
         self.plot = plot
         self.acc = []
+        self.std = []
         self.n_splits = n_splits
         self.dataset = str(dataset)
-        self.store = store_models
+        self.store = store
         self.folder = store_folder if store_folder[-1] == '/' else store_folder + '/'
-        if regression:
-            self.regression(input, output)
-        if classification:
-            self.classification(input, output)
+
+    def fit(self, input, output):
+        if self.is_regression:
+            return self.regression(input, output)
+        if self.is_classification:
+            return self.classification(input, output)
+
+    def return_models(self):
+        from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
+        from sklearn.experimental import enable_hist_gradient_boosting
+        import catboost
+        if self.is_classification:
+            ridge = linear_model.RidgeClassifier()
+            lasso = linear_model.Lasso()
+            sgd = linear_model.SGDClassifier()
+            svc = svm.SVC(kernel='rbf')
+            knc = neighbors.KNeighborsClassifier()
+            dtc = tree.DecisionTreeClassifier()
+            ada = ensemble.AdaBoostClassifier()
+            cat = catboost.CatBoostClassifier(verbose=0)
+            bag = ensemble.BaggingClassifier()
+            gbc = ensemble.GradientBoostingClassifier()
+            hgbc = ensemble.HistGradientBoostingClassifier()
+            rfc = ensemble.RandomForestClassifier()
+            mlp = neural_network.MLPClassifier()
+            return [ridge, lasso, sgd, svc, knc, dtc, ada, cat, bag, gbc, hgbc, mlp]
+        elif self.is_regression:
+            ridge = linear_model.Ridge()
+            lasso = linear_model.Lasso()
+            sgd = linear_model.SGDRegressor()
+            svr = svm.SVR(kernel='rbf')
+            knr = neighbors.KNeighborsRegressor()
+            dtr = tree.DecisionTreeRegressor()
+            ada = ensemble.AdaBoostRegressor()
+            cat = catboost.CatBoostRegressor(verbose=0)
+            gbr = ensemble.GradientBoostingRegressor()
+            hgbr = ensemble.HistGradientBoostingRegressor()
+            rfr = ensemble.RandomForestRegressor()
+            mlp = neural_network.MLPRegressor()
+            return [ridge, lasso, sgd, svr, knr, dtr, ada, cat, gbr, hgbr, mlp]
 
     def classification(self, input, output):
         # Convert to NumPy
@@ -1113,29 +1176,13 @@ class Modelling(object):
         cv = StratifiedKFold(n_splits=self.n_splits, shuffle=self.shuffle)
 
         # Dataframe for storage
-        if 'Initial_Models.csv' in os.listdir(self.folder):
+        if self.store and 'Initial_Models.csv' in os.listdir(self.folder):
             results = pd.read_csv(self.folder + 'Initial_Models.csv')
         else:
             results = pd.DataFrame(columns=['date', 'model', 'dataset', 'params', 'mean_score', 'std_score', 'mean_time', 'std_time'])
 
         # Models
-        from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
-        from sklearn.experimental import enable_hist_gradient_boosting
-        import catboost
-        ridge = linear_model.RidgeClassifier()
-        lasso = linear_model.Lasso()
-        sgd = linear_model.SGDClassifier()
-        svc = svm.SVC(kernel='rbf')
-        knc = neighbors.KNeighborsClassifier()
-        dtc = tree.DecisionTreeClassifier()
-        ada = ensemble.AdaBoostClassifier()
-        cat = catboost.CatBoostClassifier(verbose=0)
-        bag = ensemble.BaggingClassifier()
-        gbc = ensemble.GradientBoostingClassifier()
-        hgbc = ensemble.HistGradientBoostingClassifier()
-        rfc = ensemble.RandomForestClassifier()
-        mlp = neural_network.MLPClassifier()
-        self.models = [ridge, lasso, sgd, svc, knc, dtc, ada, cat, bag, gbc, hgbc, mlp]
+        self.models = self.return_models()
 
         # Loop through models
         for master_model in self.models:
@@ -1146,6 +1193,7 @@ class Modelling(object):
                 results['date'] == datetime.today().strftime('%d %b %Y, %Hh')))[0]
             if len(ind) != 0:
                 self.acc.append(results.iloc[ind[0]]['mean_score'])
+                self.std.append(results.iloc[ind[0]]['std_score'])
                 continue
 
             # Time & loops through Cross-Validation
@@ -1167,6 +1215,7 @@ class Modelling(object):
                 'std_score': np.std(v_acc), 'mean_time': np.mean(t_train), 'std_time': np.std(t_train)},
                                      ignore_index=True)
             self.acc.append(np.mean(v_acc))
+            self.std.append(np.std(v_acc))
             if self.store:
                 joblib.dump(model, self.folder + type(model).__name__ + '_acc_%.5f.joblib' % self.acc[-1])
             if self.plot:
@@ -1175,7 +1224,8 @@ class Modelling(object):
                   (type(model).__name__.ljust(40), np.mean(t_acc) * 100, np.mean(v_acc) * 100, time.time() - t_start))
 
         # Store CSV
-        results.to_csv(self.folder + 'Initial_Models.csv', index=False)
+        if self.store:
+            results.to_csv(self.folder + 'Initial_Models.csv', index=False)
 
         # Plot
         if self.plot:
@@ -1188,7 +1238,7 @@ class Modelling(object):
             plt.ylabel('Output')
             plt.xlabel('Samples')
             plt.show()
-        return self
+        return results
 
     def regression(self, input, output):
         # Convert to NumPy
@@ -1206,22 +1256,7 @@ class Modelling(object):
             results = pd.DataFrame(columns=['date', 'model', 'dataset', 'params', 'mean_score', 'std_score', 'mean_time', 'std_time'])
 
         # Models
-        from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
-        from sklearn.experimental import enable_hist_gradient_boosting
-        import catboost
-        ridge = linear_model.Ridge()
-        lasso = linear_model.Lasso()
-        sgd = linear_model.SGDRegressor()
-        svr = svm.SVR(kernel='rbf')
-        knr = neighbors.KNeighborsRegressor()
-        dtr = tree.DecisionTreeRegressor()
-        ada = ensemble.AdaBoostRegressor()
-        cat = catboost.CatBoostRegressor(verbose=0)
-        gbr = ensemble.GradientBoostingRegressor()
-        hgbr = ensemble.HistGradientBoostingRegressor()
-        rfr = ensemble.RandomForestRegressor()
-        mlp = neural_network.MLPRegressor()
-        self.models = [ridge, lasso, sgd, svr, knr, dtr, ada, cat, gbr, hgbr, mlp]
+        self.models = self.return_models()
 
         # Loop through models
         for master_model in self.models:
@@ -1275,7 +1310,7 @@ class Modelling(object):
             plt.ylabel('Output')
             plt.xlabel('Samples')
             plt.show()
-        return self
+        return results
 
 class Metrics(object):
 
@@ -1367,11 +1402,15 @@ class Sequence(object):
             raise ValueError('Type should be in [None, diff, logdiff, frac]')
 
     def convert(self, input, output, flat=False):
-        assert type(input) == type(output)
         if isinstance(input, pd.DataFrame) or isinstance(input, pd.core.series.Series):
-            self.convert_pandas(input, output)
-        if isinstance(input, np.ndarray):
-            self.convert_numpy(input, output, flat=flat)
+            assert isinstance(output, pd.DataFrame) or isinstance(output, pd.core.series.Series), \
+                'Input and Output need to be the same data type.'
+            return self.convert_pandas(input, output)
+        elif isinstance(input, np.ndarray):
+            assert isinstance(output, np.ndarray), 'Input and Output need to be the same data type.'
+            return self.convert_numpy(input, output, flat=flat)
+        else:
+            TypeError('Input & Output need to be same datatype, either Numpy or Pandas.')
 
     def convert_numpy(self, input, output, flat=False):
         if input.ndim == 1:
@@ -1484,7 +1523,6 @@ class GridSearch(object):
         else:
             self.best = [-np.inf, 0]
 
-
     def _parse_params(self):
         k, v = zip(*self.params.items())
         self.parsed_params = [dict(zip(k, v)) for v in itertools.product(*self.params.values())]
@@ -1492,7 +1530,6 @@ class GridSearch(object):
             self.cv.n_splits,
             len(self.parsed_params),
             len(self.parsed_params) * self.cv.n_splits))
-
 
     def fit(self, input, output):
         # Convert to Numpy
@@ -1502,8 +1539,8 @@ class GridSearch(object):
             output = np.array(output).reshape((-1))
 
         # Loop through parameters
-        for i, param in enumerate(self.parsed_params):
-            print('[GridSearch] ', param)
+        for i, param in tqdm(enumerate(self.parsed_params)):
+            # print('[GridSearch] ', param)
             scoring = []
             timing = []
             for train_ind, val_ind in self.cv.split(input, output):
@@ -1515,7 +1552,7 @@ class GridSearch(object):
                 ytrain, yval = output[train_ind], output[val_ind]
 
                 # Model training
-                model = sklearn.base.clone(self.model, safe=True)
+                model = copy.copy(self.model)
                 model.set_params(**param)
                 model.fit(xtrain, ytrain)
 
@@ -1531,8 +1568,8 @@ class GridSearch(object):
                 if np.mean(scoring) - np.std(scoring) > self.best[0] - self.best[1]:
                     self.best = [np.mean(scoring), np.std(scoring)]
 
-            print('[GridSearch] [%s] Score: %.4f \u00B1 %.4f (in %.1f seconds) (Best score so-far: %.4f \u00B1 %.4f) (%i / %i)' %
-                  (datetime.now().strftime('%H:%M'), np.mean(scoring), np.std(scoring), np.mean(timing), self.best[0], self.best[1], i + 1, len(self.parsed_params)))
+            # print('[GridSearch] [%s] Score: %.4f \u00B1 %.4f (in %.1f seconds) (Best score so-far: %.4f \u00B1 %.4f) (%i / %i)' %
+            #       (datetime.now().strftime('%H:%M'), np.mean(scoring), np.std(scoring), np.mean(timing), self.best[0], self.best[1], i + 1, len(self.parsed_params)))
             self.result.append({
                 'scoring': scoring,
                 'mean_score': np.mean(scoring),
