@@ -25,9 +25,11 @@ warnings.filterwarnings("ignore")
 
 # Priority
 # todo add SHAP selected as 4th dataset
+# todo add BorutaPy in EDA & 5th dataset
 # todo add a function to pipeline that prepares the files for production :) --> Ask for changelog!
 # todo merge Modelling Classification & Regression, make function cross_validator
 # todo Pipeline.validation() include regression
+# EDA missing value plot
 
 # Nicety
 # todo preprocessing check for big chunks of missing data
@@ -42,6 +44,7 @@ class Pipeline(object):
                  max_lags=15,
                  info_threshold=0.975,
                  max_diff=1,
+                 grid_search=3,
                  shuffle=False,
                  n_splits=1,
                  include_output=False,
@@ -75,6 +78,7 @@ class Pipeline(object):
         self.shuffle = shuffle
         self.prev_mod = use_prev_mod
         self.n_splits = n_splits
+        self.number_grid_search = grid_search
 
         # Instance initiating
         self.input = None
@@ -100,7 +104,7 @@ class Pipeline(object):
         self.create_dirs()
 
     def create_dirs(self):
-        dirs = ['/', '/Initial Modelling/', '/Data/', '/Hyperparameter Opt/',
+        dirs = ['/', '/Data/', '/Hyperparameter Opt/',
                 '/Instances/']
         for dir in dirs:
             try:
@@ -249,6 +253,7 @@ class Pipeline(object):
         # Check if not already completed
         if self.prev_mod and os.path.exists(self.mainDir + '/Modelling.csv'):
             self.modelling_res = pd.read_csv(self.mainDir + '/Modelling.csv')
+            self.modelling_res = self.sort_results(self.modelling_res)
         else:
             # Initial Modelling
             init = []
@@ -260,20 +265,21 @@ class Pipeline(object):
                     self.modelling_res = self.modelling.fit(self.input.reindex(columns=cols),
                                                             self.output.loc[:, self.target])
                 else:
-                    self.modelling_res.append(self.modelling.fit(self.input.reindex(columns=cols),
+                    self.modelling_res = self.modelling_res.append(self.modelling.fit(self.input.reindex(columns=cols),
                                                                  self.output.loc[:, self.target]))
+            self.modelling_res.to_csv(self.mainDir + '/Modelling.csv')
             self.modelling_res = self.sort_results(self.modelling_res)
             best_row = self.modelling_res.iloc[0]
             print('[autoML] Init Modelling finished, best score: %.2f \u00B1 %.2f' %
                   (best_row['mean_score'], best_row['std_score']))
             print('[autoML] %s, on %s features' % (best_row['model'], best_row['dataset']))
-            self.modelling_res.to_csv(self.mainDir + '/Modelling.csv')
 
     def get_hyper_params(self, model):
         print('[autoML] Getting Hyperparameters for', type(model).__name__)
         # Parameters for both Regression / Classification
         if isinstance(model, sklearn.linear_model.Lasso) or \
-            isinstance(model, sklearn.linear_model.Ridge):
+            isinstance(model, sklearn.linear_model.Ridge) or \
+                isinstance(model, sklearn.linear_model.RidgeClassifier):
             return {
                 'alpha': [0.001, 0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 2, 3, 4, 5]
             }
@@ -374,6 +380,15 @@ class Pipeline(object):
                     'iterations': [500, 1000, 2000],
                     'learning_rate': [0.001, 0.01, 0.03, 0.05, 0.1],
                     'l2_leaf_reg': [1, 3, 5],
+                    'verbose': [0],
+                }
+            elif isinstance(model, sklearn.ensemble.BaggingClassifier):
+                return {
+                    'n_estimators': [5, 10, 15, 25, 50],
+                    'max_features': [0.5, 0.75, 1.0],
+                    'bootstrap': [False, True],
+                    'bootstrap_features': [True, False],
+                    'n_jobs': [max(mp.cpu_count() - 2, 1)],
                 }
             elif isinstance(model, sklearn.ensemble.GradientBoostingClassifier):
                 return {
@@ -384,12 +399,11 @@ class Pipeline(object):
                 }
             elif isinstance(model, sklearn.ensemble.HistGradientBoostingClassifier):
                 return {
-                    'max_iter': [100, 250],
-                    # 'max_bins': [100, 255],
-                    # 'l2_regularization': [0.001, 0.005, 0.01, 0.05],
-                    # 'learning_rate': [0.01, 0.1, 0.25, 0.4],
-                    # 'max_leaf_nodes': [31, 50, 75, 150],
-                    # 'early_stopping': [True]
+                    'max_bins': [100, 255],
+                    'l2_regularization': [0.001, 0.005, 0.01, 0.05],
+                    'learning_rate': [0.01, 0.1, 0.25, 0.4],
+                    'max_leaf_nodes': [31, 50, 75, 150],
+                    'early_stopping': [True]
                 }
             elif isinstance(model, sklearn.ensemble.RandomForestClassifier):
                 return {
@@ -423,7 +437,7 @@ class Pipeline(object):
             if params is None:
                 params = self.get_hyper_params(model)
             # Run Grid Search
-            results = self.sort_results(self._gridsearch(model))
+            results = self.sort_results(self._gridsearch(model, params, data_ind))
             results.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
                            (type(model).__name__, str(data_ind)), index_label='index')
             # Validate
@@ -432,7 +446,7 @@ class Pipeline(object):
         # If arguments aren't provided, do top 3 from self.modelling_res
         datasets = ['All', 'PPS', 'RF']
         models = self.modelling.return_models()
-        for iteration in range(3):
+        for iteration in range(self.number_grid_search):
             # Grab settings
             settings = self.modelling_res.iloc[iteration]
             model = models[[i for i in range(len(models)) if type(models[i]).__name__ == settings['model']][0]]
@@ -443,7 +457,7 @@ class Pipeline(object):
                 self.grid_res = pd.read_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
                            (type(model).__name__, str(data_ind)))
                 # Validate
-                params = json.loads(self.grid_res.iloc[0]['params'].replace("'", '"'))
+                params = json.loads(self.grid_res.iloc[0]['params'].replace("'", '"').lower())
             else:
                 # Grab parameters
                 params = self.get_hyper_params(model)
@@ -481,8 +495,8 @@ class Pipeline(object):
             results = results.sort_values('worst_case', ascending=False)
         return results
 
-    def validate(self, model, params, data_ind):
-        print('\n\n[autoML] Validating results for %s (%s)' % (type(model).__name__, params))
+    def validate(self, master_model, params, data_ind):
+        print('\n\n[autoML] Validating results for %s (%s)' % (type(master_model).__name__, params))
         if not os.path.exists(self.mainDir + '/Validation/'): os.mkdir(self.mainDir + '/Validation')
 
         # For classification
@@ -493,7 +507,6 @@ class Pipeline(object):
             rec = []
             spec = []
             cm = np.zeros((2, 2))
-            vals = np.zeros((2))
             aucs = []
             tprs = []
             mean_fpr = np.linspace(0, 1, 100)
@@ -504,13 +517,12 @@ class Pipeline(object):
             for i, (t, v) in enumerate(cv.split(input, output)):
                 n = len(v)
                 ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
-                model = copy.copy(model)
+                model = copy.copy(master_model)
                 model.set_params(**params)
                 model.fit(ti, to)
-                predictions = model.predict(vi)
+                predictions = model.predict(vi).reshape((-1))
 
                 # Metrics
-                vals += np.array([(vo == 1).sum(), (vo == -1).sum()]) / self.n_splits
                 tp = np.logical_and(np.sign(predictions) == 1, vo == 1).sum()
                 tn = np.logical_and(np.sign(predictions) == -1, vo == -1).sum()
                 fp = np.logical_and(np.sign(predictions) == 1, vo == -1).sum()
@@ -540,7 +552,7 @@ class Pipeline(object):
                 return
 
             # Plot ROC
-            fig, ax = plt.subplots()
+            fig, ax = plt.subplots(figsize=[12, 8])
             viz = plot_roc_curve(model, vi, vo, name='ROC fold {}'.format(i + 1), alpha=0.3, ax=ax)
             interp_tpr = np.interp(mean_fpr, viz.fpr, viz.tpr)
             interp_tpr[0] = 0.0
@@ -563,7 +575,7 @@ class Pipeline(object):
             ax.fill_between(mean_fpr, tprs_lower, tprs_upper, color='#729ce9', alpha=.2,
                             label=r'$\pm$ 1 std. dev.')
             ax.set(xlim=[-0.05, 1.05], ylim=[-0.05, 1.05],
-                   title="Receiver operating characteristic example")
+                   title="ROC Curve - %s" % type(master_model).__name__)
             ax.legend(loc="lower right")
             fig.savefig(self.mainDir + '/Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
             plt.show()
@@ -1082,11 +1094,9 @@ class ExploratoryDataAnalysis(object):
             model = RandomForestClassifier(**args).fit(self.data, self.output)
         else:
             model = RandomForestRegressor(**args).fit(self.data, self.output)
-        fig = plt.figure(figsize=[8, 32])
+        fig, ax = plt.subplots(figsize=[8, 12], constrained_layout=True)
         ind = np.argsort(model.feature_importances_)
-        plt.barh(list(self.data.keys()[ind]), width=model.feature_importances_[ind])
-        plt.subplots_adjust(left=0.4)
-        # plt.xticks(rotation=60, ha='right')
+        plt.barh(list(self.data.keys()[ind])[-15:], width=model.feature_importances_[ind][-15:])
         results = pd.DataFrame({'x': self.data.keys(), 'score': model.feature_importances_})
         results.to_csv(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'RF.csv')
         fig.savefig(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'RF.png', format='png', dpi=300)
@@ -1101,9 +1111,8 @@ class ExploratoryDataAnalysis(object):
         elif isinstance(self.output, pd.DataFrame):
             data.loc[:, 'target'] = self.output.loc[:, self.output.keys()[0]]
         pp_score = pps.predictors(data, 'target').sort_values('ppscore')
-        plt.subplots_adjust(left=0.4)
-        fig = plt.figure(figsize=[8, 32])
-        plt.barh(pp_score['x'], width=pp_score['ppscore'])
+        fig, ax = plt.subplots(figsize=[8, 12], constrained_layout=True)
+        plt.barh(pp_score['x'][-15:], width=pp_score['ppscore'][-15:])
         fig.savefig(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'Ppscore.png', format='png', dpi=400)
         pp_score.to_csv(self.folder + 'EDA/Nonlinear Correlation/pp_score.csv')
         plt.close()
@@ -1639,11 +1648,3 @@ class LSTM(object):
 
     def predict(self, input):
         return self.model.predict(input)
-
-
-
-
-
-
-
-
