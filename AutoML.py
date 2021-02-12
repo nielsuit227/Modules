@@ -1,4 +1,4 @@
-import os, time, itertools, re, joblib, json, pickle, copy
+import os, time, itertools, re, joblib, json, pickle, copy, shutil
 import numpy as np
 import pandas as pd
 import ppscore as pps
@@ -24,6 +24,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Priority
+# BUG after specified grid_search, it validates everything... ?
 # todo add SHAP selected as 4th dataset
 # todo add BorutaPy in EDA & 5th dataset
 # todo add a function to pipeline that prepares the files for production :) --> Ask for changelog!
@@ -49,6 +50,7 @@ class Pipeline(object):
                  n_splits=1,
                  include_output=False,
                  data_ind=None,
+                 skip_eda=False,
                  use_prev_data=True,
                  use_prev_mod=True,
                  shift=[0],
@@ -66,12 +68,14 @@ class Pipeline(object):
         assert max(shift) >= 0 and min(shift) < 50;
 
         # Data prep params
+        self.datasets = ['All', 'PPS', 'RF', 'RFs']
         self.missing_values = missing_values
         self.remove_colinear = remove_colinear
         self.max_lags = max_lags
         self.info_threshold = info_threshold
         self.max_diff = max_diff
         self.include_output = include_output
+        self.skip_eda = skip_eda
         self.prev_data = use_prev_data
 
         # Modelling Params
@@ -149,9 +153,6 @@ class Pipeline(object):
             if self.include_output is False:
                 self.input = self.input.drop(self.target, axis=1)
 
-            # EDA
-            self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder=self.mainDir + '/')
-
             # Check whether is classification
             if len(set(self.output)) == 2:
                 self.classification = True
@@ -164,6 +165,7 @@ class Pipeline(object):
                     self.output.loc[self.output == list(output_set)[1]] = 1
 
             # Normalize
+            print('[autoML] Normalizing data')
             all_features = self.input.keys()
             scaler = StandardScaler()
             if self.regression:
@@ -218,13 +220,19 @@ class Pipeline(object):
             self.input.to_csv(self.mainDir + '/Data/Input.csv', index_label='index')
             self.output.to_csv(self.mainDir + '/Data/Output.csv', index_label='index')
 
+            # EDA
+            if not self.skip_eda:
+                self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder=self.mainDir + '/')
+
             # Keep based on PPScore
+            print('[autoML] Determining Features with PPS')
             data = self.input.copy()
             data['target'] = self.output.copy()
             pp_score = pps.predictors(data, "target")
             self.col_keep.append(pp_score['x'][pp_score['ppscore'] != 0].to_list())
 
             # Keep based on RF
+            print('[autoML] Determining Features with RF')
             if self.regression:
                 rf = RandomForestRegressor().fit(self.input, self.output[self.target])
             elif self.classification:
@@ -232,7 +240,13 @@ class Pipeline(object):
             fi = rf.feature_importances_
             sfi = fi.sum()
             ind = np.flip(np.argsort(fi))
+
+            # Based on Info Threshold (97.5% of info)
             ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.info_threshold * sfi]
+            self.col_keep.append(self.input.keys()[ind_keep].to_list())
+
+            # Based on Info Increment (1% increments)
+            ind_keep = [ind_keep[i] for i in range(len(ind)) if fi[i] > sfi / 100]
             self.col_keep.append(self.input.keys()[ind_keep].to_list())
 
             # Store to self
@@ -257,10 +271,9 @@ class Pipeline(object):
         else:
             # Initial Modelling
             init = []
-            ds = ['All', 'PPS', 'RF']
             for i, cols in enumerate(self.col_keep):
                 print('[autoML] Initial Modelling for %s features (%i)' % (ds[i], len(cols)))
-                self.modelling.dataset = ds[i]
+                self.modelling.dataset = self.datasets[i]
                 if self.modelling_res is None:
                     self.modelling_res = self.modelling.fit(self.input.reindex(columns=cols),
                                                             self.output.loc[:, self.target])
@@ -362,7 +375,7 @@ class Pipeline(object):
                     'loss': ['hinge', 'log', 'modified_huber', 'squared_hinge'],
                     'penalty': ['l2', 'l1', 'elasticnet'],
                     'alpha': [0.001, 0.01, 0.1, 0.5, 1, 2],
-                    'max_iter': [1000, 2500, 5000],
+                    'max_iter': [500, 1000, 1500],
                 }
             elif isinstance(model, sklearn.tree.DecisionTreeClassifier):
                 return {
@@ -430,34 +443,40 @@ class Pipeline(object):
         # If arguments are provided
         if model is not None:
             # Check if already completed
-            if self.prev_mod and type(model).__name__ + '_%s.csv' % str(self.data_ind) in \
+            if self.prev_mod and type(model).__name__ + '_%s.csv' % str(data_ind) in \
                     os.listdir(self.mainDir + '/Hyperparameter Opt'):
                 print('[autoML] Hyperparameter Optimization already completed.')
-            # Parameter check
-            if params is None:
-                params = self.get_hyper_params(model)
-            # Run Grid Search
-            results = self.sort_results(self._gridsearch(model, params, data_ind))
-            results.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
-                           (type(model).__name__, str(data_ind)), index_label='index')
+                self.grid_res = pd.read_csv(self.mainDir + '/Hyperparameter Opt/' + type(model).__name +
+                                            '_%s.csv' % str(data_ind))
+            else:
+                # Parameter check
+                if params is None:
+                    params = self.get_hyper_params(model)
+                # Run Grid Search
+                self.grid_res = self.sort_results(self._gridsearch(model, params, data_ind))
+                self.grid_res.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
+                               (type(model).__name__, str(data_ind)), index_label='index')
             # Validate
             self.validate(model, self.grid_res.iloc[0]['params'], data_ind)
 
         # If arguments aren't provided, do top 3 from self.modelling_res
-        datasets = ['All', 'PPS', 'RF']
         models = self.modelling.return_models()
         for iteration in range(self.number_grid_search):
             # Grab settings
             settings = self.modelling_res.iloc[iteration]
             model = models[[i for i in range(len(models)) if type(models[i]).__name__ == settings['model']][0]]
-            data_ind = [i for i in range(3) if datasets[i] == settings['dataset']][0]
+            data_ind = [i for i in range(3) if self.datasets[i] == settings['dataset']][0]
             # Check whether exists
             if self.prev_mod and os.path.exists(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
                            (type(model).__name__, str(data_ind))):
                 self.grid_res = pd.read_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
                            (type(model).__name__, str(data_ind)))
                 # Validate
-                params = json.loads(self.grid_res.iloc[0]['params'].replace("'", '"').lower())
+                try:
+                    params = json.loads(self.grid_res.iloc[0]['params'].replace("'", '"').lower())
+                except:
+                    print('[autoML] Cannot validate %s, imparsable JSON.' % type(model).__name__)
+                    continue
             else:
                 # Grab parameters
                 params = self.get_hyper_params(model)
@@ -578,7 +597,29 @@ class Pipeline(object):
                    title="ROC Curve - %s" % type(master_model).__name__)
             ax.legend(loc="lower right")
             fig.savefig(self.mainDir + '/Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
-            plt.show()
+
+    def prepare_production_files(self):
+
+        os.mkdir(self.mainDir + '/Production')
+
+        # Find best model
+        best_row = None
+        folder = self.mainDir + '/Hyperparameter Opt/'
+        for file in os.listdir(folder):
+            res = pd.read_csv(folder + file)
+            if (best_row is None) or \
+                (self.classification and res.iloc[0]['worst_case'] > best_row['worst_case']) or \
+                (self.regression and res.iloc[0]['worst_case'] < best_row['worst_case']):
+                best_row = res.iloc[0]
+
+        # Copy
+        shutil.copy(self.mainDir + '/Data/features_%i.json' % best_row['data_ind'],
+                    self.mainDir + '/Production/features.json')
+        shutil.copy(self.mainDir + '/Data/Normalization.pickle',
+                    self.mainDir + '/Produciton/Normalization.pickle')
+
+        # Model
+        return
 
     def predict(self, sample):
         # todo asserts for sample
@@ -1050,11 +1091,12 @@ class ExploratoryDataAnalysis(object):
 
     def crossCorr(self):
         folder = 'EDA/Correlation/Cross/'
+        output = self.output.to_numpy().reshape((-1))
         for key in tqdm(self.data.keys()):
             if self.tag + key + '_differ_' + str(self.differ) + '.png' in os.listdir(self.folder + folder):
                 continue
             fig = plt.figure(figsize=[24, 16])
-            plt.xcorr(self.data[key], self.output, maxlags=self.lags)
+            plt.xcorr(self.data[key], output.to_numpy(), maxlags=self.lags)
             plt.title(key)
             fig.savefig(self.folder + folder + self.tag + key + '_differ_' + str(self.differ) + '.png', format='png', dpi=300)
             plt.close()
