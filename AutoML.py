@@ -125,6 +125,13 @@ class Pipeline(object):
             results = results.sort_values('worst_case', ascending=False)
         return results
 
+    def parse_json(self, json_string):
+        return json.loads(json_string\
+                .replace("'", '"')\
+                .replace("True", "true")\
+                .replace("False", "false")\
+                .replace("None", "null"))
+
     def fit(self, data):
         # Data preparation -- Creates/Loads All_selected, output, pp_selected, rf_selected
         self.data_preparation(data)
@@ -132,6 +139,8 @@ class Pipeline(object):
         self.initial_modelling()
         # Hyperparameter optimization
         self.grid_search()
+        # Production Env
+        self.prepare_production_files()
 
     def data_preparation(self, data):
         files = os.listdir(self.mainDir + '/Data/')
@@ -146,6 +155,7 @@ class Pipeline(object):
             # Clean
             self.prep = Preprocessing(missingValues=self.missing_values)
             data = self.prep.clean(data)
+            pickle.dump(self.prep, open(self.mainDir + '/Data/Preprocessing.pickle', 'wb'))
 
             # Split data
             self.output = data[self.target]
@@ -165,16 +175,19 @@ class Pipeline(object):
                     self.output.loc[self.output == list(output_set)[1]] = 1
 
             # Normalize
-            print('[autoML] Normalizing data')
-            all_features = self.input.keys()
+            print('[autoML] Normalizing Data.')
+            norm_features = self.input.keys().to_list()
             scaler = StandardScaler()
             if self.regression:
                 self.input[self.input.keys()], self.output[self.output.keys()] = scaler.fit_transform(self.input, self.output)
             elif self.classification:
                 self.input[self.input.keys()] = scaler.fit_transform(self.input)
             self.norm = scaler  # Important for production env that scaler doesn't have a super class
+            pickle.dump(scaler, open(self.mainDir + '/Data/Normalization.pickle', 'wb'))
+            json.dump(norm_features, open(self.mainDir + '/Data/norm_features.json', 'w'))
 
             # Stationarity Check
+            print('[autoML] Stationarity Check')
             if self.max_diff != 0:
                 varVec = np.zeros((self.max_diff + 1, len(self.input.keys())))
                 diffData = self.input.copy(deep=True)
@@ -191,6 +204,7 @@ class Pipeline(object):
                 self.diff = 'none'
 
             # Differencing, shifting, lagging
+            print('[autoML] Sequencing Data.')
             n_features = len(self.input.keys())
             self.sequencer = Sequence(back=self.max_lags, forward=self.shift, diff=self.diff)
             self.input, self.output = self.sequencer.convert(self.input, self.output)
@@ -216,11 +230,13 @@ class Pipeline(object):
                 print('[autoML] Dropped %i Co-Linear variables.' % len(col_drop))
 
             # Keep all
+            print('[autoML] Storing input/output')
             self.col_keep = [self.input.keys().to_list()]
             self.input.to_csv(self.mainDir + '/Data/Input.csv', index_label='index')
             self.output.to_csv(self.mainDir + '/Data/Output.csv', index_label='index')
 
             # EDA
+            print('[autoML] Starting Exploratory Data Analysis')
             if not self.skip_eda:
                 self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder=self.mainDir + '/')
 
@@ -240,21 +256,18 @@ class Pipeline(object):
             fi = rf.feature_importances_
             sfi = fi.sum()
             ind = np.flip(np.argsort(fi))
-
             # Based on Info Threshold (97.5% of info)
             ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.info_threshold * sfi]
             self.col_keep.append(self.input.keys()[ind_keep].to_list())
-
             # Based on Info Increment (1% increments)
-            ind_keep = [ind_keep[i] for i in range(len(ind)) if fi[i] > sfi / 100]
+            ind_keep = [ind[i] for i in range(len(ind)) if fi[i] > sfi / 100]
             self.col_keep.append(self.input.keys()[ind_keep].to_list())
 
             # Store to self
-            for i in range(3):
+            print('[autoML] Storing data preparation meta data.')
+            for i in range(len(self.datasets)):
                 json.dump(self.col_keep[i], open(self.mainDir + '/Data/features_%i.json' % i, 'w'))
             json.dump(self.col_keep, open(self.mainDir + '/Data/Col_keep.json', 'w'))
-            pickle.dump(self.prep, open(self.mainDir + '/Data/Preprocessing.pickle', 'wb'))
-            pickle.dump(scaler, open(self.mainDir + '/Data/Normalization.pickle', 'wb'))
 
     def initial_modelling(self):
         # Initialize modelling class
@@ -446,8 +459,13 @@ class Pipeline(object):
             if self.prev_mod and type(model).__name__ + '_%s.csv' % str(data_ind) in \
                     os.listdir(self.mainDir + '/Hyperparameter Opt'):
                 print('[autoML] Hyperparameter Optimization already completed.')
-                self.grid_res = pd.read_csv(self.mainDir + '/Hyperparameter Opt/' + type(model).__name +
-                                            '_%s.csv' % str(data_ind))
+                self.grid_res = self.sort_results(pd.read_csv(self.mainDir + '/Hyperparameter Opt/' +
+                                                              type(model).__name__ + '_%s.csv' % str(data_ind)))
+                try:
+                    params = self.parse_json(self.grid_res.iloc[0]['params'])
+                except:
+                    print('[autoML] Cannot validate %s, imparsable JSON.' % type(model).__name__)
+                    return
             else:
                 # Parameter check
                 if params is None:
@@ -456,8 +474,10 @@ class Pipeline(object):
                 self.grid_res = self.sort_results(self._gridsearch(model, params, data_ind))
                 self.grid_res.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
                                (type(model).__name__, str(data_ind)), index_label='index')
+                params = self.grid_res.iloc[0]['params']
             # Validate
-            self.validate(model, self.grid_res.iloc[0]['params'], data_ind)
+            self.validate(model, params, data_ind)
+            return
 
         # If arguments aren't provided, do top 3 from self.modelling_res
         models = self.modelling.return_models()
@@ -473,7 +493,7 @@ class Pipeline(object):
                            (type(model).__name__, str(data_ind)))
                 # Validate
                 try:
-                    params = json.loads(self.grid_res.iloc[0]['params'].replace("'", '"').lower())
+                    params = self.parse_json(self.grid_res.iloc[0]['params'])
                 except:
                     print('[autoML] Cannot validate %s, imparsable JSON.' % type(model).__name__)
                     continue
@@ -515,7 +535,8 @@ class Pipeline(object):
         return results
 
     def validate(self, master_model, params, data_ind):
-        print('\n\n[autoML] Validating results for %s (%s)' % (type(master_model).__name__, params))
+        print('\n\n[autoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
+                                                len(self.col_keep[data_ind]), self.datasets[data_ind], params))
         if not os.path.exists(self.mainDir + '/Validation/'): os.mkdir(self.mainDir + '/Validation')
 
         # For classification
@@ -598,27 +619,40 @@ class Pipeline(object):
             ax.legend(loc="lower right")
             fig.savefig(self.mainDir + '/Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
 
-    def prepare_production_files(self):
+    def prepare_production_files(self, file=None):
+        if not os.path.exists(self.mainDir + '/Production'):
+            os.mkdir(self.mainDir + '/Production')
+        if file is not None:
+            model = file[:file.find('_')]
+            data_ind = int(file[file.find('_') + 1])
+            params = self.parse_json(pd.read_csv(self.mainDir + '/Hyperparameter Opt/' + file).iloc[0]['params'])
+        else:
+            # Find best model
+            best_row = None
+            folder = self.mainDir + '/Hyperparameter Opt/'
+            for file in os.listdir(folder):
+                res = pd.read_csv(folder + file)
+                if (best_row is None) or \
+                    (self.classification and res.iloc[0]['worst_case'] > best_row['worst_case']) or \
+                    (self.regression and res.iloc[0]['worst_case'] < best_row['worst_case']):
+                    model = file[:file.find('_')]
+                    data_ind = int(file[file.find('_') + 1])
+                    params = self.parse_json(res.iloc[0]['params'])
 
-        os.mkdir(self.mainDir + '/Production')
-
-        # Find best model
-        best_row = None
-        folder = self.mainDir + '/Hyperparameter Opt/'
-        for file in os.listdir(folder):
-            res = pd.read_csv(folder + file)
-            if (best_row is None) or \
-                (self.classification and res.iloc[0]['worst_case'] > best_row['worst_case']) or \
-                (self.regression and res.iloc[0]['worst_case'] < best_row['worst_case']):
-                best_row = res.iloc[0]
-
-        # Copy
-        shutil.copy(self.mainDir + '/Data/features_%i.json' % best_row['data_ind'],
+        print('[autoML] Preparing Production Env Files for %s, feature set %s' % (model, self.datasets[data_ind]))
+        # Copy Features & Normalization & Norm Features
+        shutil.copy(self.mainDir + '/Data/features_%i.json' % data_ind,
                     self.mainDir + '/Production/features.json')
         shutil.copy(self.mainDir + '/Data/Normalization.pickle',
-                    self.mainDir + '/Produciton/Normalization.pickle')
+                    self.mainDir + '/Production/normalization.pickle')
+        shutil.copy(self.mainDir + '/Data/norm_features.json',
+                    self.mainDir + '/Production/norm_features.json')
 
         # Model
+        model = [mod for mod in self.modelling.return_models() if type(mod).__name__ == model][0]
+        model.set_params(**params)
+        model.fit(self.input[self.col_keep[data_ind]], self.output)
+        joblib.dump(model, self.mainDir + '/Production/model.joblib')
         return
 
     def predict(self, sample):
