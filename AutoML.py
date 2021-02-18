@@ -1130,7 +1130,7 @@ class ExploratoryDataAnalysis(object):
             if self.tag + key + '_differ_' + str(self.differ) + '.png' in os.listdir(self.folder + folder):
                 continue
             fig = plt.figure(figsize=[24, 16])
-            plt.xcorr(self.data[key], output.to_numpy(), maxlags=self.lags)
+            plt.xcorr(self.data[key], output, maxlags=self.lags)
             plt.title(key)
             fig.savefig(self.folder + folder + self.tag + key + '_differ_' + str(self.differ) + '.png', format='png', dpi=300)
             plt.close()
