@@ -238,7 +238,7 @@ class Pipeline(object):
             # EDA
             print('[autoML] Starting Exploratory Data Analysis')
             if not self.skip_eda:
-                self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder=self.mainDir + '/')
+                self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder='/')
 
             # Keep based on PPScore
             print('[autoML] Determining Features with PPS')
