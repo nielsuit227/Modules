@@ -53,8 +53,8 @@ class Pipeline(object):
                  skip_eda=False,
                  use_prev_data=True,
                  use_prev_mod=True,
-                 shift=[0],
-                 version=1):
+                 version=None,
+                 shift=[0]):
         print('\n\n*** Start Amplo PM Model Builder ***\n\n')
 
         # Checks
@@ -104,12 +104,13 @@ class Pipeline(object):
         self.diffOrder = 0
         self.classification = False
         self.regression = True
-        self.mainDir = 'AutoML_v%i' % version
+        self.mainDir = 'AutoML'
+        self.version = version
         self.create_dirs()
 
     def create_dirs(self):
-        dirs = ['/', '/Data/', '/Hyperparameter Opt/',
-                '/Instances/']
+        dirs = ['/', '/Data/', '/Columns/', '/Features/', '/Normalization/',
+                '/Hyperparameter Opt/', '/Instances/']
         for dir in dirs:
             try:
                 os.mkdir(self.mainDir + dir)
@@ -144,10 +145,14 @@ class Pipeline(object):
 
     def data_preparation(self, data):
         files = os.listdir(self.mainDir + '/Data/')
-        if self.prev_data and len(files) != 0:
-            self.input = pd.read_csv(self.mainDir + '/Data/Input.csv', index_col='index')
-            self.output = pd.read_csv(self.mainDir + '/Data/Output.csv', index_col='index')
-            self.col_keep = json.load(open(self.mainDir + '/Data/Col_keep.json', 'r'))
+        if self.prev_data and 'Col_keep.json' in files:
+            if self.version is None:
+                self.version = max([int(x[x.find('v')+1:x.find('.')]) for x in
+                                    os.listdir(self.mainDir + '/Data/') if 'Input' in x]) + 1
+                print('[autoML] Loading data version %i ()')
+            self.input = pd.read_csv(self.mainDir + '/Data/Input_v%i.csv' % self.version, index_col='index')
+            self.output = pd.read_csv(self.mainDir + '/Data/Output_v%i.csv' % self.version, index_col='index')
+            self.col_keep = json.load(open(self.mainDir + '/Columns/Col_keep_v%i.json' % self.version, 'r'))
             if len(set(self.output[self.target])) == 2:
                 self.classification = True
                 self.regression = False
@@ -179,12 +184,15 @@ class Pipeline(object):
             norm_features = self.input.keys().to_list()
             scaler = StandardScaler()
             if self.regression:
-                self.input[self.input.keys()], self.output[self.output.keys()] = scaler.fit_transform(self.input, self.output)
+                self.input[self.input.keys()] = scaler.fit_transform(self.input)
+                output_scaler = StandardScaler()
+                self.output[self.output.keys()] = output_scaler.fit_transform(self.output.to_numpy().reshape((-1, 1))).reshape((-1))
+                pickle.dump(output_scaler, open(self.mainDir + '/Normalization/Output_norm.pickle', 'wb'))
             elif self.classification:
                 self.input[self.input.keys()] = scaler.fit_transform(self.input)
             self.norm = scaler  # Important for production env that scaler doesn't have a super class
-            pickle.dump(scaler, open(self.mainDir + '/Data/Normalization.pickle', 'wb'))
-            json.dump(norm_features, open(self.mainDir + '/Data/norm_features.json', 'w'))
+            pickle.dump(scaler, open(self.mainDir + '/Normalization/Normalization_v%i.pickle' % self.version, 'wb'))
+            json.dump(norm_features, open(self.mainDir + '/Normalization/norm_features_v%i.json' % self.version, 'w'))
 
             # Stationarity Check
             print('[autoML] Stationarity Check')
@@ -231,9 +239,22 @@ class Pipeline(object):
 
             # Keep all
             print('[autoML] Storing input/output')
+            input_versions = [int(x[x.find('v')+1:x.find('.')]) for x in os.listdir(self.mainDir + '/Data/') if 'Input' in x]
+            if len(input_versions) != 0:
+                self.version = max(input_versions) + 1
+                changelog = input("Data changelog v%i")
+                file = open(self.mainDir + '/changelog.txt', 'a')
+                file.write(('\n v%i: ' % self.version) + changelog)
+                file.close()
+            elif self.version is None:
+                self.version = 0
+                file = open(self.mainDir + '/changelog.txt', 'w')
+                file.write('Dataset changelog. \nv0: Initial')
+                file.close()
             self.col_keep = [self.input.keys().to_list()]
-            self.input.to_csv(self.mainDir + '/Data/Input.csv', index_label='index')
-            self.output.to_csv(self.mainDir + '/Data/Output.csv', index_label='index')
+            self.input.to_csv(self.mainDir + '/Data/Input_v%i.csv' % self.version, index_label='index')
+            self.output.to_csv(self.mainDir + '/Data/Output_v%i.csv' % self.version, index_label='index')
+
 
             # EDA
             print('[autoML] Starting Exploratory Data Analysis')
@@ -263,11 +284,15 @@ class Pipeline(object):
             ind_keep = [ind[i] for i in range(len(ind)) if fi[i] > sfi / 100]
             self.col_keep.append(self.input.keys()[ind_keep].to_list())
 
+            # SHAP
+            import shap
+            shap_values = shap.TreeExplainer(rf).shap_values(self.input)
+
             # Store to self
             print('[autoML] Storing data preparation meta data.')
             for i in range(len(self.datasets)):
-                json.dump(self.col_keep[i], open(self.mainDir + '/Data/features_%i.json' % i, 'w'))
-            json.dump(self.col_keep, open(self.mainDir + '/Data/Col_keep.json', 'w'))
+                json.dump(self.col_keep[i], open(self.mainDir + '/Features/features_%i_v%i.json' % (i, self.version), 'w'))
+            json.dump(self.col_keep, open(self.mainDir + '/Columns/Col_keep_v%i.json' % self.version, 'w'))
 
     def initial_modelling(self):
         # Initialize modelling class
