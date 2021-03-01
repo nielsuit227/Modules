@@ -25,8 +25,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Priority
-# todo merge Modelling Classification & Regression, make function cross_validator
-# EDA missing value plot
 
 # Nicety
 # todo preprocessing check for big chunks of missing data
@@ -1077,6 +1075,8 @@ class ExploratoryDataAnalysis(object):
 
     def run(self):
         # Run all functions
+        print('[EDA] Generating Missing Values Plot')
+        self.missingValues()
         print('[EDA] Generating Timeplots')
         self.timeplots()
         print('[EDA] Generating Boxplots')
@@ -1118,6 +1118,13 @@ class ExploratoryDataAnalysis(object):
                     file.close()
             except:
                 continue
+
+    def missingValues(self):
+        if self.tag + 'MissingValues.png' in os.listdir(self.folder + 'EDA/'):
+            return
+        import missingno
+        fig = missingno.matrix(self.input, figsize=[24, 16])
+        fig.savefig(self.folder + 'EDA/MissingValues.png')
 
     def boxplots(self):
         for key in tqdm(self.data.keys()):
