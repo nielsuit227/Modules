@@ -24,7 +24,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Priority
-# BUG after specified grid_search, it validates everything... ?
 # todo add SHAP selected as 4th dataset
 # todo add BorutaPy in EDA & 5th dataset
 # todo add a function to pipeline that prepares the files for production :) --> Ask for changelog!
@@ -47,7 +46,7 @@ class Pipeline(object):
                  max_diff=1,
                  grid_search=3,
                  shuffle=False,
-                 n_splits=1,
+                 n_splits=3,
                  include_output=False,
                  data_ind=None,
                  skip_eda=False,
@@ -110,7 +109,7 @@ class Pipeline(object):
 
     def create_dirs(self):
         dirs = ['/', '/Data/', '/Columns/', '/Features/', '/Normalization/',
-                '/Hyperparameter Opt/', '/Instances/']
+                '/Hyperparameter Opt/', '/Instances/', '/Models/', '/Produciton/']
         for dir in dirs:
             try:
                 os.mkdir(self.mainDir + dir)
@@ -144,12 +143,15 @@ class Pipeline(object):
         self.prepare_production_files()
 
     def data_preparation(self, data):
-        files = os.listdir(self.mainDir + '/Data/')
-        if self.prev_data and 'Col_keep.json' in files:
-            if self.version is None:
-                self.version = max([int(x[x.find('v')+1:x.find('.')]) for x in
-                                    os.listdir(self.mainDir + '/Data/') if 'Input' in x]) + 1
-                print('[autoML] Loading data version %i ()')
+        columns = os.listdir(self.mainDir + '/Columns/')
+        if self.version is None:
+            if len(columns) == 0:
+                self.version = 0
+            else:
+                self.version = max([int(x[x.find('v')+1:x.find('.')]) for x in columns]) + 1
+        if self.prev_data and len(columns) != 0:
+            self.version -= 1
+            print('[autoML] Loading data version %i' % self.version)
             self.input = pd.read_csv(self.mainDir + '/Data/Input_v%i.csv' % self.version, index_col='index')
             self.output = pd.read_csv(self.mainDir + '/Data/Output_v%i.csv' % self.version, index_col='index')
             self.col_keep = json.load(open(self.mainDir + '/Columns/Col_keep_v%i.json' % self.version, 'r'))
@@ -157,6 +159,17 @@ class Pipeline(object):
                 self.classification = True
                 self.regression = False
         else:
+            # Version
+            if self.version == 0:
+                file = open(self.mainDir + '/changelog.txt', 'w')
+                file.write('Dataset changelog. \nv0: Initial')
+                file.close()
+            else:
+                changelog = input("Data changelog v%i")
+                file = open(self.mainDir + '/changelog.txt', 'a')
+                file.write(('\n v%i: ' % self.version) + changelog)
+                file.close()
+
             # Clean
             self.prep = Preprocessing(missingValues=self.missing_values)
             data = self.prep.clean(data)
@@ -187,7 +200,7 @@ class Pipeline(object):
                 self.input[self.input.keys()] = scaler.fit_transform(self.input)
                 output_scaler = StandardScaler()
                 self.output[self.output.keys()] = output_scaler.fit_transform(self.output.to_numpy().reshape((-1, 1))).reshape((-1))
-                pickle.dump(output_scaler, open(self.mainDir + '/Normalization/Output_norm.pickle', 'wb'))
+                pickle.dump(output_scaler, open(self.mainDir + '/Normalization/Output_norm_v%i.pickle' % self.version, 'wb'))
             elif self.classification:
                 self.input[self.input.keys()] = scaler.fit_transform(self.input)
             self.norm = scaler  # Important for production env that scaler doesn't have a super class
@@ -239,18 +252,6 @@ class Pipeline(object):
 
             # Keep all
             print('[autoML] Storing input/output')
-            input_versions = [int(x[x.find('v')+1:x.find('.')]) for x in os.listdir(self.mainDir + '/Data/') if 'Input' in x]
-            if len(input_versions) != 0:
-                self.version = max(input_versions) + 1
-                changelog = input("Data changelog v%i")
-                file = open(self.mainDir + '/changelog.txt', 'a')
-                file.write(('\n v%i: ' % self.version) + changelog)
-                file.close()
-            elif self.version is None:
-                self.version = 0
-                file = open(self.mainDir + '/changelog.txt', 'w')
-                file.write('Dataset changelog. \nv0: Initial')
-                file.close()
             self.col_keep = [self.input.keys().to_list()]
             self.input.to_csv(self.mainDir + '/Data/Input_v%i.csv' % self.version, index_label='index')
             self.output.to_csv(self.mainDir + '/Data/Output_v%i.csv' % self.version, index_label='index')
@@ -300,25 +301,38 @@ class Pipeline(object):
                                    classification=self.classification,
                                    shuffle=self.shuffle,
                                    n_splits=self.n_splits,
-                                   store=False,)
+                                   store_folder='AutoML/Models/',
+                                   store_models=True,
+                                   store_results=False)
 
-        # Check if not already completed
-        if self.prev_mod and os.path.exists(self.mainDir + '/Modelling.csv'):
-            self.modelling_res = pd.read_csv(self.mainDir + '/Modelling.csv')
+        # Load existing results
+        if 'Results.csv' in os.listdir(self.mainDir):
+            self.modelling_res = pd.read_csv(self.mainDir + '/Results.csv')
+        # Check bool to use existing results, check if modelling_res exists and whether
+        # current data version is already existent in the existing results.
+        # If so, load, else, execute
+        if self.prev_mod and self.modelling_res is not None and \
+                (self.version == self.modelling_res['data_version']).any():
             self.modelling_res = self.sort_results(self.modelling_res)
         else:
             # Initial Modelling
             init = []
             for i, cols in enumerate(self.col_keep):
-                print('[autoML] Initial Modelling for %s features (%i)' % (ds[i], len(cols)))
+                print('[autoML] Initial Modelling for %s features (%i)' % (self.datasets[i], len(cols)))
                 self.modelling.dataset = self.datasets[i]
                 if self.modelling_res is None:
                     self.modelling_res = self.modelling.fit(self.input.reindex(columns=cols),
                                                             self.output.loc[:, self.target])
+                    self.modelling_res['data_version'] = self.version
+                    self.modelling_res['type'] = 'Initial modelling'
                 else:
-                    self.modelling_res = self.modelling_res.append(self.modelling.fit(self.input.reindex(columns=cols),
-                                                                 self.output.loc[:, self.target]))
-            self.modelling_res.to_csv(self.mainDir + '/Modelling.csv')
+                    modelling_res = self.modelling.fit(self.input.reindex(columns=cols),
+                                                                 self.output.loc[:, self.target])
+                    modelling_res['data_version'] = self.version
+                    self.modelling_res['type'] = 'Initial modelling'
+                    self.modelling_res = self.modelling_res.append(modelling_res)
+
+            self.modelling_res.to_csv(self.mainDir + '/Results.csv', index=False)
             self.modelling_res = self.sort_results(self.modelling_res)
             best_row = self.modelling_res.iloc[0]
             print('[autoML] Init Modelling finished, best score: %.2f \u00B1 %.2f' %
@@ -326,7 +340,6 @@ class Pipeline(object):
             print('[autoML] %s, on %s features' % (best_row['model'], best_row['dataset']))
 
     def get_hyper_params(self, model):
-        print('[autoML] Getting Hyperparameters for', type(model).__name__)
         # Parameters for both Regression / Classification
         if isinstance(model, sklearn.linear_model.Lasso) or \
             isinstance(model, sklearn.linear_model.Ridge) or \
@@ -508,17 +521,23 @@ class Pipeline(object):
         models = self.modelling.return_models()
         for iteration in range(self.number_grid_search):
             # Grab settings
-            settings = self.modelling_res.iloc[iteration]
+            res = self.modelling_res[np.logical_and(
+                self.modelling_res['type'] == 'Initial modelling',
+                self.modelling_res['data_version'] == self.version,
+            )]
+            settings = res.iloc[iteration]
             model = models[[i for i in range(len(models)) if type(models[i]).__name__ == settings['model']][0]]
             data_ind = [i for i in range(3) if self.datasets[i] == settings['dataset']][0]
             # Check whether exists
-            if self.prev_mod and os.path.exists(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
-                           (type(model).__name__, str(data_ind))):
-                self.grid_res = pd.read_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
-                           (type(model).__name__, str(data_ind)))
+            model_res = self.modelling_res[np.logical_and(
+                self.modelling_res['model'] == type(model).__name__,
+                self.modelling_res['data_version'] == self.version,
+            )]
+            if self.prev_mod and 'Hyperparameter Opt' in model_res['type']:
+                hyper_opt_res = model_res[model_res['type'] == 'Hyperparameter Opt']
                 # Validate
                 try:
-                    params = self.parse_json(self.grid_res.iloc[0]['params'])
+                    params = self.parse_json(hyper_opt_res.iloc[0]['params'])
                 except:
                     print('[autoML] Cannot validate %s, imparsable JSON.' % type(model).__name__)
                     continue
@@ -528,8 +547,11 @@ class Pipeline(object):
                 # Optimize
                 self.grid_res = self.sort_results(self._gridsearch(model, params, data_ind))
                 # Store
-                self.grid_res.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
-                               (type(model).__name__, str(data_ind)), index_label='index')
+                self.grid_res['model'] = type(model).__name__
+                self.grid_res['data_version'] = self.version
+                self.grid_res['type'] = 'Hyperparameter Opt'
+                self.modelling_res = self.modelling_res.append(self.grid_res)
+                self.modelling_res.to_csv(self.mainDir + '/Results.csv', index=False)
                 params = self.grid_res.iloc[0]['params']
             # Validate
             self.validate(model, params, data_ind)
@@ -541,7 +563,7 @@ class Pipeline(object):
         # Select data
         input = self.input[self.col_keep[data_ind]]
         # Grid Search
-        print('[autoML] Starting Hyperparameter Optimization %s (%i samples, %i features)' %
+        print('\n[autoML] Starting Hyperparameter Optimization %s (%i samples, %i features)' %
               (type(model).__name__, len(input), len(input.keys())))
         if self.regression:
             self.grid = GridSearch(model, params,
@@ -560,9 +582,28 @@ class Pipeline(object):
         return results
 
     def validate(self, master_model, params, data_ind):
-        print('\n\n[autoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
+        print('[autoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
                                                 len(self.col_keep[data_ind]), self.datasets[data_ind], params))
         if not os.path.exists(self.mainDir + '/Validation/'): os.mkdir(self.mainDir + '/Validation')
+
+        # For Regression
+        if self.regression:
+            mae = []
+
+            cv = KFold(n_splits=self.n_splits, shuffle=self.shuffle)
+            input, output = np.array(self.input[self.col_keep[data_ind]]), np.array(self.output)
+            for i, (t, v) in enumerate(cv.split(input, output)):
+                ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
+                model = copy.copy(master_model)
+                model.set_params(**params)
+                model.fit(ti, to)
+                predictions = model.predict(vi).reshape((-1))
+
+                # Metrics
+                mae.append(Metrics.mae(vo, predictions))
+            print('[autoML] MAE:        %.2f \u00B1 %.2f' % (np.mean(mae), np.std(mae)))
+
+
 
         # For classification
         if self.classification:
@@ -645,12 +686,13 @@ class Pipeline(object):
             fig.savefig(self.mainDir + '/Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
 
     def prepare_production_files(self, file=None):
-        if not os.path.exists(self.mainDir + '/Production'):
-            os.mkdir(self.mainDir + '/Production')
+        # Get sorted results for this data version
+        results = self.sort_results(self.modelling_res[self.modelling_res['data_version'] == self.version])
+        # In the case that a string is provided with model and data ind
         if file is not None:
             model = file[:file.find('_')]
             data_ind = int(file[file.find('_') + 1])
-            params = self.parse_json(pd.read_csv(self.mainDir + '/Hyperparameter Opt/' + file).iloc[0]['params'])
+            params = self.parse_json(results.iloc[0]['params'])
         else:
             # Find best model
             best_row = None
@@ -1221,7 +1263,7 @@ class ExploratoryDataAnalysis(object):
 class Modelling(object):
 
     def __init__(self, regression=False, classification=False, shuffle=False, split=0.2, plot=False,
-                 store_folder='models/', n_splits=3, dataset=0, store=True):
+                 store_folder='models/', n_splits=3, dataset=0, store_models=False, store_results=True):
         assert regression != classification, 'Cannot do both regression AND classification.'
         self.is_regression = regression
         self.is_classification = classification
@@ -1232,7 +1274,8 @@ class Modelling(object):
         self.std = []
         self.n_splits = n_splits
         self.dataset = str(dataset)
-        self.store = store
+        self.store_results = store_results
+        self.store_models = store_models
         self.folder = store_folder if store_folder[-1] == '/' else store_folder + '/'
 
     def fit(self, input, output):
@@ -1356,11 +1399,11 @@ class Modelling(object):
         output = np.array(output)
 
         # Data
-        print('[modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.n_split, len(input[0])))
+        print('[modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.n_splits, len(input[0])))
         from sklearn.model_selection import KFold
         cv = KFold(n_splits=self.n_splits, shuffle=self.shuffle)
 
-        if 'Initial_Models.csv' in os.listdir(self.folder):
+        if self.store_results and 'Initial_Models.csv' in os.listdir(self.folder):
             results = pd.read_csv(self.folder + 'Initial_Models.csv')
         else:
             results = pd.DataFrame(columns=['date', 'model', 'dataset', 'params', 'mean_score', 'std_score', 'mean_time', 'std_time'])
@@ -1399,15 +1442,16 @@ class Modelling(object):
                                       'std_score': np.std(v_acc), 'mean_time': np.mean(t_train),
                                       'std_time': np.std(t_train)}, ignore_index=True)
             self.acc.append(np.mean(v_acc))
-            if self.store:
-                joblib.dump(model, self.folder + '/AutoML_IM_' + type(model).__name__ + '_mae_%.5f.joblib' % self.acc[-1])
+            if self.store_models:
+                joblib.dump(model, self.folder + type(model).__name__ + '_mae_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
             print('[modelling] %s MAE train/val: %.2f %.2f, training time: %.1f s' %
-                  (type(model).__name__.ljust(60), Metrics.mae(to, tp), Metrics.mae(vo, p), time.time() - t))
+                  (type(model).__name__.ljust(60), np.mean(t_acc), np.mean(v_acc), time.time() - t_start))
 
         # Store CSV
-        results.to_csv(self.folder + 'Initial_Models.csv')
+        if self.store_results:
+            results.to_csv(self.folder + 'Initial_Models.csv')
 
         # Plot
         if self.plot:
