@@ -71,7 +71,7 @@ class Pipeline(object):
         assert max(shift) >= 0 and min(shift) < 50;
 
         # Data prep params
-        self.datasets = ['All', 'PPS', 'RF', 'RFs']
+        self.datasets = ['All', 'PPS', 'RF', 'RFs', 'Boruta']
         self.missing_values = missing_values
         self.remove_colinear = remove_colinear
         self.max_lags = max_lags
@@ -302,14 +302,14 @@ class Pipeline(object):
             self.col_keep.append(self.input.keys()[ind_keep].to_list())
 
             # Keep based on BorutaPy -- Numerically EXHAUSTIVE
-            # print('[autoML] Determining Features with Boruta')
-            # if self.regression:
-            #     rf = RandomForestRegressor()
-            # elif self.classification:
-            #     rf = RandomForestClassifier()
-            # selector = BorutaPy(rf, n_estimators='auto', verbose=0)
-            # selector.fit(self.input.to_numpy(), self.output.to_numpy())
-            # features = selector.support_
+            print('[autoML] Determining Features with Boruta')
+            if self.regression:
+                rf = RandomForestRegressor()
+            elif self.classification:
+                rf = RandomForestClassifier()
+            selector = BorutaPy(rf, n_estimators='auto', verbose=0)
+            selector.fit(self.input.to_numpy(), self.output.to_numpy())
+            self.col_keep.append(self.input.keys()[selector.support_].to_list())
 
             # Store to self
             print('[autoML] Storing data preparation meta data.')
@@ -1300,9 +1300,13 @@ class Modelling(object):
 
     def fit(self, input, output):
         if self.is_regression:
-            return self.regression(input, output)
+            from sklearn.model_selection import KFold
+            cv = KFold(n_splits=self.n_splits, shuffle=self.shuffle)
+            return self._fit(input, output, cv, Metrics.mae)
         if self.is_classification:
-            return self.classification(input, output)
+            from sklearn.model_selection import StratifiedKFold
+            cv = StratifiedKFold(n_splits=self.n_splits, shuffle=self.shuffle)
+            return self._fit(input, output, cv, Metrics.acc)
 
     def return_models(self):
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
@@ -1338,17 +1342,14 @@ class Modelling(object):
             mlp = neural_network.MLPRegressor()
             return [ridge, lasso, sgd, svr, knr, dtr, ada, cat, gbr, hgbr, mlp]
 
-    def classification(self, input, output):
+    def _fit(self, input, output, cross_val, metric):
         # Convert to NumPy
         input = np.array(input)
         output = np.array(output)
 
         # Data
         print('[modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.n_splits, len(input[0])))
-        from sklearn.model_selection import StratifiedKFold
-        cv = StratifiedKFold(n_splits=self.n_splits, shuffle=self.shuffle)
 
-        # Dataframe for storage
         if self.store_results and 'Initial_Models.csv' in os.listdir(self.folder):
             results = pd.read_csv(self.folder + 'Initial_Models.csv')
         else:
@@ -1373,86 +1374,13 @@ class Modelling(object):
             v_acc = []
             t_acc = []
             t_train = []
-            for t, v in cv.split(input, output):
+            for t, v in cross_val.split(input, output):
                 t_start = time.time()
                 ti, vi, to, vo = input[t], input[v], output[t], output[v]
                 model = copy.copy(master_model)
                 model.fit(ti, to)
-                v_acc.append(Metrics.acc(vo, model.predict(vi)))
-                t_acc.append(Metrics.acc(to, model.predict(ti)))
-                t_train.append(time.time() - t_start)
-
-            # Results
-            results = results.append({'date': datetime.today().strftime('%d %b %Y, %Hh'), 'model': type(model).__name__,
-                'dataset': self.dataset, 'params': model.get_params(), 'mean_score': np.mean(v_acc),
-                'std_score': np.std(v_acc), 'mean_time': np.mean(t_train), 'std_time': np.std(t_train)},
-                                     ignore_index=True)
-            self.acc.append(np.mean(v_acc))
-            self.std.append(np.std(v_acc))
-            if self.store_models:
-                joblib.dump(model, self.folder + type(model).__name__ + '_acc_%.5f.joblib' % self.acc[-1])
-            if self.plot:
-                plt.plot(p, alpha=0.2)
-            print('[modelling] %s ACC train/val: %.1f %% / %.1f %%, training time: %.1f s' %
-                  (type(model).__name__.ljust(40), np.mean(t_acc) * 100, np.mean(v_acc) * 100, time.time() - t_start))
-
-        # Store CSV
-        if self.store_results:
-            results.to_csv(self.folder + 'Initial_Models.csv', index=False)
-
-        # Plot
-        if self.plot:
-            plt.plot(vo, c='k')
-            ind = np.where(self.acc == np.min(self.acc))[0][0]
-            p = self.models[ind].predict(vi)
-            plt.plot(p, color='#2369ec')
-            plt.title('Predictions')
-            plt.legend(['True output', 'Ridge', 'Lasso', 'SGD', 'KNR', 'DTR', 'ADA', 'GBR', 'HGBR', 'MLP', 'Best'])
-            plt.ylabel('Output')
-            plt.xlabel('Samples')
-            plt.show()
-        return results
-
-    def regression(self, input, output):
-        # Convert to NumPy
-        input = np.array(input)
-        output = np.array(output)
-
-        # Data
-        print('[modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.n_splits, len(input[0])))
-        from sklearn.model_selection import KFold
-        cv = KFold(n_splits=self.n_splits, shuffle=self.shuffle)
-
-        if self.store_results and 'Initial_Models.csv' in os.listdir(self.folder):
-            results = pd.read_csv(self.folder + 'Initial_Models.csv')
-        else:
-            results = pd.DataFrame(columns=['date', 'model', 'dataset', 'params', 'mean_score', 'std_score', 'mean_time', 'std_time'])
-
-        # Models
-        self.models = self.return_models()
-
-        # Loop through models
-        for master_model in self.models:
-            # Check first if we don't already have the results
-            ind = np.where(np.logical_and(np.logical_and(
-                results['model'] == type(master_model).__name__,
-                results['dataset'] == self.dataset),
-                results['date'] == datetime.today().strftime('%d %b %Y, %Hh')))[0]
-            if len(ind) != 0:
-                self.acc.append(results.iloc[ind[0]]['mean_score'])
-                continue
-
-            # Time & loops through Cross-Validation
-            v_acc = []
-            t_acc = []
-            t_train = []
-            for t, v in cv.split(input, output):
-                t_start = time.time()
-                ti, vi, to, vo = input[t], input[v], output[t], output[v]
-                model = copy.copy(master_model)
-                model.fit(ti, to)
-                v_acc.append(Metrics.mae(vo, model.predict(vi)))
-                t_acc.append(Metrics.mae(to, model.predict(ti)))
+                v_acc.append(metric(vo, model.predict(vi)))
+                t_acc.append(metric(to, model.predict(ti)))
                 t_train.append(time.time() - t_start)
 
             # Results
@@ -1462,11 +1390,12 @@ class Modelling(object):
                                       'std_score': np.std(v_acc), 'mean_time': np.mean(t_train),
                                       'std_time': np.std(t_train)}, ignore_index=True)
             self.acc.append(np.mean(v_acc))
+            self.std.append(np.std(v_acc))
             if self.store_models:
-                joblib.dump(model, self.folder + type(model).__name__ + '_mae_%.5f.joblib' % self.acc[-1])
+                joblib.dump(model, self.folder + type(model).__name__ + '_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
-            print('[modelling] %s MAE train/val: %.2f %.2f, training time: %.1f s' %
+            print('[modelling] %s train/val: %.2f %.2f, training time: %.1f s' %
                   (type(model).__name__.ljust(60), np.mean(t_acc), np.mean(v_acc), time.time() - t_start))
 
         # Store CSV
@@ -1476,7 +1405,10 @@ class Modelling(object):
         # Plot
         if self.plot:
             plt.plot(vo, c='k')
-            ind = np.where(self.acc == np.min(self.acc))[0][0]
+            if self.regression:
+                ind = np.where(self.acc == np.min(self.acc))[0][0]
+            else:
+                ind = np.where(self.acc == np.max(self.acc))[0][0]
             p = self.models[ind].predict(vi)
             plt.plot(p, color='#2369ec')
             plt.title('Predictions')
