@@ -25,6 +25,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Priority
+# figure out bug on set_params(**params) in Pipeline.Make_Prod_Files
 # add prediction script to prod env
 # add cloud function script to prod env
 
@@ -118,7 +119,7 @@ class Pipeline(object):
             return True
         else:
             print('Sorry, I did not understand. Please answer with "n" or "y"')
-            self.boolask(question)
+            return self.boolask(question)
 
     def notification(self, message):
         import requests
@@ -1077,8 +1078,8 @@ class ExploratoryDataAnalysis(object):
         assert isinstance(data, pd.DataFrame)
 
         # Register data
-        self.data = data
-        self.output = output
+        self.data = data.fillna(0)
+        self.output = output.fillna(0)
 
         # General settings
         self.seasonPeriods = seasonPeriods
