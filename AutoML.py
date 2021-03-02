@@ -553,12 +553,12 @@ class Pipeline(object):
 
         # If arguments aren't provided, do top 3 from self.modelling_res
         models = self.modelling.return_models()
+        res = self.sort_results(self.modelling_res[np.logical_and(
+            self.modelling_res['type'] == 'Initial modelling',
+            self.modelling_res['data_version'] == self.version,
+        )])
         for iteration in range(self.number_grid_search):
             # Grab settings
-            res = self.modelling_res[np.logical_and(
-                self.modelling_res['type'] == 'Initial modelling',
-                self.modelling_res['data_version'] == self.version,
-            )]
             settings = res.iloc[iteration]
             model = models[[i for i in range(len(models)) if type(models[i]).__name__ == settings['model']][0]]
             data_ind = [i for i in range(len(self.datasets)) if self.datasets[i] == settings['dataset']][0]
@@ -622,6 +622,7 @@ class Pipeline(object):
         if self.regression:
             mae = []
             fig, ax = plt.subplots(round(self.n_splits / 2), 2, sharex=True, sharey=True)
+            fig.suptitle('%i-Fold Cross Validated Predictions' % self.n_splits)
 
             cv = KFold(n_splits=self.n_splits, shuffle=self.shuffle)
             input, output = np.array(self.input[self.col_keep[data_ind]]), np.array(self.output)
@@ -635,11 +636,11 @@ class Pipeline(object):
                 # Metrics
                 mae.append(Metrics.mae(vo, predictions))
                 # Plot
+                ax[i // 2][i % 2].set_title('Fold-%i' % i)
                 ax[i // 2][i % 2].plot(vo, color='#2369ec')
                 ax[i // 2][i % 2].plot(predictions, color='#ffa62b', alpha=0.4)
             print('[autoML] MAE:        %.2f \u00B1 %.2f' % (np.mean(mae), np.std(mae)))
             plt.show()
-
 
         # For classification
         if self.classification:
