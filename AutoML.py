@@ -25,6 +25,8 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Priority
+# add prediction script to prod env
+# add cloud function script to prod env
 
 # Nicety
 # todo preprocessing check for big chunks of missing data
@@ -34,6 +36,7 @@ warnings.filterwarnings("ignore")
 
 class Pipeline(object):
     def __init__(self, target,
+                 project='',
                  missing_values='interpolate',
                  remove_colinear=True,
                  max_lags=15,
@@ -48,7 +51,8 @@ class Pipeline(object):
                  use_prev_data=None,
                  version=None,
                  shift=[0]):
-        print('\n\n*** Start Amplo PM Model Builder ***\n\n')
+        self.project = project
+        print('\n\n*** Start Amplo PM Model Builder - %s ***\n\n' % project)
         if skip_eda is None:
             self.skip_eda = not self.boolask('Generate EDA graphs?')
         else:
@@ -79,7 +83,6 @@ class Pipeline(object):
 
         # Modelling Params
         self.shuffle = shuffle
-        self.prev_mod = use_prev_mod
         self.n_splits = n_splits
         self.number_grid_search = grid_search
 
@@ -117,6 +120,13 @@ class Pipeline(object):
             print('Sorry, I did not understand. Please answer with "n" or "y"')
             self.boolask(question)
 
+    def notification(self, message):
+        import requests
+        print(message.replace(self.project, 'autoML'))
+        url = 'https://hooks.slack.com/services/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'
+        data = '{"text":"%s"}' % message
+        requests.post(url, data=data)
+
     def create_dirs(self):
         dirs = ['/', '/Data/', '/Columns/', '/Features/', '/Normalization/',
                 '/Hyperparameter Opt/', '/Instances/', '/Models/', '/Production/']
@@ -148,18 +158,19 @@ class Pipeline(object):
             return
 
     def fit(self, data):
-        # Data preparation -- Creates/Loads All_selected, output, pp_selected, rf_selected
-        self.data_preparation(data)
         # EDA
         print('[autoML] Starting Exploratory Data Analysis')
         if not self.skip_eda:
-            self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder='/')
+            self.eda = ExploratoryDataAnalysis(data, output=data[self.target])
+        # Data preparation -- Creates/Loads All_selected, output, pp_selected, rf_selected
+        self.data_preparation(data)
         # Initial Modelling
         self.initial_modelling()
         # Hyperparameter optimization
         self.grid_search()
         # Production Env
         self.prepare_production_files()
+        print('[autoML] Done :)')
 
     def data_preparation(self, data):
         columns = os.listdir(self.mainDir + '/Columns/')
@@ -359,9 +370,9 @@ class Pipeline(object):
             self.modelling_res.to_csv(self.mainDir + '/Results.csv', index=False)
             self.modelling_res = self.sort_results(self.modelling_res)
             best_row = self.modelling_res.iloc[0]
-            print('[autoML] Init Modelling finished, best score: %.2f \u00B1 %.2f' %
-                  (best_row['mean_score'], best_row['std_score']))
-            print('[autoML] %s, on %s features' % (best_row['model'], best_row['dataset']))
+            self.notification('[%s] Init Modelling finished, best score: %.2f \u00B1 %.2f' % \
+                  (self.project, best_row['mean_score'], best_row['std_score']))
+            self.notification('[%s] %s, on %s features' % (self.project, best_row['model'], best_row['dataset']))
 
     def get_hyper_params(self, model):
         # Parameters for both Regression / Classification
@@ -550,7 +561,7 @@ class Pipeline(object):
             )]
             settings = res.iloc[iteration]
             model = models[[i for i in range(len(models)) if type(models[i]).__name__ == settings['model']][0]]
-            data_ind = [i for i in range(3) if self.datasets[i] == settings['dataset']][0]
+            data_ind = [i for i in range(len(self.datasets)) if self.datasets[i] == settings['dataset']][0]
             # Check whether exists
             model_res = self.modelling_res[np.logical_and(
                 self.modelling_res['model'] == type(model).__name__,
@@ -717,13 +728,20 @@ class Pipeline(object):
         if file is not None:
             model = file[:file.find('_')]
             data_ind = int(file[file.find('_') + 1])
-            results = results[np.logical_and(results['model'] == model, results['data_ind'] == data_ind)]
+            results = self.sort_results(results[np.logical_and(results['model'] == model, results['data_ind'] == data_ind)])
             params = self.parse_json(results.iloc[0]['params'])
         else:
             model = results.iloc[0]['model']
             data_ind = [i for i, ds in enumerate(self.datasets) if ds == results.iloc[0]['dataset']][0]
             params = self.parse_json(results.iloc[0]['params'])
-        print('[autoML] Preparing Production Env Files for %s, feature set %s' % (model, self.datasets[data_ind]))
+        self.notification('[%s] Preparing Production Env Files for %s, feature set %s' %
+                          (self.project, model, self.datasets[data_ind]))
+        if self.classification:
+            self.notification('[%s] Accuracy: %.2f \u00B1 %.2f' %
+                              (self.project, results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
+        elif self.regression:
+            self.notification('[%s] Mean Absolute Error: %.2f \u00B1 %.2f' %
+                              (self.project, results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
 
         # Copy Features & Normalization & Norm Features
         shutil.copy(self.mainDir + '/Features/features_%i_v%i.json' % (data_ind, self.version),
@@ -732,6 +750,9 @@ class Pipeline(object):
                     self.mainDir + '/Production/normalization.pickle')
         shutil.copy(self.mainDir + '/Normalization/norm_features_v%i.json' % self.version,
                     self.mainDir + '/Production/norm_features.json')
+        if 'Output_norm_v%i.pickle' in os.listdir(self.mainDir + '/Normalization/'):
+            shutil.copy(self.mainDir + '/Normaliation/Output_norm_v%i.pickle' % self.version,
+                        self.mainDir + '/Production/output_norm.pickle')
 
         # Model
         model = [mod for mod in self.modelling.return_models() if type(mod).__name__ == model][0]
@@ -854,7 +875,8 @@ class Preprocessing(object):
         elif self.missingValues == 'mean':
             data = data.fillna(data.mean())
         if n_nans + diff > 0:
-            print('[preprocessing] Filled %i NaN with %s' % (n_nans + diff, self.missingValues))
+            print('[preprocessing] Filled %i (%.1f %%) NaN with %s' % (n_nans + diff, (n_nans + diff) * 100 / len(data)
+                                                                       / len(data.keys()), self.missingValues))
 
         # Drop constant columns
         n_cols = len(data.keys())
@@ -1065,7 +1087,7 @@ class ExploratoryDataAnalysis(object):
 
         # Storage settings
         self.tag = pretag
-        self.folder = folder if folder[-1] == '/' else folder + '/'
+        self.folder = folder if folder == '' or folder[-1] == '/' else folder + '/'
         self.skip = skip_completed
 
         # Create dirs
@@ -1123,7 +1145,8 @@ class ExploratoryDataAnalysis(object):
         if self.tag + 'MissingValues.png' in os.listdir(self.folder + 'EDA/'):
             return
         import missingno
-        fig = missingno.matrix(self.input, figsize=[24, 16])
+        ax = missingno.matrix(self.data, figsize=[24, 16])
+        fig = ax.get_figure()
         fig.savefig(self.folder + 'EDA/MissingValues.png')
 
     def boxplots(self):
@@ -1212,10 +1235,13 @@ class ExploratoryDataAnalysis(object):
         for key in tqdm(self.data.keys()):
             if self.tag + key + '_differ_' + str(self.differ) + '.png' in os.listdir(self.folder + 'EDA/Correlation/PACF/'):
                 continue
-            fig = plot_pacf(self.data[key])
-            fig.savefig(self.folder + 'EDA/Correlation/PACF/' + self.tag + key + '_differ_' + str(self.differ) + '.png', format='png', dpi=300)
-            plt.title(key)
-            plt.close()
+            try:
+                fig = plot_pacf(self.data[key])
+                fig.savefig(self.folder + 'EDA/Correlation/PACF/' + self.tag + key + '_differ_' + str(self.differ) + '.png', format='png', dpi=300)
+                plt.title(key)
+                plt.close()
+            except:
+                continue
 
     def crossCorr(self):
         folder = 'EDA/Correlation/Cross/'
@@ -1223,11 +1249,14 @@ class ExploratoryDataAnalysis(object):
         for key in tqdm(self.data.keys()):
             if self.tag + key + '_differ_' + str(self.differ) + '.png' in os.listdir(self.folder + folder):
                 continue
-            fig = plt.figure(figsize=[24, 16])
-            plt.xcorr(self.data[key], output, maxlags=self.lags)
-            plt.title(key)
-            fig.savefig(self.folder + folder + self.tag + key + '_differ_' + str(self.differ) + '.png', format='png', dpi=300)
-            plt.close()
+            try:
+                fig = plt.figure(figsize=[24, 16])
+                plt.xcorr(self.data[key], output, maxlags=self.lags)
+                plt.title(key)
+                fig.savefig(self.folder + folder + self.tag + key + '_differ_' + str(self.differ) + '.png', format='png', dpi=300)
+                plt.close()
+            except:
+                continue
 
     def scatters(self):
         # Plots
