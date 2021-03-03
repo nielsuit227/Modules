@@ -124,7 +124,7 @@ class Pipeline(object):
     def notification(self, message):
         import requests
         print(message.replace(self.project, 'autoML'))
-        oAuthToken = 'xoxb-1822915844353-1822989373697-h60TpijuPPeqX0HylG1V5KJ6'
+        oAuthToken = 'xoxb-1822915844353-1822989373697-zsFM6CuC6VGTxBjHUcdZHSdJ'
         url = 'https://slack.com/api/chat.postMessage'
         data = {
             "token": oAuthToken,
