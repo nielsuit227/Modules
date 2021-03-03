@@ -124,8 +124,14 @@ class Pipeline(object):
     def notification(self, message):
         import requests
         print(message.replace(self.project, 'autoML'))
-        url = 'https://hooks.slack.com/services/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'
-        data = '{"text":"%s"}' % message
+        oAuthToken = 'xoxb-1822915844353-1822989373697-h60TpijuPPeqX0HylG1V5KJ6'
+        url = 'https://slack.com/api/chat.postMessage'
+        data = {
+            "token": oAuthToken,
+            "channel": "automl",
+            "text": message,
+            "username": "AutoML",
+        }
         requests.post(url, data=data)
 
     def create_dirs(self):
@@ -623,7 +629,7 @@ class Pipeline(object):
         if self.regression:
             mae = []
             fig, ax = plt.subplots(round(self.n_splits / 2), 2, sharex=True, sharey=True)
-            fig.suptitle('%i-Fold Cross Validated Predictions' % self.n_splits)
+            fig.suptitle('%i-Fold Cross Validated Predictions - %s' % (self.n_splits, type(master_model).__name__))
 
             cv = KFold(n_splits=self.n_splits, shuffle=self.shuffle)
             input, output = np.array(self.input[self.col_keep[data_ind]]), np.array(self.output)
