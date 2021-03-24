@@ -25,15 +25,20 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Priority
-# figure out bug on set_params(**params) in Pipeline.Make_Prod_Files
+# split EDA in regression & classification
+# add report output
 # add prediction script to prod env
 # add cloud function script to prod env
 
 # Nicety
-# todo preprocessing check for big chunks of missing data
-# todo multiprocessing for EDA RF, GridSearch
-# todo flat=bool for sequence (needed for lightGBM)
-# todo implement autoencoder for Feature Extraction
+# implement HalvingGridSearchCV (https://scikit-learn.org/stable/modules/grid_search.html#successive-halving-user-guide)
+# implement ensembles (http://www.cs.cornell.edu/~alexn/papers/shotgun.icml04.revised.rev2.pdf)
+# preprocessing check for big chunks of missing data
+# multiprocessing for EDA RF, GridSearch
+# flat=bool for sequence (needed for lightGBM)
+# implement autoencoder for Feature Extraction
+# implement transformers
+# implement 'golden feature' (add all division / multiplication pairs, train single trees to find good ones)
 
 class Pipeline(object):
     def __init__(self, target,
@@ -49,7 +54,7 @@ class Pipeline(object):
                  include_output=False,
                  data_ind=None,
                  skip_eda=None,
-                 use_prev_data=None,
+                 prep_data=None,
                  version=None,
                  shift=[0]):
         self.project = project
@@ -58,10 +63,10 @@ class Pipeline(object):
             self.skip_eda = not self.boolask('Generate EDA graphs?')
         else:
             self.skip_eda = skip_eda
-        if use_prev_data is None:
-            self.prev_data = self.boolask('Use Previously prepared data?')
+        if prep_data is None:
+            self.prep_data = self.boolask('Process/prepare data?')
         else:
-            self.prev_data = use_prev_data
+            self.prep_data = prep_data
 
         # Checks
         assert type(target) == str;
@@ -184,11 +189,11 @@ class Pipeline(object):
         if self.version is None:
             if len(columns) == 0:
                 self.version = 0
-            elif self.prev_data:
-                self.version = max([int(x[x.find('v') + 1:x.find('.')]) for x in columns])
+            elif self.prep_data:
+                self.version = max([int(x[x.find('v') + 1:x.find('.')]) for x in columns]) + 1
             else:
-                self.version = max([int(x[x.find('v')+1:x.find('.')]) for x in columns]) + 1
-        if self.prev_data and len(columns) != 0:
+                self.version = max([int(x[x.find('v')+1:x.find('.')]) for x in columns])
+        if not self.prep_data and len(columns) != 0:
             print('[autoML] Loading data version %i' % self.version)
             self.input = pd.read_csv(self.mainDir + '/Data/Input_v%i.csv' % self.version, index_col='index')
             self.output = pd.read_csv(self.mainDir + '/Data/Output_v%i.csv' % self.version, index_col='index')
@@ -376,7 +381,10 @@ class Pipeline(object):
 
             self.modelling_res.to_csv(self.mainDir + '/Results.csv', index=False)
             self.modelling_res = self.sort_results(self.modelling_res)
-            best_row = self.modelling_res.iloc[0]
+            best_row = self.modelling_res[np.logical_and(
+                self.modelling_res['data_version'] == self.version,
+                self.modelling_res['type'] == 'Initial modelling'
+            )].iloc[0]
             self.notification('[%s] Init Modelling finished, best score: %.2f \u00B1 %.2f' % \
                   (self.project, best_row['mean_score'], best_row['std_score']))
             self.notification('[%s] %s, on %s features' % (self.project, best_row['model'], best_row['dataset']))
@@ -621,6 +629,11 @@ class Pipeline(object):
         return results
 
     def validate(self, master_model, params, data_ind):
+
+        if not self.prep_data:
+            if self.boolask('Run Validation?') == False:
+                return
+
         print('[autoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
                                                 len(self.col_keep[data_ind]), self.datasets[data_ind], params))
         if not os.path.exists(self.mainDir + '/Validation/'): os.mkdir(self.mainDir + '/Validation')
@@ -647,6 +660,7 @@ class Pipeline(object):
                 ax[i // 2][i % 2].plot(vo, color='#2369ec')
                 ax[i // 2][i % 2].plot(predictions, color='#ffa62b', alpha=0.4)
             print('[autoML] MAE:        %.2f \u00B1 %.2f' % (np.mean(mae), np.std(mae)))
+            ax[i // 2][i % 2].legend(['Output', 'Prediction'])
             plt.show()
 
         # For classification
@@ -741,7 +755,9 @@ class Pipeline(object):
         else:
             model = results.iloc[0]['model']
             data_ind = [i for i, ds in enumerate(self.datasets) if ds == results.iloc[0]['dataset']][0]
-            params = self.parse_json(results.iloc[0]['params'])
+            params = results.iloc[0]['params']
+            if isinstance(params, str):
+                params = self.parse_json(params)
         self.notification('[%s] Preparing Production Env Files for %s, feature set %s' %
                           (self.project, model, self.datasets[data_ind]))
         if self.classification:
@@ -758,8 +774,8 @@ class Pipeline(object):
                     self.mainDir + '/Production/normalization.pickle')
         shutil.copy(self.mainDir + '/Normalization/norm_features_v%i.json' % self.version,
                     self.mainDir + '/Production/norm_features.json')
-        if 'Output_norm_v%i.pickle' in os.listdir(self.mainDir + '/Normalization/'):
-            shutil.copy(self.mainDir + '/Normaliation/Output_norm_v%i.pickle' % self.version,
+        if self.regression:
+            shutil.copy(self.mainDir + '/Normalization/Output_norm_v%i.pickle' % self.version,
                         self.mainDir + '/Production/output_norm.pickle')
 
         # Model
@@ -767,6 +783,14 @@ class Pipeline(object):
         model.set_params(**params)
         model.fit(self.input[self.col_keep[data_ind]], self.output)
         joblib.dump(model, self.mainDir + '/Production/model.joblib')
+
+        # Predict function
+        f = open(self.mainDir + '/Production/Predict.py', 'w')
+        f.write(self.returnPredictFunc())
+        f.close()
+        
+        # Pipeline
+        pickle.dump(self, open(self.mainDir + '/Production/Pipeline.pickle', 'wb'))
         return
 
     def predict(self, sample):
@@ -777,6 +801,116 @@ class Pipeline(object):
         selected = sequenced[self.col_keep[self.data_ind]]
         pred = self.best_model.predict(selected)
         return self.norm.revert_output(pred)
+
+    def returnPredictFunc(self):
+        return '''import pandas as pd
+import numpy as np
+import struct, re
+
+
+def decode(data, dbc):
+    for key in data.keys():
+        data = data.rename(columns={key: key.replace(' ', '')})
+    dec_list = []
+    float_inds = [1031, 1002, 997, 873, 934, 868, 1313, 1282, 1281, 1038, 1037, 1036, 1035, 1033, 1032, 1030, 1029,
+                  1028, 1026, 1070, 1069, 1068, 1067, 1065, 1064, 1063, 1063, 1061, 1060, 1059, 1058]
+    for j in range(9000):
+        row = data.iloc[j]
+        row_id = int(row['ID'], 0)
+        can_bytes = bytes.fromhex(row['data'].strip()[2:])[::-1]
+
+        # Skip legacy packages
+        if row_id not in [265, 280, 769, 808, 866, 870, 871, 877, 879, 881, 885, 889, 891, 933, 943, 944, 945,
+                          1025, 1026, 1035, 1057, 1058, 1063, 1067, 1889]:
+            continue
+
+        # Decode
+        try:
+            decoded = dbc.decode_message(row_id, can_bytes)
+            decoded['ts'] = row['Recvtime']
+            # Check floats
+            if row_id in float_inds:
+                if len(dbc.get_message_by_frame_id(row_id).signals) == 2:
+                    x, y = struct.unpack('<ff', can_bytes)
+                    decoded[list(decoded.keys())[0]] = x
+                    decoded[list(decoded.keys())[1]] = y
+                else:
+                    signal = [s for s in dbc.get_message_by_frame_id(row_id).signals if s.length == 32][0]
+                    x, y = struct.unpack('<ff', can_bytes)
+                    if signal.start == 32:
+                        decoded[signal.name] = y
+                    elif signal.start == 0:
+                        decoded[signal.name] = x
+                # Store
+                dec_list.append(decoded)
+        except:
+            # Bare exception is no issue. Exception is triggered for legacy messages.
+            pass
+    # Store
+    decoded_data = pd.DataFrame(dec_list)
+    return decoded_data
+
+
+def preprocess(data):
+    # Convert timestamps
+    data['ts'] = pd.to_datetime(data['ts'])
+    data = data.set_index('ts')
+    # Drop duplicates
+    data = data.drop_duplicates()
+    data = data.loc[:, ~data.columns.duplicated()]
+    # Merge rows
+    new_data = pd.DataFrame(columns=[], index=data.index.drop_duplicates(keep='first'))
+    for key in data.keys():
+        key_series = pd.Series(data[~data[key].isna()][key])
+        new_data[key] = key_series[~key_series.index.duplicated()]
+    data = new_data
+    # Cat cols
+    cat_cols = ['ControlPilotState', 'ChargeState', 'CCSState', 'CCSStateNext', 'CCSShutdownCode',
+                'CCSReinitErrorCode', 'ChargerErrorEvent1', 'ChargerErrorEvent2', 'ChargerErrorEvent3',
+                'ChargerErrorEvent4', 'RFIDSwipeStatus']
+    for key in cat_cols:
+        if key in data.keys():
+            dummies = pd.get_dummies(data[key], prefix=key).replace(0, 1)
+            data = data.drop(key, axis=1).join(dummies)
+    # Re-sample
+    data = data.resample('ms').interpolate(limit_direction='both')
+    data = data.resample('s').asfreq()
+    # Cleaning Keys
+    new_keys = {}
+    for key in data.keys():
+        new_keys[key] = re.sub('[^a-zA-Z0-9]', '_', key.lower())
+    data = data.rename(columns=new_keys)
+    del new_keys
+    return data
+
+
+class Predict(object):
+
+    def __init__(self):
+        self.version = 'v0.1.2'
+
+    def predict(self, model, features, all_features, normalization, dbc, data):
+        # Decode
+        data = decode(data, dbc)
+
+        # Convert to timeseries & preprocess
+        data = preprocess(data)
+
+        # Normalize
+        for key in [x for x in all_features if x not in list(data.keys())]:
+            data.loc[:, key] = np.zeros(len(data))
+        data = data[all_features]
+        data[data.keys()] = normalization.transform(data)
+
+        # Select features
+        for key in [x for x in features if x not in list(data.keys())]:
+            data.loc[:, key] = np.zeros(len(data))
+        data = data[features]
+
+        # Make prediction
+        predictions = model.predict_proba(data.iloc[1:])[:, 1]
+        return sum(predictions) / len(predictions) * 100
+'''
 
 class Preprocessing(object):
 
@@ -1084,8 +1218,8 @@ class ExploratoryDataAnalysis(object):
         assert isinstance(data, pd.DataFrame)
 
         # Register data
-        self.data = data.fillna(0)
-        self.output = output.fillna(0)
+        self.data = data.astype('float32').fillna(0)
+        self.output = output.astype('float32').fillna(0)
 
         # General settings
         self.seasonPeriods = seasonPeriods
