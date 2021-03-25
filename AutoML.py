@@ -173,7 +173,7 @@ class Pipeline(object):
         print('[autoML] Starting Exploratory Data Analysis')
         if not self.skip_eda:
             self.eda = ExploratoryDataAnalysis(data, output=data[self.target])
-        # Data preparation -- Creates/Loads All_selected, output, pp_selected, rf_selected
+        # Data processing
         self.data_preparation(data)
         # Initial Modelling
         self.initial_modelling()
@@ -1122,11 +1122,17 @@ class FeatureProcessing(object):
         self.model = None
         self.mode = None
         self.threshold = None
+        # Register
+        self.baseScore= {}
+        self.colinearFeatures = None
+        self.crossFeatures = None
+        self.laggedFeatures = None
+        self.kMeansFeatures = None
         # Parameters
         self.maxLags = max_lags
         self.informationThreshold = information_threshold
 
-    def fit(self, inputFrame, outputFrame):
+    def extract(self, inputFrame, outputFrame):
         assert isinstance(inputFrame, pd.DataFrame), 'Input supports only Pandas DataFrame'
         assert isinstance(outputFrame, pd.DataFrame), 'Output supports only Pandas DataFrame'
         if len(outputFrame[outputFrame.keys()[0]].unique()) == 2:
@@ -1148,14 +1154,11 @@ class FeatureProcessing(object):
 
         # Manipulate features
         baseline = self.calcBaseline()
-        plt.plot(list(baseline.values()))
-        plt.show()
-        dropped = self.removeColinearity()
-        CFscore = self.addCrossFeatures()
+        # crossFeatureScores = self.addCrossFeatures()
+        laggedFeatureScores = self.addLaggedFeatures()
+        kmeansFeatureScores = self.addKMeansFeatures()
 
-        # crossFeatureScores = self.crossFeatures()
-        # lagFeatureScores = self.laggedFeatures()
-        return CFscore
+        return self.input
 
     def removeColinearity(self):
         nk = len(self.input.keys())
@@ -1171,9 +1174,9 @@ class FeatureProcessing(object):
                     corr_mat[i, j] = c
                     corr_mat[j, i] = c
         upper = np.triu(corr_mat)
-        col_drop = self.input.keys()[np.sum(upper > self.informationThreshold, axis=0) > 0].to_list()
-        self.input = self.input.drop(col_drop, axis=1)
-        print('[Features] Removed %i Co-Linear features (%.3f %% threshold)' % (len(col_drop), self.informationThreshold))
+        self.colinearFeatures = self.input.keys()[np.sum(upper > self.informationThreshold, axis=0) > 0].to_list()
+        self.input = self.input.drop(self.colinearFeatures, axis=1)
+        print('[Features] Removed %i Co-Linear features (%.3f %% threshold)' % (len(self.colinearFeatures), self.informationThreshold))
         return col_drop
 
     def calcBaseline(self):
@@ -1181,12 +1184,11 @@ class FeatureProcessing(object):
         Calculates baseline for correlation, method same for all functions.
         '''
         # Calculate scores
-        scores = {}
         for key in self.input.keys():
             m = copy.copy(self.model)
             m.fit(self.input[[key]], self.output)
-            scores[key] = m.score(self.input[[key]], self.output)
-        return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+            self.baseScore[key] = m.score(self.input[[key]], self.output)
+        return {k: v for k, v in sorted(self.baseScore.items(), key=lambda item: item[1], reverse=True)}
 
     def addCrossFeatures(self):
         '''
@@ -1225,9 +1227,9 @@ class FeatureProcessing(object):
             scores[keyA + '__x__' + keyB] = m.score(feature, self.output)
 
         # Add the valuable features
-        valuableFeatures = [k for k, v in scores.items() if v > 0.1]
-        multiFeatures = [k for k in valuableFeatures if '__x__' in k]
-        divFeatures = [k for k in valuableFeatures if '__d__' in k]
+        self.crossFeatures = [k for k, v in scores.items() if v > 0.1]
+        multiFeatures = [k for k in self.crossFeatures if '__x__' in k]
+        divFeatures = [k for k in self.crossFeatures if '__d__' in k]
         for k in multiFeatures:
             keyA, keyB = k.split('__x__')
             feature = self.input[[keyA]] * self.input[[keyB]]
@@ -1240,7 +1242,8 @@ class FeatureProcessing(object):
             feature = (feature - feature.mean()) / feature.std()
             feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
             self.input[k] = feature
-        print('[Features] Added %i cross features' % len(valuableFeatures))
+        json.dump(self.crossFeatures, open('crossFeatures.json', 'w'))
+        print('[Features] Added %i cross features' % len(self.crossFeatures))
         return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
 
     def addLaggedFeatures(self):
@@ -1249,18 +1252,19 @@ class FeatureProcessing(object):
         '''
         keys = self.input.keys()
         scores = {}
-        for lag in range(self.maxLags):
+        for lag in range(1, self.maxLags):
             for key in keys:
                 m = copy.copy(self.model)
-                m.fit(self.input[key][:-lag], self.output[lag:])
-                scores[key + '__lag__%i' % lag] = m.score(self.input[key][:-lag], self.output[lag:])
+                m.fit(self.input[[key]][:-lag], self.output[lag:])
+                scores[key + '__lag__%i' % lag] = m.score(self.input[[key]][:-lag], self.output[lag:])
 
         # Add the valuable features
-        valuableFeatures = [k for k, v in scores.items() if v > 0.1]
-        for k in valuableFeatures:
+        self.laggedFeatures = [k for k, v in scores.items() if v > self.baseScore[k[:k.find('__lag__')]]]
+        for k in self.laggedFeatures:
             key, lag = k.split('__lag__')
-            self.input[k] = self.input[key].shift(-lag)
-        print('[Features] Added %i lagged features' % len(valuableFeatures))
+            self.input[k] = self.input[key].shift(-int(lag), fill_value=0)
+        json.dump(self.laggedFeatures, open('crossFeatures.json', 'w'))
+        print('[Features] Added %i lagged features' % len(self.laggedFeatures))
         return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
 
     def addKMeansFeatures(self):
@@ -1279,18 +1283,16 @@ class FeatureProcessing(object):
         scores = {}
         for key in distances.keys():
             m = copy.copy(self.model)
-            m.fit(distances[key], self.output)
-            scores[key] = m.score(distances[key], self.output)
-        return scores
+            m.fit(distances[[key]], self.output)
+            scores[key] = m.score(distances[[key]], self.output)
 
-
-    def predictivePowerScore(self):
-        return 'hoi!'
-
-
-
-
-
+        # Add the valuable features
+        self.kMeansFeatures = [k for k, v in scores.items() if v > 0.1]
+        for k in self.kMeansFeatures:
+            self.input[k] = distances[k]
+        json.dump(self.kMeansFeatures, open('crossFeatures.json', 'w'))
+        print('[Features] Added %i K-Means features (%i clusters)' % (len(self.kMeansFeatures), clusters))
+        return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
 
 
 class Normalize(object):
