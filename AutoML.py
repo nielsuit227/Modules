@@ -12,7 +12,7 @@ import multiprocessing as mp
 from boruta import BorutaPy
 import catboost
 import sklearn
-from sklearn import neural_network
+from sklearn import neural_network, tree, cluster
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import plot_roc_curve, auc
 from sklearn.model_selection import StratifiedKFold, KFold
@@ -38,7 +38,6 @@ warnings.filterwarnings("ignore")
 # flat=bool for sequence (needed for lightGBM)
 # implement autoencoder for Feature Extraction
 # implement transformers
-# implement 'golden feature' (add all division / multiplication pairs, train single trees to find good ones)
 
 class Pipeline(object):
     def __init__(self, target,
@@ -1114,6 +1113,185 @@ class Preprocessing(object):
             print('[preprocessing] Saving to: ', self.outputPath + file)
             data.to_csv(self.outputPath + file, index=self.indexCol is not None)
         return data
+
+class FeatureProcessing(object):
+
+    def __init__(self, max_lags=10, information_threshold=0.975):
+        self.input = None
+        self.output = None
+        self.model = None
+        self.mode = None
+        self.threshold = None
+        # Parameters
+        self.maxLags = max_lags
+        self.informationThreshold = information_threshold
+
+    def fit(self, inputFrame, outputFrame):
+        assert isinstance(inputFrame, pd.DataFrame), 'Input supports only Pandas DataFrame'
+        assert isinstance(outputFrame, pd.DataFrame), 'Output supports only Pandas DataFrame'
+        if len(outputFrame[outputFrame.keys()[0]].unique()) == 2:
+            self.model = tree.DecisionTreeClassifier(max_depth=3)
+            self.mode = 'c'
+        else:
+            self.model = tree.DecisionTreeRegressor(max_depth=3)
+            self.mode = 'r'
+        # Bit of data cleaning
+        inputFrame = inputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
+        inputFrame = (inputFrame - inputFrame.mean()) / inputFrame.std()
+        inputFrame = inputFrame.replace([np.inf, -np.inf], 0).fillna(0)
+        outputFrame = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
+        if self.mode == 'r':
+            outputFrame = (outputFrame - outputFrame.mean()) / outputFrame.std()
+        outputFrame = outputFrame.replace([np.inf, -np.inf], 0).fillna(0)
+        self.input = inputFrame
+        self.output = outputFrame
+
+        # Manipulate features
+        baseline = self.calcBaseline()
+        plt.plot(list(baseline.values()))
+        plt.show()
+        dropped = self.removeColinearity()
+        CFscore = self.addCrossFeatures()
+
+        # crossFeatureScores = self.crossFeatures()
+        # lagFeatureScores = self.laggedFeatures()
+        return CFscore
+
+    def removeColinearity(self):
+        nk = len(self.input.keys())
+        norm = (self.input - self.input.mean(skipna=True, numeric_only=True)).to_numpy()
+        ss = np.sqrt(np.sum(norm ** 2, axis=0))
+        corr_mat = np.zeros((nk, nk))
+        for i in range(nk):
+            for j in range(nk):
+                if i == j:
+                    continue
+                if corr_mat[i, j] == 0:
+                    c = abs(np.sum(norm[:, i] * norm[:, j]) / (ss[i] * ss[j]))
+                    corr_mat[i, j] = c
+                    corr_mat[j, i] = c
+        upper = np.triu(corr_mat)
+        col_drop = self.input.keys()[np.sum(upper > self.informationThreshold, axis=0) > 0].to_list()
+        self.input = self.input.drop(col_drop, axis=1)
+        print('[Features] Removed %i Co-Linear features (%.3f %% threshold)' % (len(col_drop), self.informationThreshold))
+        return col_drop
+
+    def calcBaseline(self):
+        '''
+        Calculates baseline for correlation, method same for all functions.
+        '''
+        # Calculate scores
+        scores = {}
+        for key in self.input.keys():
+            m = copy.copy(self.model)
+            m.fit(self.input[[key]], self.output)
+            scores[key] = m.score(self.input[[key]], self.output)
+        return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+
+    def addCrossFeatures(self):
+        '''
+        Calculates cross-feature features with m and multiplication.
+        Allows up to 500 features (364.750 cross-features).
+        '''
+        # Make division todo List
+        keys = self.input.keys()
+        divList = []
+        for key in keys:
+            divList += [(key, k) for k in keys if k != key]
+
+        # Make multiplication todo list
+        multiList = []
+        for i, keyA in enumerate(keys):
+            for j, keyB in enumerate(keys):
+                if j >= i:
+                    continue
+                multiList.append((keyA, keyB))
+
+        # Analyse scores
+        scores = {}
+        for keyA, keyB in tqdm(divList):
+            feature = self.input[[keyA]] / self.input[[keyB]]
+            feature = (feature - feature.mean()) / feature.std()
+            feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
+            m = copy.copy(self.model)
+            m.fit(feature, self.output)
+            scores[keyA + '__d__' + keyB] = m.score(feature, self.output)
+        for keyA, keyB in tqdm(multiList):
+            feature = self.input[[keyA]] * self.input[[keyB]]
+            feature = (feature - feature.mean()) / feature.std()
+            feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
+            m = copy.copy(self.model)
+            m.fit(feature, self.output)
+            scores[keyA + '__x__' + keyB] = m.score(feature, self.output)
+
+        # Add the valuable features
+        valuableFeatures = [k for k, v in scores.items() if v > 0.1]
+        multiFeatures = [k for k in valuableFeatures if '__x__' in k]
+        divFeatures = [k for k in valuableFeatures if '__d__' in k]
+        for k in multiFeatures:
+            keyA, keyB = k.split('__x__')
+            feature = self.input[[keyA]] * self.input[[keyB]]
+            feature = (feature - feature.mean()) / feature.std()
+            feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
+            self.input[k] = feature
+        for k in divFeatures:
+            keyA, keyB = k.split('__d__')
+            feature = self.input[[keyA]] / self.input[[keyB]]
+            feature = (feature - feature.mean()) / feature.std()
+            feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
+            self.input[k] = feature
+        print('[Features] Added %i cross features' % len(valuableFeatures))
+        return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+
+    def addLaggedFeatures(self):
+        '''
+        Analyses the correlation of lagged features (value of sensor_x at t-1 to predict target at t)
+        '''
+        keys = self.input.keys()
+        scores = {}
+        for lag in range(self.maxLags):
+            for key in keys:
+                m = copy.copy(self.model)
+                m.fit(self.input[key][:-lag], self.output[lag:])
+                scores[key + '__lag__%i' % lag] = m.score(self.input[key][:-lag], self.output[lag:])
+
+        # Add the valuable features
+        valuableFeatures = [k for k, v in scores.items() if v > 0.1]
+        for k in valuableFeatures:
+            key, lag = k.split('__lag__')
+            self.input[k] = self.input[key].shift(-lag)
+        print('[Features] Added %i lagged features' % len(valuableFeatures))
+        return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+
+    def addKMeansFeatures(self):
+        '''
+        Analyses the correlation of k-means features.
+        k-means is a clustering algorithm which clusters the data.
+        The distance to each cluster is then analysed.
+        '''
+        # Fit K-Means and calculate distances
+        clusters = min(max(int(np.log10(len(self.input)) * 8), 8), len(self.input.keys()))
+        kmeans = cluster.MiniBatchKMeans(n_clusters=clusters)
+        columnNames = ['dist_c_%i' % i for i in range(clusters)]
+        distances = pd.DataFrame(columns=columnNames, data=kmeans.fit_transform(self.input))
+
+        # Analyse correlation
+        scores = {}
+        for key in distances.keys():
+            m = copy.copy(self.model)
+            m.fit(distances[key], self.output)
+            scores[key] = m.score(distances[key], self.output)
+        return scores
+
+
+    def predictivePowerScore(self):
+        return 'hoi!'
+
+
+
+
+
+
 
 class Normalize(object):
 
