@@ -73,7 +73,7 @@ class Pipeline(object):
                  store_models=True,
 
                  # Grid Search
-                 grid_search=3,
+                 grid_search_iterations=3,
 
                  # Flags
                  plot_eda=False,
@@ -121,7 +121,7 @@ class Pipeline(object):
         self.includeOutput = include_output
         self.shuffle = shuffle
         self.nSplits = n_splits
-        self.gridSearch = gridSearch
+        self.gridSearchIterations = grid_search_iterations
         self.sequence = sequence
 
         # Instance initiating
@@ -578,9 +578,9 @@ class Pipeline(object):
         # Raise error if nothing is returned
         raise NotImplementedError('Hyperparameter tuning not implemented for ', type(model).__name__)
 
-    def grid_search(self, model=None, params=None, feature_set=None):
+    def gridSearch(self, model=None, params=None, feature_set=None):
         """
-        Runs a grid search. By default, takes the self.modelling_res, and runs for the top 3 optimizations.
+        Runs a grid search. By default, takes the self.results, and runs for the top 3 optimizations.
         There is the option to provide a model & data_ind, but both have to be provided. In this case,
         the model & data set combination will be optimized.
         :param model:
@@ -608,40 +608,40 @@ class Pipeline(object):
                 if params is None:
                     params = self._getHyperParams(model)
                 # Run Grid Search
-                self.grid_res = self.sort_results(self._gridsearch(model, params, data_ind))
+                self.grid_res = self.sort_results(self._gridSearch(model, params, data_ind))
                 self.grid_res.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
                                (type(model).__name__, str(data_ind)), index_label='index')
                 params = self.grid_res.iloc[0]['params']
             # Validate
-            self.validate(model, params, data_ind)
+            if self.validateResults:
+                self.validate(model, params, data_ind)
             return
 
         # If arguments aren't provided, do top 3 from self.modelling_res
-        models = self.modelling.return_models()
-        res = self.sort_results(self.modelling_res[np.logical_and(
-            self.modelling_res['type'] == 'Initial modelling',
-            self.modelling_res['data_version'] == self.version,
+        models = self.Modelling.return_models()
+        results = self.sort_results(self.results[np.logical_and(
+            self.results['type'] == 'Initial modelling',
+            self.results['data_version'] == self.version,
         )])
-        for iteration in range(self.number_grid_search):
+        for iteration in range(self.gridSearchIterations):
             # Grab settings
-            settings = res.iloc[iteration]
+            settings = result.iloc[iteration]
             model = models[[i for i in range(len(models)) if type(models[i]).__name__ == settings['model']][0]]
-            data_ind = [i for i in range(len(self.datasets)) if self.datasets[i] == settings['dataset']][0]
+            featureSet = settings['dataset']
             # Check whether exists
-            model_res = self.modelling_res[np.logical_and(
-                self.modelling_res['model'] == type(model).__name__,
-                self.modelling_res['data_version'] == self.version,
+            modelResults = self.results[np.logical_and(
+                self.results['model'] == type(model).__name__,
+                self.results['data_version'] == self.version,
             )]
-            model_res = self.sort_results(model_res[model_res['dataset'] == self.datasets[data_ind]])
+            modelResults = self._sortResults(modelResults[modelResults['dataset'] == featureSet])
+            # If exists
             if ('Hyperparameter Opt' == model_res['type']).any():
                 hyper_opt_res = model_res[model_res['type'] == 'Hyperparameter Opt']
-                # Validate
                 params = self.parse_json(hyper_opt_res.iloc[0]['params'])
+            # Else run
             else:
-                # Grab parameters
                 params = self.get_hyper_params(model)
-                # Optimize
-                self.grid_res = self.sort_results(self._gridsearch(model, params, data_ind))
+                gridSearchResults = self._sortResults(self._gridSearch(model, params, data_ind))
                 # Store
                 self.grid_res['model'] = type(model).__name__
                 self.grid_res['data_version'] = self.version
@@ -653,7 +653,7 @@ class Pipeline(object):
             # Validate
             self.validate(model, params, data_ind)
 
-    def _gridsearch(self, model, params, data_ind):
+    def _gridSearch(self, model, params, data_ind):
         """
         INTERNAL | Grid search for defined model, parameter set and data_ind.
         """
