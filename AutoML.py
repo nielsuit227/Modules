@@ -241,8 +241,7 @@ class Pipeline(object):
         self._dataProcessing(data)
         self._featureProcessing()
         self._initialModelling()
-        # Hyperparameter optimization
-        self.grid_search()
+        self.gridSearch()
         # Production Env
         self.prepare_production_files()
         print('[autoML] Done :)')
@@ -593,92 +592,109 @@ class Pipeline(object):
 
         # If arguments are provided
         if model is not None:
+
             # Check if already completed
             results = self.results[np.logical_and(
                 self.results['model'] == type(model).__name__,
                 self.results['data_version'] == self.version,
             )]
             results = self._sortResults(results[results['dataset'] == feature_set])
-            # Check if not already done, get params
             if ('Hyperparameter Opt' == results['type']).any():
-                hyper_opt_res = results[results['type'] == 'Hyperparameter Opt']
-                params = self.parse_json(hyper_opt_res.iloc[0]['params'])
+                hyperOptResults = results[results['type'] == 'Hyperparameter Opt']
+                params = self._parseJson(hyperOptResults.iloc[0]['params'])
             else:
+
                 # Parameter check
                 if params is None:
                     params = self._getHyperParams(model)
+
                 # Run Grid Search
-                self.grid_res = self.sort_results(self._gridSearch(model, params, data_ind))
-                self.grid_res.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
+                results = self._sortResults(self._gridSearchIteration(model, params, data_ind))
+                results.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
                                (type(model).__name__, str(data_ind)), index_label='index')
-                params = self.grid_res.iloc[0]['params']
+                params = results.iloc[0]['params']
+
             # Validate
-            if self.validateResults:
-                self.validate(model, params, data_ind)
+            self.validate(model, params, data_ind)
             return
 
-        # If arguments aren't provided, do top 3 from self.modelling_res
+        # If arguments aren't provided
         models = self.Modelling.return_models()
-        results = self.sort_results(self.results[np.logical_and(
+        results = self._sortResults(self.results[np.logical_and(
             self.results['type'] == 'Initial modelling',
             self.results['data_version'] == self.version,
         )])
+
         for iteration in range(self.gridSearchIterations):
             # Grab settings
             settings = result.iloc[iteration]
             model = models[[i for i in range(len(models)) if type(models[i]).__name__ == settings['model']][0]]
             featureSet = settings['dataset']
+
             # Check whether exists
             modelResults = self.results[np.logical_and(
                 self.results['model'] == type(model).__name__,
                 self.results['data_version'] == self.version,
             )]
             modelResults = self._sortResults(modelResults[modelResults['dataset'] == featureSet])
+
             # If exists
-            if ('Hyperparameter Opt' == model_res['type']).any():
-                hyper_opt_res = model_res[model_res['type'] == 'Hyperparameter Opt']
-                params = self.parse_json(hyper_opt_res.iloc[0]['params'])
+            if ('Hyperparameter Opt' == modelResults['type']).any():
+                hyperOptRes = modelResults[modelResults['type'] == 'Hyperparameter Opt']
+                params = self._parseJson(hyperOptRes.iloc[0]['params'])
+
             # Else run
             else:
-                params = self.get_hyper_params(model)
-                gridSearchResults = self._sortResults(self._gridSearch(model, params, data_ind))
-                # Store
-                self.grid_res['model'] = type(model).__name__
-                self.grid_res['data_version'] = self.version
-                self.grid_res['dataset'] = self.datasets[data_ind]
-                self.grid_res['type'] = 'Hyperparameter Opt'
-                self.modelling_res = self.modelling_res.append(self.grid_res)
-                self.modelling_res.to_csv(self.mainDir + '/Results.csv', index=False)
-                params = self.grid_res.iloc[0]['params']
-            # Validate
-            self.validate(model, params, data_ind)
+                params = self._getHyperParams(model)
+                gridSearchResults = self._sortResults(self._gridSearchIteration(model, params, data_ind))
 
-    def _gridSearch(self, model, params, data_ind):
+                # Store
+                gridSearchResults['model'] = type(model).__name__
+                gridSearchResults['data_version'] = self.version
+                gridSearchResults['dataset'] = self.datasets[data_ind]
+                gridSearchResults['type'] = 'Hyperparameter Opt'
+                self.results = self.results.append(gridSearchResults)
+                self.results.to_csv(self.mainDir + '/Results.csv', index=False)
+                params = gridSearchResults.iloc[0]['params']
+
+            # Validate
+            if self.validateResults:
+                self.validate(model, params, data_ind)
+
+    def _gridSearchIteration(self, model, params, feature_set):
         """
         INTERNAL | Grid search for defined model, parameter set and data_ind.
         """
+        print('\n[autoML] Starting Hyperparameter Optimization for %s on %s features (%i samples, %i features)' %
+              (type(model).__name__, feature_set, len(input), len(self.colKeep[feature_set])))
+
         # Select data
-        input = self.input[self.col_keep[data_ind]]
-        # Grid Search
-        print('\n[autoML] Starting Hyperparameter Optimization for %s on %s (%i samples, %i features)' %
-              (type(model).__name__, self.datasets[data_ind], len(input), len(input.keys())))
-        if self.regression:
-            self.grid = GridSearch(model, params,
-                                   cv=KFold(n_splits=self.n_splits),
+        input = self.input[self.colKeep[feature_set]]
+
+        # Run for regression (different Cross-Validation & worst case (MAE vs ACC))
+        if self.mode == 'regression':
+            gridSearch = GridSearch(model, params,
+                                   cv=KFold(n_splits=self.nSplits),
                                    scoring=Metrics.mae)
-            results = self.grid.fit(input, self.output)
+            results = gridSearch.fit(input, self.output)
             results['worst_case'] = results['mean_score'] + results['std_score']
             results = results.sort_values('worst_case')
-        elif self.classification:
-            self.grid = GridSearch(model, params,
-                                   cv=StratifiedKFold(n_splits=self.n_splits),
+
+        # run for classification
+        elif self.mode == 'classification':
+            gridSearch = GridSearch(model, params,
+                                   cv=StratifiedKFold(n_splits=self.nSplits),
                                    scoring=Metrics.acc)
-            results = self.grid.fit(input, self.output)
+            results = gridSearch.fit(input, self.output)
             results['worst_case'] = results['mean_score'] - results['std_score']
             results = results.sort_values('worst_case', ascending=False)
+
         return results
 
     def validate(self, master_model, params, data_ind):
+        ################
+        # We're updating here
+        ################
 
         if not self.prep_data:
             if self.boolask('Run Validation?') == False:
