@@ -1182,11 +1182,12 @@ class FeatureProcessing(object):
     def extract(self, inputFrame, outputFrame):
         self._cleanAndSet(inputFrame, outputFrame)
         # Manipulate features
-        baseline = self._calcBaseline()
-        crossFeatureScores = self._addCrossFeatures()
-        diffFeatureScores = self._addDiffFeatures()
-        kmeansFeatureScores = self._addKMeansFeatures()
-        laggedFeatureScores = self._addLaggedFeatures()
+        # baseline = self._calcBaseline()
+        self._removeColinearity()
+        self._addCrossFeatures()
+        self._addDiffFeatures()
+        self._addKMeansFeatures()
+        self._addLaggedFeatures()
         return self.input
 
     def _cleanAndSet(self, inputFrame, outputFrame):
@@ -1231,6 +1232,7 @@ class FeatureProcessing(object):
 
         # Else run
         else:
+            print('[Features] Analysing colinearity')
             nk = len(self.input.keys())
             norm = (self.input - self.input.mean(skipna=True, numeric_only=True)).to_numpy()
             ss = np.sqrt(np.sum(norm ** 2, axis=0))
@@ -1250,7 +1252,6 @@ class FeatureProcessing(object):
         json.dump(self.colinearFeatures, open(self.folder + 'Colinear_v%i.json' % self.version, 'w'))
         self.input = self.input.drop(self.colinearFeatures, axis=1)
         print('[Features] Removed %i Co-Linear features (%.3f %% threshold)' % (len(self.colinearFeatures), self.informationThreshold))
-        return col_drop
 
     def _addCrossFeatures(self):
         '''
@@ -1260,9 +1261,11 @@ class FeatureProcessing(object):
         # Check if not already executed
         if os.path.exists(self.folder + 'crossFeatures_v%i.json' % self.version):
             self.crossFeatures = json.load(open(self.folder + 'crossFeatures_v%i.json' % self.version, 'r'))
+            print('[Features] Loaded %i cross features' % len(self.crossFeatures))
 
         # Else, execute
         else:
+            print('[Features] Analysing cross features')
             # Make division todo List
             keys = self.input.keys()
             divList = []
@@ -1307,7 +1310,7 @@ class FeatureProcessing(object):
         for k in divFeatures:
             keyA, keyB = k.split('__d__')
             newFeatures.append(self.input[[keyA]] / self.input[[keyB]])
-        newFeatures = pd.DataFrame(newFeatures)
+        newFeatures = pd.concat(newFeatures, axis=1, ignore_index=True)
 
         # Process and add new features
         scaler = StandardScaler()
@@ -1318,7 +1321,6 @@ class FeatureProcessing(object):
         pickle.dump(scaler, open(self.folder + 'crossFeatureNorm_v%i.pickle' % self.version, 'wb'))
         json.dump(self.crossFeatures, open(self.folder + 'crossFeatures_v%i.json' % self.version, 'w'))
         print('[Features] Added %i cross features' % len(self.crossFeatures))
-        return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
 
     def _addKMeansFeatures(self):
         '''
@@ -1326,76 +1328,122 @@ class FeatureProcessing(object):
         k-means is a clustering algorithm which clusters the data.
         The distance to each cluster is then analysed.
         '''
-        # Fit K-Means and calculate distances
-        clusters = min(max(int(np.log10(len(self.input)) * 8), 8), len(self.input.keys()))
-        kmeans = cluster.MiniBatchKMeans(n_clusters=clusters)
-        columnNames = ['dist_c_%i' % i for i in range(clusters)]
-        distances = pd.DataFrame(columns=columnNames, data=kmeans.fit_transform(self.input))
+        # Check if not exist
+        if os.path.exists(self.folder + 'K-MeansFeatures_v%i.json' % self.version):
+            # Load features and cluster size
+            self.kMeansFeatures = json.load(open(self.folder + 'K-MeansFeatures_v%i.json' % self.version, 'r'))
+            clusters = self.kMeansFeatures[0]
+            clusters = int(clusters[clusters.rfind('_'):])
+            print('[Features] Loaded %i K-Means features' % len(self.kMeansFeatures))
 
-        # Analyse correlation
-        scores = {}
-        for key in distances.keys():
-            m = copy.copy(self.model)
-            m.fit(distances[[key]], self.output)
-            scores[key] = m.score(distances[[key]], self.output)
+            # Calculate distances
+            kmeans = cluster.MiniBatchKMeans(n_clusters=clusters)
+            columnNames = ['dist_c_%i_%i' % (i, clusters) for i in range(clusters)]
+            distances = pd.DataFrame(columns=columnNames, data=kmeans.fit_transform(self.input))
 
-        # Add the valuable features
-        self.kMeansFeatures = [k for k, v in scores.items() if v > 0.1]
-        for k in self.kMeansFeatures:
-            self.input[k] = distances[k]
-        json.dump(self.kMeansFeatures, open(self.folder + 'crossFeatures.json', 'w'))
-        print('[Features] Added %i K-Means features (%i clusters)' % (len(self.kMeansFeatures), clusters))
-        return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+            # Add them
+            for key in self.kMeansFeatures:
+                self.input[key] = distances[key]
+
+        # If not executed, analyse all
+        else:
+            print('[Features] Calculating and Analysing K-Means features')
+            # Fit K-Means and calculate distances
+            clusters = min(max(int(np.log10(len(self.input)) * 8), 8), len(self.input.keys()))
+            kmeans = cluster.MiniBatchKMeans(n_clusters=clusters)
+            columnNames = ['dist_c_%i_%i' % (i, clusters) for i in range(clusters)]
+            distances = pd.DataFrame(columns=columnNames, data=kmeans.fit_transform(self.input))
+
+            # Analyse correlation
+            scores = {}
+            for key in distances.keys():
+                m = copy.copy(self.model)
+                m.fit(distances[[key]], self.output)
+                scores[key] = m.score(distances[[key]], self.output)
+
+            # Add the valuable features
+            self.kMeansFeatures = [k for k, v in scores.items() if v > 0.1]
+            for k in self.kMeansFeatures:
+                self.input[k] = distances[k]
+            json.dump(self.kMeansFeatures, open(self.folder + 'crossFeatures.json', 'w'))
+            print('[Features] Added %i K-Means features (%i clusters)' % (len(self.kMeansFeatures), clusters))
 
     def _addDiffFeatures(self):
         '''
         Analyses whether the differenced signal of the data should be included.
         '''
-        # Copy data so we can diff without altering original data
-        keys = self.input.keys()
-        diffInput = copy.copy(self.input)
 
-        # Calculate scores
-        scores = {}
-        for diff in range(1, self.maxDiff+1):
-            diffInput = diffInput.diff().fillna(0)
-            for key in keys:
-                m = copy.copy(self.model)
-                m.fit(diffInput[key], diffOutput)
-                score[key + '__diff__%i' % diff] = m.score(diffInput[key], diffOutput)
+        # Check if we're allowed
+        if self.maxLags == 0:
+            return
 
-        # Add the valuable features
-        self.diffFeatures = [k for k, v in scores.items() if v > 0.1]
+        # Check if exist
+        if os.path.exists(self.folder + 'diffFeatures_v%i.json' % self.version):
+            self.diffFeatures = json.load(open(self.folder + 'diffFeatures_v%i.json' % self.version, 'r'))
+            print('[Features] Loaded %i differenced features' % len(self.diffFeatures))
+
+        # If not exist, execute
+        else:
+            print('[Features] Analysing differenced features')
+            # Copy data so we can diff without altering original data
+            keys = self.input.keys()
+            diffInput = copy.copy(self.input)
+
+            # Calculate scores
+            scores = {}
+            for diff in range(1, self.maxDiff+1):
+                diffInput = diffInput.diff().fillna(0)
+                for key in keys:
+                    m = copy.copy(self.model)
+                    m.fit(diffInput[key], diffOutput)
+                    score[key + '__diff__%i' % diff] = m.score(diffInput[key], diffOutput)
+
+            # Select the valuable features
+            self.diffFeatures = [k for k, v in scores.items() if v > 0.1]
+            print('[Features] Added %i differenced features' % len(self.diffFeatures))
+
+        # Add Differenced Features
         for k in self.diffFeatures:
             key, diff = k.split('__diff__')
             feature = self.input[key]
             for i in range(1, diff):
                 feature = feature.diff().fillna(0)
             self.input[k] = feature
-        json.dump(self.diffFeatures, open(self.folder + 'diffFeatures.json', 'w'))
-        print('[Features] Added %i differenced features' % len(self.diffFeatures))
-        return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+        json.dump(self.diffFeatures, open(self.folder + 'diffFeatures_v%i.json' % self.version, 'w'))
 
     def _addLaggedFeatures(self):
         '''
         Analyses the correlation of lagged features (value of sensor_x at t-1 to predict target at t)
         '''
-        keys = self.input.keys()
-        scores = {}
-        for lag in range(1, self.maxLags):
-            for key in keys:
-                m = copy.copy(self.model)
-                m.fit(self.input[[key]][:-lag], self.output[lag:])
-                scores[key + '__lag__%i' % lag] = m.score(self.input[[key]][:-lag], self.output[lag:])
+        # Check if allowed
+        if self.maxLags == 0:
+            return
 
-        # Add the valuable features
-        self.laggedFeatures = [k for k, v in scores.items() if v > self.baseScore[k[:k.find('__lag__')]]]
+        # Check if exists
+        if os.path.exists(self.folder + 'laggedFeatures_v%i.json' % self.version):
+            self.laggedFeatures = json.load(open(self.folder + 'laggedFeatures_v%i.json' % self.version, 'r'))
+            print('[Features] Loaded %i lagged features' % len(self.laggedFeatures))
+
+        # Else execute
+        else:
+            print('[Features] Analysing lagged features')
+            keys = self.input.keys()
+            scores = {}
+            for lag in range(1, self.maxLags):
+                for key in keys:
+                    m = copy.copy(self.model)
+                    m.fit(self.input[[key]][:-lag], self.output[lag:])
+                    scores[key + '__lag__%i' % lag] = m.score(self.input[[key]][:-lag], self.output[lag:])
+
+            # Select
+            self.laggedFeatures = [k for k, v in scores.items() if v > self.baseScore[k[:k.find('__lag__')]]]
+            print('[Features] Added %i lagged features' % len(self.laggedFeatures))
+
+        # Add selected
         for k in self.laggedFeatures:
             key, lag = k.split('__lag__')
             self.input[k] = self.input[key].shift(-int(lag), fill_value=0)
-        json.dump(self.laggedFeatures, open(self.folder + 'crossFeatures.json', 'w'))
-        print('[Features] Added %i lagged features' % len(self.laggedFeatures))
-        return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+        json.dump(self.laggedFeatures, open(self.folder + 'laggedFeatures_v%i.json' % self.version, 'w'))
 
 
     def select(self, inputFrame, outputFrame):
