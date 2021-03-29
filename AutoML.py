@@ -108,6 +108,7 @@ class Pipeline(object):
         self.validateResults = validate_result
 
         # Instance initiating
+        self.version = None
         self.input = None
         self.output = None
         self.colKeep = None
@@ -157,7 +158,7 @@ class Pipeline(object):
                 file.write('Dataset changelog. \nv0: Initial')
                 file.close()
             else:
-                changelog = input("Data changelog v%i")
+                changelog = input("Data changelog v%i:\n")
                 file = open(self.mainDir + 'changelog.txt', 'a')
                 file.write(('\nv%i: ' % self.version) + changelog)
                 file.close()
@@ -178,7 +179,7 @@ class Pipeline(object):
             return True
         else:
             print('Sorry, I did not understand. Please answer with "n" or "y"')
-            return self.boolask(question)
+            return self._boolask(question)
 
     def _notification(self, message):
         import requests
@@ -245,12 +246,12 @@ class Pipeline(object):
         self.prepare_production_files()
         print('[autoML] Done :)')
 
-    def _eda(self):
+    def _eda(self, data):
         if self.plotEDA:
             print('[autoML] Starting Exploratory Data Analysis')
             output = data[self.target]
             input = data.drop(self.target, axis=1)
-            self.eda = ExploratoryDataAnalysis(input, output=data[self.target])
+            self.eda = ExploratoryDataAnalysis(input, output=output)
 
     def data_preparation(self, data):
         ''' DEPRECATED '''
@@ -388,8 +389,10 @@ class Pipeline(object):
         else:
             # Extract
             self.input = self.FeatureProcessing.extract(self.input, self.output)
+
             # Select
             self.colKeep = self.FeatureProcessing.select(self.input, self.output)
+
             # Store
             self.input.to_csv(self.mainDir + 'Data/Extracted_v%i.csv' % self.version)
             json.dump(self.colKeep, open(self.mainDir + 'Features/Sets_v%i.json' % self.version, 'w'))
@@ -994,6 +997,7 @@ class DataProcessing(object):
                  z_score_threshold=4,
                  folder='',
                  version=1,
+                 mode='regression',
                  ):
         '''
         Preprocessing Class. Deals with Outliers, Missing Values, duplicate rows, data types (floats, categorical and dates),
@@ -1013,10 +1017,10 @@ class DataProcessing(object):
         self.folder = folder if len(folder) == 0 or folder[-1] == '/' else folder + '/'
         self.version = version
         self.target = re.sub('[^a-z0-9]', '_', target.lower())
-        self.mode = 'r'
-        self.numCols = [re.sub('[^a-z0-9]', '_', nc.lower()) for nc in numCols] if num_cols is not None else []
-        self.catCols = [re.sub('[^a-z0-9]', '_', cc.lower()) for cc in catCols] if cat_cols is not None else []
-        self.dateCols = [re.sub('[^a-z0-9]', '_', dc.lower()) for dc in dateCols]  if date_cols is not None else []
+        self.mode = mode
+        self.numCols = [re.sub('[^a-z0-9]', '_', nc.lower()) for nc in num_cols] if num_cols is not None else []
+        self.catCols = [re.sub('[^a-z0-9]', '_', cc.lower()) for cc in cat_cols] if cat_cols is not None else []
+        self.dateCols = [re.sub('[^a-z0-9]', '_', dc.lower()) for dc in date_cols]  if date_cols is not None else []
         if self.target in self.numCols:
             self.numCols.remove(self.target)
 
@@ -1033,12 +1037,14 @@ class DataProcessing(object):
             raise ValueError("Missing Values Algorithm not implemented. Should be in " + str(missingValuesImplemented))
         self.missingValues = missing_values
         self.outlierRemoval = outlier_removal
-        self.zScoreThreshold = zScore_threshold
+        self.zScoreThreshold = z_score_threshold
 
 
     def clean(self, data):
-        print('[Data] Data Cleaning Started, (%i x %i) samples' % (len(data), len(data.keys())))
-        if len(set(data[self.target])) == 2: self.mode = 'c'
+        print('[Data] Data Cleaning Started, (%i x %i) samples' % (len(data.keys()), len(data)))
+        if len(data[self.target].unique()) == 2: self.mode = 'classification'
+
+        # Clean
         data = self._cleanKeys(data)
         data = self._convertDataTypes(data)
         data = self._removeDuplicates(data)
@@ -1046,7 +1052,9 @@ class DataProcessing(object):
         data = self._removeMissingValues(data)
         data = self._removeConstants(data)
         data = self._normalize(data)
-        self.store(data)
+
+        # Finish
+        self._store(data)
         print('[Data] Processing completed, (%i x %i) samples returned' % (len(data), len(data.keys())))
         return data
 
@@ -1081,8 +1089,9 @@ class DataProcessing(object):
         return data
 
     def _removeConstants(self, data):
+        nCols = len(data.keys())
         data = data.drop(data.keys()[data.min() == data.max()], axis=1)
-        print('[Data] Removed %i constant columns' % (n_cols - len(data.keys())))
+        print('[Data] Removed %i constant columns' % (nCols - len(data.keys())))
         return data
 
     def _removeOutliers(self, data):
@@ -1117,14 +1126,20 @@ class DataProcessing(object):
         elif self.missingValues == 'mean':
             data = data.fillna(data.mean())
         if n_nans > 0:
-            print('[Data] Filled %i (%.1f %%) missing values with %s' % (n_nans + diff,
-                  (n_nans + diff) * 100 / len(data) / len(data.keys()), self.missingValues))
+            print('[Data] Filled %i (%.1f %%) missing values with %s' % (n_nans,
+                  n_nans * 100 / len(data) / len(data.keys()), self.missingValues))
         return data
 
     def _normalize(self, data):
+        # Organise features that need normalizing, some where deleted
+        features = [key for key in data.keys() if key not in self.catCols + self.dateCols + [self.target]]
+
+        # Normalize
         self.scaler = StandardScaler()
-        data[self.numCols] = self.scaler.fit_transform(data[self.numCols])
-        if self.mode == 'r':
+        data[features] = self.scaler.fit_transform(data[features])
+
+        # Normalize output for regression
+        if self.mode == 'regression':
             self.oScaler = StandardScaler()
             data[self.target] = self.oScaler.fit_transform(data[self.target])
         return data
@@ -1184,16 +1199,26 @@ class FeatureProcessing(object):
 
     def _cleanAndSet(self, inputFrame, outputFrame):
         assert isinstance(inputFrame, pd.DataFrame), 'Input supports only Pandas DataFrame'
-        assert isinstance(outputFrame, pd.DataFrame), 'Output supports only Pandas DataFrame'
-        if len(outputFrame[outputFrame.keys()[0]].unique()) == 2:
+        assert isinstance(outputFrame, pd.Series), 'Output supports only Pandas Series'
+        if len(outputFrame.unique()) == 2:
             self.model = tree.DecisionTreeClassifier(max_depth=3)
-            self.mode = 'c'
         else:
             self.model = tree.DecisionTreeRegressor(max_depth=3)
-            self.mode = 'r'
         # Bit of necessary data cleaning (shouldn't change anything)
         self.input = inputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
         self.output = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
+
+    def _calcBaseline(self):
+        '''
+        Calculates baseline for correlation, method same for all functions.
+        '''
+        # Calculate scores
+        for key in self.input.keys():
+            m = copy.copy(self.model)
+            m.fit(self.input[[key]], self.output)
+            self.baseScore[key] = m.score(self.input[[key]], self.output)
+        json.dump(self.baseScore, open(self.folder + 'BaseScores.json', 'w'))
+        return {k: v for k, v in sorted(self.baseScore.items(), key=lambda item: item[1], reverse=True)}
 
     def _predictivePowerScore(self):
         print('[features] Determining Features with PPS')
@@ -1252,18 +1277,6 @@ class FeatureProcessing(object):
         self.input = self.input.drop(self.colinearFeatures, axis=1)
         print('[Features] Removed %i Co-Linear features (%.3f %% threshold)' % (len(self.colinearFeatures), self.informationThreshold))
         return col_drop
-
-    def _calcBaseline(self):
-        '''
-        Calculates baseline for correlation, method same for all functions.
-        '''
-        # Calculate scores
-        for key in self.input.keys():
-            m = copy.copy(self.model)
-            m.fit(self.input[[key]], self.output)
-            self.baseScore[key] = m.score(self.input[[key]], self.output)
-        json.dump(self.baseScore, open(self.folder + 'BaseScores.json', 'w'))
-        return {k: v for k, v in sorted(self.baseScore.items(), key=lambda item: item[1], reverse=True)}
 
     def _addCrossFeatures(self):
         '''
@@ -1747,9 +1760,7 @@ class Modelling(object):
 
     def __init__(self, mode='regression', shuffle=False, plot=False,
                  folder='models/', n_splits=3, dataset=0, store_models=False, store_results=True):
-        assert regression != classification, 'Cannot do both regression AND classification.'
-        self.is_regression = regression
-        self.is_classification = classification
+        self.mode = mode
         self.shuffle = shuffle
         self.plot = plot
         self.acc = []
