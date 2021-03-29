@@ -1311,27 +1311,23 @@ class FeatureProcessing(object):
 
             # Select valuable features
             scores = {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
-            items = min(250, sum(scores.values() > 0.1))
+            items = min(250, sum(score > 0.1 for score in scores.values()))
             self.crossFeatures = [k for k, v in list(scores.items())[:items] if v > 0.1]
 
-        # Split and remove
+        # Split and Add
         multiFeatures = [k for k in self.crossFeatures if '__x__' in k]
         divFeatures = [k for k in self.crossFeatures if '__d__' in k]
         newFeatures = []
         for k in multiFeatures:
             keyA, keyB = k.split('__x__')
             feature = self.input[keyA] * self.input[keyB]
-            feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
-            newFeatures.append(feature)
+            feature = feature.astype('float32').replace([np.inf, -np.inf], 0).fillna(0)
+            self.input[k] = feature
         for k in divFeatures:
             keyA, keyB = k.split('__d__')
             feature = self.input[keyA] / self.input[keyB]
-            feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
-            newFeatures.append(feature)
-
-        # Add new features
-        newFeatures = pd.concat(newFeatures, axis=1, ignore_index=True)
-        self.input[newFeatures.keys()] = newFeatures
+            feature = feature.astype('float32').replace([np.inf, -np.inf], 0).fillna(0)
+            self.input[k] = feature
 
         # Store
         json.dump(self.crossFeatures, open(self.folder + 'crossFeatures_v%i.json' % self.version, 'w'))
