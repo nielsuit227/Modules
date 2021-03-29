@@ -258,7 +258,7 @@ class Pipeline(object):
             print('[autoML] Starting Exploratory Data Analysis')
             output = data[self.target]
             input = data.drop(self.target, axis=1)
-            self.eda = ExploratoryDataAnalysis(input, output=output)
+            self.eda = ExploratoryDataAnalysis(input, output=output, folder=self.mainDir + 'EDA')
 
     def data_preparation(self, data):
         ''' DEPRECATED '''
@@ -881,7 +881,7 @@ class Pipeline(object):
                         self.mainDir + 'Production/v%i/OScaler.pickle' % self.version)
 
         # Model
-        model = [mod for mod in self.modelling.return_models() if type(mod).__name__ == model][0]
+        model = [mod for mod in self.Modelling.return_models() if type(mod).__name__ == model][0]
         model.set_params(**params)
         model.fit(self.input[self.colKeep[feature_set]], self.output)
         joblib.dump(model, self.mainDir + 'Production/v%i/Model.joblib' % self.version)
@@ -1235,7 +1235,8 @@ class FeatureProcessing(object):
         # Check if not already executed
         if os.path.exists(self.folder + 'BaseScores_v%i.json' % self.version):
             print('[Features] Loading Baseline')
-            return json.load(open(self.folder + 'BaseScores_v%i.json' % self.version, 'r'))
+            self.baseScore = json.load(open(self.folder + 'BaseScores_v%i.json' % self.version, 'r'))
+            return
 
         # Calculate scores
         print('[Features] Calculating baseline feature importance v%i' % self.version)
@@ -1462,7 +1463,7 @@ class FeatureProcessing(object):
 
             # Select
             scores = {k: v - self.baseScore[k[:k.find('__lag__')]] for k, v in sorted(scores.items(),
-                                              lambda k: k[1] - self.baseScore[k[0][:k[0].find('__lag__')]], reverse=True)}
+                                              key=lambda k: k[1] - self.baseScore[k[0][:k[0].find('__lag__')]], reverse=True)}
             items = min(250, sum(v > 0.1 for v in scores.values()))
             self.laggedFeatures = [k for k, v in list(scores.items())[:items] if v > self.baseScore[k[:k.find('__lag__')]]]
             print('[Features] Added %i lagged features' % len(self.laggedFeatures))
@@ -1607,7 +1608,7 @@ class ExploratoryDataAnalysis(object):
             dirs.append(self.folder + 'EDA/Seasonality/' + str(period))
         for dir in dirs:
             try:
-                os.mkdir(self.folder + dir)
+                os.makedirs(self.folder + dir)
                 if dir == 'EDA/Correlation':
                     file = open(self.folder + 'EDA/Correlation/Readme.txt', 'w')
                     edit = file.write(
