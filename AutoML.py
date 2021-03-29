@@ -873,7 +873,7 @@ class Pipeline(object):
                               (self.mainDir[:-1], results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
 
         # Copy Features & Normalization & Norm Features
-        json.dump(self.colKeep[feature_set], open('Production/v%i/Features.json' % self.version, 'w'))
+        json.dump(self.colKeep[feature_set], open(self.mainDir + 'Production/v%i/Features.json' % self.version, 'w'))
         shutil.copy(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version),
                     self.mainDir + 'Production/v%i/Scaler.json' % self.version)
         if self.mode == 'regression':
