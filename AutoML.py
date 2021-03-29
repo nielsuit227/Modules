@@ -62,9 +62,9 @@ class Pipeline(object):
 
                  # Sequencing
                  sequence=False,
-                 back=None,
-                 forward=None,
-                 shift=None,
+                 back=0,
+                 forward=0,
+                 shift=0,
                  diff='none',
 
                  # Initial Modelling
@@ -87,33 +87,15 @@ class Pipeline(object):
         else: self.mainDir = project if project[-1] == '/' else project + '/'
         self.target = re.sub('[^a-z0-9]', '_', target.lower())
 
-        # Load Version
-        self._loadVersion()
-        # Create Directories
-        self._createDirs()
-
         # Checks
         assert mode == 'regression' or mode == 'classification'
         assert isinstance(target, str)
         assert isinstance(project, str)
-        assert isinstance(shift, list)
+        assert isinstance(shift, int)
         assert isinstance(max_diff, int)
         assert max_lags < 50
-        assert info_threshold > 0 and info_threshold < 1
+        assert information_threshold > 0 and information_threshold < 1
         assert max_diff < 5
-        assert max(shift) >= 0 and min(shift) < 50
-
-        # Sub- Classes
-        self.DataProcessing = DataProcessing(target=self.target, num_cols=num_cols, date_cols=date_cols,
-                                             cat_cols=cat_cols, missing_values=missing_values,
-                                             outlier_removal=outlier_removal, z_score_threshold=z_score_threshold,
-                                             folder=self.mainDir + '/Data/', version=self.version)
-        self.FeatureProcessing = FeatureProcessing(max_lags=max_lags, max_diff=max_diff,
-                                                   information_threshold=information_threshold,
-                                                   folder=self.mainDir + '/Features/', version=self.version)
-        self.Sequence = Sequence(back=back, forward=forward, shift=shift, diff=diff)
-        self.Modelling = Modelling(mode=mode, shuffle=shuffle, store_models=store_models,
-                                   store_results=False, folder=self.mainDir + '/Models/')
 
         # Params needed
         self.includeOutput = include_output
@@ -133,6 +115,22 @@ class Pipeline(object):
 
         # Flags
         self._setFlags()
+        # Create Directories
+        self._createDirs()
+        # Load Version
+        self._loadVersion()
+
+        # Sub- Classes
+        self.DataProcessing = DataProcessing(target=self.target, num_cols=num_cols, date_cols=date_cols,
+                                             cat_cols=cat_cols, missing_values=missing_values,
+                                             outlier_removal=outlier_removal, z_score_threshold=z_score_threshold,
+                                             folder=self.mainDir + 'Data/', version=self.version)
+        self.FeatureProcessing = FeatureProcessing(max_lags=max_lags, max_diff=max_diff,
+                                                   information_threshold=information_threshold,
+                                                   folder=self.mainDir + 'Features/', version=self.version)
+        self.Sequence = Sequence(back=back, forward=forward, shift=shift, diff=diff)
+        self.Modelling = Modelling(mode=mode, shuffle=shuffle, store_models=store_models,
+                                   store_results=False, folder=self.mainDir + 'Models/')
 
     def _setFlags(self):
         if self.plotEDA is None:
@@ -143,8 +141,7 @@ class Pipeline(object):
             self.validateResults = self._boolAsk('Validate results?')
 
     def _loadVersion(self):
-        # Sets version
-        columns = os.listdir(self.mainDir + 'Columns/')
+        columns = os.listdir(self.mainDir + 'Sets/')
         if self.version is None:
             if len(columns) == 0:
                 self.version = 0
@@ -156,7 +153,7 @@ class Pipeline(object):
         # Updates changelog
         if self.processData:
             if self.version == 0:
-                file = open(self.mainDir + '/hangelog.txt', 'w')
+                file = open(self.mainDir + 'changelog.txt', 'w')
                 file.write('Dataset changelog. \nv0: Initial')
                 file.close()
             else:
@@ -166,7 +163,7 @@ class Pipeline(object):
                 file.close()
 
     def _createDirs(self):
-        dirs = ['', 'Data/', 'Features', 'Models', 'Production', 'Validation']
+        dirs = ['', 'Data/', 'Features', 'Models', 'Production', 'Validation', 'Sets']
         for dir in dirs:
             try:
                 os.makedirs(self.mainDir + dir)
@@ -262,7 +259,7 @@ class Pipeline(object):
             print('[autoML] Loading data version %i' % self.version)
             self.input = pd.read_csv(self.mainDir + 'Data/Input_v%i.csv' % self.version, index_col='index')
             self.output = pd.read_csv(self.mainDir + 'Data/Output_v%i.csv' % self.version, index_col='index')
-            self.colKeep = json.load(open(self.mainDir + 'Columns/Col_keep_v%i.json' % self.version, 'r'))
+            self.colKeep = json.load(open(self.mainDir + 'Sets/Col_keep_v%i.json' % self.version, 'r'))
             if len(set(self.output[self.target])) == 2:
                 self.classification = True
                 self.regression = False
@@ -364,8 +361,8 @@ class Pipeline(object):
             # Store to self
             print('[autoML] Storing data preparation meta data.')
             for i in range(len(self.datasets)):
-                json.dump(self.col_keep[i], open(self.mainDir + '/Features/features_%i_v%i.json' % (i, self.version), 'w'))
-            json.dump(self.col_keep, open(self.mainDir + '/Columns/Col_keep_v%i.json' % self.version, 'w'))
+                json.dump(self.col_keep[i], open(self.mainDir + 'Features/features_%i_v%i.json' % (i, self.version), 'w'))
+            json.dump(self.col_keep, open(self.mainDir + 'Sets/Col_keep_v%i.json' % self.version, 'w'))
 
     def _dataProcessing(self, data):
         # Load if possible
@@ -665,7 +662,7 @@ class Pipeline(object):
                 gridSearchResults['dataset'] = featureSet
                 gridSearchResults['type'] = 'Hyperparameter Opt'
                 self.results = self.results.append(gridSearchResults)
-                self.results.to_csv(self.mainDir + '/Results.csv', index=False)
+                self.results.to_csv(self.mainDir + 'Results.csv', index=False)
                 params = gridSearchResults.iloc[0]['params']
 
             # Validate
@@ -705,7 +702,7 @@ class Pipeline(object):
     def _validateResult(self, master_model, params, feature_set):
         print('[autoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
                                                 len(self.colKeep[feature_set]), feature_set, params))
-        if not os.path.exists(self.mainDir + 'Validation/'): os.mkdir(self.mainDir + '/Validation/')
+        if not os.path.exists(self.mainDir + 'Validation/'): os.mkdir(self.mainDir + 'Validation/')
 
         # For Regression
         if self.mode == 'regression':
