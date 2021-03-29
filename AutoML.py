@@ -1318,10 +1318,10 @@ class FeatureProcessing(object):
         newFeatures = []
         for k in multiFeatures:
             keyA, keyB = k.split('__x__')
-            newFeatures.append(self.input[[keyA]] * self.input[[keyB]])
+            newFeatures.append(self.input[keyA] * self.input[keyB])
         for k in divFeatures:
             keyA, keyB = k.split('__d__')
-            newFeatures.append(self.input[[keyA]] / self.input[[keyB]])
+            newFeatures.append(self.input[keyA] / self.input[keyB])
 
         # Add new features
         newFeatures = pd.concat(newFeatures, axis=1, ignore_index=True)
