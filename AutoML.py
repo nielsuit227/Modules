@@ -149,14 +149,14 @@ class Pipeline(object):
             self.validateResults = self._boolAsk('Validate results?')
 
     def _loadVersion(self):
-        columns = os.listdir(self.mainDir + 'Sets/')
+        versions = os.listdir(self.mainDir + 'Production')
         if self.version is None:
-            if len(columns) == 0:
+            if len(versions) == 0:
                 self.version = 0
             elif self.processData:
-                self.version = max([int(x[x.find('v') + 1:x.find('.')]) for x in columns]) + 1
+                self.version = int(len(versions))
             else:
-                self.version = max([int(x[x.find('v')+1:x.find('.')]) for x in columns])
+                self.version = int(len(versions)) - 1
 
         # Updates changelog
         if self.processData:
@@ -190,7 +190,7 @@ class Pipeline(object):
 
     def _notification(self, message):
         import requests
-        print(message.replace(self.project, 'autoML'))
+        print(message.replace(self.mainDir[:-1], 'autoML'))
         oAuthToken = 'xoxb-1822915844353-1822989373697-zsFM6CuC6VGTxBjHUcdZHSdJ'
         url = 'https://slack.com/api/chat.postMessage'
         data = {
@@ -202,10 +202,10 @@ class Pipeline(object):
         requests.post(url, data=data)
 
     def _sortResults(self, results):
-        if self.regression:
+        if self.mode == 'regression':
             results['worst_case'] = results['mean_score'] + results['std_score']
             results = results.sort_values('worst_case', ascending=True)
-        elif self.classification:
+        elif self.mode == 'classification':
             results['worst_case'] = results['mean_score'] - results['std_score']
             results = results.sort_values('worst_case', ascending=False)
         return results
@@ -250,7 +250,7 @@ class Pipeline(object):
         self._initialModelling()
         self.gridSearch()
         # Production Env
-        self.prepare_production_files()
+        self._prepareProductionFiles()
         print('[autoML] Done :)')
 
     def _eda(self, data):
@@ -417,7 +417,7 @@ class Pipeline(object):
         # Run Modelling
         else:
             init = []
-            for set, cols in enumerate(self.colKeep):
+            for set, cols in self.colKeep.items():
                 # Skip empty sets
                 if len(cols) == 0:
                     print('[autoML] Skipping %s features, empty set' % set)
@@ -426,7 +426,8 @@ class Pipeline(object):
 
                     # Apply Feature Set
                     self.Modelling.dataset = set
-                    input, output = self.input.reindex(columns=cols), self.output.loc[:, self.target]
+                    # input, output = self.input.reindex(columns=cols), self.output.loc[:, self.target]
+                    input, output = self.input[cols], self.output
 
                     # Normalize Feature Set (Done here to get one normalization file per feature set)
                     normalizeFeatures = [k for k in input.keys() if k not in self.dateCols + self.catCols]
@@ -443,8 +444,7 @@ class Pipeline(object):
                         input, output = self.Sequence.convert(input, output)
 
                     # Do the modelling
-                    results = self.modelling.fit(self.input.reindex(columns=cols),
-                                                                self.output.loc[:, self.target])
+                    results = self.Modelling.fit(input, output)
 
                     # Add results to memory
                     results['type'] = 'Initial modelling'
@@ -489,7 +489,7 @@ class Pipeline(object):
             }
 
         # Regressor specific hyperparameters
-        elif self.regression:
+        elif self.mode == 'regression':
             if isinstance(model, sklearn.linear_model.SGDRegressor):
                 return {
                     'loss': ['squared_loss', 'huber', 'epsilon_insensitive', 'squared_epsilon_insensitive'],
@@ -538,7 +538,7 @@ class Pipeline(object):
                 }
 
         # Classification specific hyperparameters
-        elif self.classification:
+        elif self.mode == 'classification':
             if isinstance(model, sklearn.linear_model.SGDClassifier):
                 return {
                     'loss': ['hinge', 'log', 'modified_huber', 'squared_hinge'],
@@ -655,7 +655,7 @@ class Pipeline(object):
         )])
         for iteration in range(self.gridSearchIterations):
             # Grab settings
-            settings = result.iloc[iteration]
+            settings = results.iloc[iteration]
             model = models[[i for i in range(len(models)) if type(models[i]).__name__ == settings['model']][0]]
             featureSet = settings['dataset']
 
@@ -694,7 +694,7 @@ class Pipeline(object):
         INTERNAL | Grid search for defined model, parameter set and feature set.
         """
         print('\n[autoML] Starting Hyperparameter Optimization for %s on %s features (%i samples, %i features)' %
-              (type(model).__name__, feature_set, len(input), len(self.colKeep[feature_set])))
+              (type(model).__name__, feature_set, len(self.input), len(self.colKeep[feature_set])))
 
         # Select data
         input = self.input[self.colKeep[feature_set]]
@@ -846,11 +846,13 @@ class Pipeline(object):
             fig.savefig(self.mainDir + 'Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
 
     def _prepareProductionFiles(self, model=None, feature_set=None):
+        if not os.path.exists(self.mainDir + 'Production/v%i/' % self.version):
+            os.mkdir(self.mainDir + 'Production/v%i/' % self.version)
         # Get sorted results for this data version
         results = self._sortResults(self.results[self.results['data_version'] == self.version])
 
         # In the case args are provided
-        if file is not None:
+        if model is not None and feature_set is not None:
             results = self._sortResults(results[np.logical_and(results['model'] == model, results['dataset'] == feature_set)])
             params = self._parseJson(results.iloc[0]['params'])
 
@@ -861,30 +863,28 @@ class Pipeline(object):
             params = results.iloc[0]['params']
             if isinstance(params, str):
                 params = self._parseJson(params)
-        self.notification('[%s] Preparing Production Env Files for %s, feature set %s' %
-                          (self.project, model, feature_set))
-        if self.classification:
-            self.notification('[%s] Accuracy: %.2f \u00B1 %.2f' %
-                              (self.project, results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
-        elif self.regression:
-            self.notification('[%s] Mean Absolute Error: %.2f \u00B1 %.2f' %
-                              (self.project, results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
+        self._notification('[%s] Preparing Production Env Files for %s, feature set %s' %
+                          (self.mainDir[:-1], model, feature_set))
+        if self.mode == 'classification':
+            self._notification('[%s] Accuracy: %.2f \u00B1 %.2f' %
+                              (self.mainDir[:-1], results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
+        elif self.mode == 'regression':
+            self._notification('[%s] Mean Absolute Error: %.2f \u00B1 %.2f' %
+                              (self.mainDir[:-1], results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
 
         # Copy Features & Normalization & Norm Features
-        shutil.copy(self.mainDir + 'Features/features_%i_v%i.json' % (feature_set, self.version),
-                    self.mainDir + 'Production/v%i/features.json' % self.version)
-        # todo update scaler so that it only takes the features as defined here
-        shutil.copy(self.mainDir + 'Normalization/Normalization_v%i.pickle' % self.version,
-                    self.mainDir + 'Production/v%i/normalization.pickle' % self.version)
-        if self.regression:
-            shutil.copy(self.mainDir + 'Normalization/Output_norm_v%i.pickle' % self.version,
-                        self.mainDir + 'Production/v%i/output_norm.pickle' % self.version)
+        json.dump(self.colKeep[feature_set], open('Production/v%i/Features.json' % self.version, 'w'))
+        shutil.copy(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version),
+                    self.mainDir + 'Production/v%i/Scaler.json' % self.version)
+        if self.mode == 'regression':
+            shutil.copy(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version),
+                        self.mainDir + 'Production/v%i/OScaler.pickle' % self.version)
 
         # Model
         model = [mod for mod in self.modelling.return_models() if type(mod).__name__ == model][0]
         model.set_params(**params)
         model.fit(self.input[self.colKeep[feature_set]], self.output)
-        joblib.dump(model, self.mainDir + 'Production/v%i/model.joblib' % self.version)
+        joblib.dump(model, self.mainDir + 'Production/v%i/Model.joblib' % self.version)
 
         # Predict function
         f = open(self.mainDir + 'Production/Predict.py', 'w')
@@ -1800,27 +1800,27 @@ class Modelling(object):
         self.plot = plot
         self.acc = []
         self.std = []
-        self.n_splits = n_splits
+        self.nSplits = n_splits
         self.dataset = str(dataset)
         self.store_results = store_results
         self.store_models = store_models
         self.folder = folder if folder[-1] == '/' else folder + '/'
 
     def fit(self, input, output):
-        if mode == 'regression':
+        if self.mode == 'regression':
             from sklearn.model_selection import KFold
-            cv = KFold(n_splits=self.n_splits, shuffle=self.shuffle)
+            cv = KFold(n_splits=self.nSplits, shuffle=self.shuffle)
             return self._fit(input, output, cv, Metrics.mae)
-        if mode == 'classification':
+        if self.mode == 'classification':
             from sklearn.model_selection import StratifiedKFold
-            cv = StratifiedKFold(n_splits=self.n_splits, shuffle=self.shuffle)
+            cv = StratifiedKFold(n_splits=self.nSplits, shuffle=self.shuffle)
             return self._fit(input, output, cv, Metrics.acc)
 
     def return_models(self):
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
         from sklearn.experimental import enable_hist_gradient_boosting
         import catboost
-        if mode == 'classification':
+        if self.mode == 'classification':
             ridge = linear_model.RidgeClassifier()
             lasso = linear_model.Lasso()
             sgd = linear_model.SGDClassifier()
@@ -1835,7 +1835,7 @@ class Modelling(object):
             rfc = ensemble.RandomForestClassifier()
             mlp = neural_network.MLPClassifier()
             return [ridge, lasso, sgd, svc, knc, dtc, ada, cat, bag, gbc, hgbc, mlp]
-        elif mode == 'regression':
+        elif self.mode == 'regression':
             ridge = linear_model.Ridge()
             lasso = linear_model.Lasso()
             sgd = linear_model.SGDRegressor()
