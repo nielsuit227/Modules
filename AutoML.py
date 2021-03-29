@@ -76,7 +76,7 @@ class Pipeline(object):
                  grid_search_iterations=3,
 
                  # Flags
-                 plot_eda=False,
+                 plot_eda=None,
                  process_data=None,
                  validate_result=None):
         # Starting
@@ -87,8 +87,6 @@ class Pipeline(object):
         else: self.mainDir = project if project[-1] == '/' else project + '/'
         self.target = re.sub('[^a-z0-9]', '_', target.lower())
 
-        # Flags
-        self._setFlags()
         # Load Version
         self._loadVersion()
         # Create Directories
@@ -133,6 +131,9 @@ class Pipeline(object):
         self.colKeep = None
         self.results = None
 
+        # Flags
+        self._setFlags()
+
     def _setFlags(self):
         if self.plotEDA is None:
             self.plotEDA = self._boolAsk('Make all EDA graphs?')
@@ -143,7 +144,7 @@ class Pipeline(object):
 
     def _loadVersion(self):
         # Sets version
-        columns = os.listdir(self.mainDir + '/Columns/')
+        columns = os.listdir(self.mainDir + 'Columns/')
         if self.version is None:
             if len(columns) == 0:
                 self.version = 0
@@ -155,17 +156,17 @@ class Pipeline(object):
         # Updates changelog
         if self.processData:
             if self.version == 0:
-                file = open(self.mainDir + '/changelog.txt', 'w')
+                file = open(self.mainDir + '/hangelog.txt', 'w')
                 file.write('Dataset changelog. \nv0: Initial')
                 file.close()
             else:
                 changelog = input("Data changelog v%i")
-                file = open(self.mainDir + '/changelog.txt', 'a')
+                file = open(self.mainDir + 'changelog.txt', 'a')
                 file.write(('\nv%i: ' % self.version) + changelog)
                 file.close()
 
     def _createDirs(self):
-        dirs = ['/', '/Data/', '/Features/', '/Models/', '/Production/']
+        dirs = ['', 'Data/', 'Features', 'Models', 'Production', 'Validation']
         for dir in dirs:
             try:
                 os.makedirs(self.mainDir + dir)
@@ -259,9 +260,9 @@ class Pipeline(object):
         # Load
         if not self.prep_data and len(columns) != 0:
             print('[autoML] Loading data version %i' % self.version)
-            self.input = pd.read_csv(self.mainDir + '/Data/Input_v%i.csv' % self.version, index_col='index')
-            self.output = pd.read_csv(self.mainDir + '/Data/Output_v%i.csv' % self.version, index_col='index')
-            self.col_keep = json.load(open(self.mainDir + '/Columns/Col_keep_v%i.json' % self.version, 'r'))
+            self.input = pd.read_csv(self.mainDir + 'Data/Input_v%i.csv' % self.version, index_col='index')
+            self.output = pd.read_csv(self.mainDir + 'Data/Output_v%i.csv' % self.version, index_col='index')
+            self.colKeep = json.load(open(self.mainDir + 'Columns/Col_keep_v%i.json' % self.version, 'r'))
             if len(set(self.output[self.target])) == 2:
                 self.classification = True
                 self.regression = False
@@ -270,7 +271,6 @@ class Pipeline(object):
             # Clean
             self.prep = Preprocessing(missingValues=self.missing_values)
             data = self.prep.clean(data)
-            pickle.dump(self.prep, open(self.mainDir + '/Data/Preprocessing.pickle', 'wb'))
 
             # Split data
             self.output = data[self.target]
@@ -324,7 +324,7 @@ class Pipeline(object):
 
             # Keep all
             print('[autoML] Storing input/output')
-            self.col_keep = [self.input.keys().to_list()]
+            self.colKeep = [self.input.keys().to_list()]
             self.input.to_csv(self.mainDir + '/Data/Input_v%i.csv' % self.version, index_label='index')
             self.output.to_csv(self.mainDir + '/Data/Output_v%i.csv' % self.version, index_label='index')
 
@@ -333,7 +333,7 @@ class Pipeline(object):
             data = self.input.copy()
             data['target'] = self.output.copy()
             pp_score = pps.predictors(data, "target")
-            self.col_keep.append(pp_score['x'][pp_score['ppscore'] != 0].to_list())
+            self.colKeep.append(pp_score['x'][pp_score['ppscore'] != 0].to_list())
 
             # Keep based on RF
             print('[autoML] Determining Features with RF')
@@ -369,8 +369,8 @@ class Pipeline(object):
 
     def _dataProcessing(self, data):
         # Load if possible
-        if not self.processData and os.path.exists(self.mainDir + '/Data/Cleaned_v%i.csv' % self.version):
-            data = pd.read_csv(self.mainDir + '/Data/Cleaned_v%i.csv' % self.version, index_col='index')
+        if not self.processData and os.path.exists(self.mainDir + 'Data/Cleaned_v%i.csv' % self.version):
+            data = pd.read_csv(self.mainDir + 'Data/Cleaned_v%i.csv' % self.version, index_col='index')
 
         # Clean
         else:
@@ -384,9 +384,9 @@ class Pipeline(object):
 
     def _featureProcessing(self):
         # Load if possible
-        if not self.processData and os.path.exists(self.mainDir + '/Data/Extracted_v%i.csv' % self.version):
-            self.input = pd.read_csv(self.mainDir + '/Data/Extracted_v%i.csv' % self.version, index_col='index')
-            self.colKeep = json.load(open(self.mainDir + '/Features/Sets_v%i.json' % self.version, 'r'))
+        if not self.processData and os.path.exists(self.mainDir + 'Data/Extracted_v%i.csv' % self.version):
+            self.input = pd.read_csv(self.mainDir + 'Data/Extracted_v%i.csv' % self.version, index_col='index')
+            self.colKeep = json.load(open(self.mainDir + 'Features/Sets_v%i.json' % self.version, 'r'))
 
         else:
             # Extract
@@ -394,13 +394,13 @@ class Pipeline(object):
             # Select
             self.colKeep = self.FeatureProcessing.select(self.input, self.output)
             # Store
-            self.input.to_csv(self.mainDir + '/Data/Extracted_v%i.csv' % self.version)
-            json.dump(self.colKeep, open(self.mainDir + '/Features/Sets_v%i.json' % self.version, 'w'))
+            self.input.to_csv(self.mainDir + 'Data/Extracted_v%i.csv' % self.version)
+            json.dump(self.colKeep, open(self.mainDir + 'Features/Sets_v%i.json' % self.version, 'w'))
 
     def _initialModelling(self):
         # Load existing results
         if 'Results.csv' in os.listdir(self.mainDir):
-            self.results = pd.read_csv(self.mainDir + '/Results.csv')
+            self.results = pd.read_csv(self.mainDir + 'Results.csv')
 
         # Check if this version has been modelled
         if self.results is not None and \
@@ -438,7 +438,7 @@ class Pipeline(object):
                         self.results = self.results.append(results)
 
             # Save results
-            self.results.to_csv(self.mainDir + '/Results.csv', index=False)
+            self.results.to_csv(self.mainDir + 'Results.csv', index=False)
 
     def _getHyperParams(self, model):
         # Parameters for both Regression / Classification
@@ -595,24 +595,34 @@ class Pipeline(object):
         # If arguments are provided
         if model is not None:
 
-            # Check if already completed
+            # Organise existing results
             results = self.results[np.logical_and(
                 self.results['model'] == type(model).__name__,
                 self.results['data_version'] == self.version,
             )]
             results = self._sortResults(results[results['dataset'] == feature_set])
+
+            # Check if exists and load
             if ('Hyperparameter Opt' == results['type']).any():
                 hyperOptResults = results[results['type'] == 'Hyperparameter Opt']
                 params = self._parseJson(hyperOptResults.iloc[0]['params'])
-            else:
 
+            # Or run
+            else:
                 # Parameter check
                 if params is None:
                     params = self._getHyperParams(model)
 
                 # Run Grid Search
                 results = self._sortResults(self._gridSearchIteration(model, params, feature_set))
-                results.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
+
+                # Store results
+                results['model'] = type(model).__name__
+                results['data_version'] = self.version
+                results['dataset'] = featureSet
+                results['type'] = 'Hyperparameter Opt'
+                self.results.append(results)
+                results.to_csv(self.mainDir + 'Hyperparameter Opt/%s_%s.csv' %
                                (type(model).__name__, feature_set), index_label='index')
                 params = results.iloc[0]['params']
 
@@ -626,7 +636,6 @@ class Pipeline(object):
             self.results['type'] == 'Initial modelling',
             self.results['data_version'] == self.version,
         )])
-
         for iteration in range(self.gridSearchIterations):
             # Grab settings
             settings = result.iloc[iteration]
@@ -696,7 +705,7 @@ class Pipeline(object):
     def _validateResult(self, master_model, params, feature_set):
         print('[autoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
                                                 len(self.colKeep[feature_set]), feature_set, params))
-        if not os.path.exists(self.mainDir + '/Validation/'): os.mkdir(self.mainDir + '/Validation/')
+        if not os.path.exists(self.mainDir + 'Validation/'): os.mkdir(self.mainDir + '/Validation/')
 
         # For Regression
         if self.mode == 'regression':
@@ -809,7 +818,7 @@ class Pipeline(object):
             ax.set(xlim=[-0.05, 1.05], ylim=[-0.05, 1.05],
                    title="ROC Curve - %s" % type(master_model).__name__)
             ax.legend(loc="lower right")
-            fig.savefig(self.mainDir + '/Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
+            fig.savefig(self.mainDir + 'Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
 
     def _prepareProductionFiles(self, model=None, feature_set=None):
         # Get sorted results for this data version
@@ -837,28 +846,28 @@ class Pipeline(object):
                               (self.project, results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
 
         # Copy Features & Normalization & Norm Features
-        shutil.copy(self.mainDir + '/Features/features_%i_v%i.json' % (feature_set, self.version),
-                    self.mainDir + '/Production/v%i/features.json' % self.version)
+        shutil.copy(self.mainDir + 'Features/features_%i_v%i.json' % (feature_set, self.version),
+                    self.mainDir + 'Production/v%i/features.json' % self.version)
         # todo update scaler so that it only takes the features as defined here
-        shutil.copy(self.mainDir + '/Normalization/Normalization_v%i.pickle' % self.version,
-                    self.mainDir + '/Production/v%i/normalization.pickle' % self.version)
+        shutil.copy(self.mainDir + 'Normalization/Normalization_v%i.pickle' % self.version,
+                    self.mainDir + 'Production/v%i/normalization.pickle' % self.version)
         if self.regression:
-            shutil.copy(self.mainDir + '/Normalization/Output_norm_v%i.pickle' % self.version,
-                        self.mainDir + '/Production/v%i/output_norm.pickle' % self.version)
+            shutil.copy(self.mainDir + 'Normalization/Output_norm_v%i.pickle' % self.version,
+                        self.mainDir + 'Production/v%i/output_norm.pickle' % self.version)
 
         # Model
         model = [mod for mod in self.modelling.return_models() if type(mod).__name__ == model][0]
         model.set_params(**params)
         model.fit(self.input[self.colKeep[feature_set]], self.output)
-        joblib.dump(model, self.mainDir + '/Production/v%i/model.joblib' % self.version)
+        joblib.dump(model, self.mainDir + 'Production/v%i/model.joblib' % self.version)
 
         # Predict function
-        f = open(self.mainDir + '/Production/Predict.py', 'w')
+        f = open(self.mainDir + 'Production/Predict.py', 'w')
         f.write(self.returnPredictFunc())
         f.close()
         
         # Pipeline
-        pickle.dump(self, open(self.mainDir + '/Production/Pipeline.pickle', 'wb'))
+        pickle.dump(self, open(self.mainDir + 'Production/Pipeline.pickle', 'wb'))
         return
 
     def predict(self, model, features, scaler, sample):
