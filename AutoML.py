@@ -1189,14 +1189,6 @@ class FeatureProcessing(object):
         laggedFeatureScores = self._addLaggedFeatures()
         return self.input
 
-    def select(self, inputFrame, outputFrame):
-        self._cleanAndSet(inputFrame, outputFrame)
-        # Make different selectors
-        pps = self._predictivePowerScore()
-        rft, rfi = self._randomForestImportance()
-        bp = self._borutaPy()
-        return {'PPS': pps, 'RFT': rft, 'RFI': rfi, 'BP': bp}
-
     def _cleanAndSet(self, inputFrame, outputFrame):
         assert isinstance(inputFrame, pd.DataFrame), 'Input supports only Pandas DataFrame'
         assert isinstance(outputFrame, pd.Series), 'Output supports only Pandas Series'
@@ -1212,7 +1204,13 @@ class FeatureProcessing(object):
         '''
         Calculates baseline for correlation, method same for all functions.
         '''
+        # Check if not already executed
+        if os.path.exists(self.folder + 'BaseScores_v%i.json' % self.version):
+            print('[Features] Loading Baseline')
+            return json.load(open(self.folder + 'BaseScores_v%i.json' % self.version, 'r'))
+
         # Calculate scores
+        print('[Features] Calculating baseline feature importance v%i' % self.version)
         for key in self.input.keys():
             m = copy.copy(self.model)
             m.fit(self.input[[key]], self.output)
@@ -1220,60 +1218,36 @@ class FeatureProcessing(object):
         json.dump(self.baseScore, open(self.folder + 'BaseScores.json', 'w'))
         return {k: v for k, v in sorted(self.baseScore.items(), key=lambda item: item[1], reverse=True)}
 
-    def _predictivePowerScore(self):
-        print('[features] Determining Features with PPS')
-        data = self.input.copy()
-        data['target'] = self.output.copy()
-        pp_score = pps.predictors(data, "target")
-        pp_cols = pp_score['x'][pp_score['ppscore'] != 0].to_list()
-        print('[features] Selected %i features with Predictive Power Score' % len(pp_cols))
-        return pp_cols
-
-    def _randomForestImportance(self):
-        print('[features] Determining Features with RF')
-        if self.mode == 'r':
-            rf = RandomForestRegressor().fit(self.input, self.output[self.target])
-        elif self.mode == 'c':
-            rf = RandomForestClassifier().fit(self.input, self.output[self.target])
-        fi = rf.feature_importances_
-        sfi = fi.sum()
-        ind = np.flip(np.argsort(fi))
-        # Info Threshold
-        ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.info_threshold * sfi]
-        thresholded = self.input.keys()[ind_keep].to_list()
-        ind_keep = [ind[i] for i in range(len(ind)) if fi[i] > sfi / 100]
-        increment = self.input.keys()[ind_keep].to_list()
-        print('[features] Selected %i features with RF thresholded' % len(thresholded))
-        print('[features] Selected %i features with RF increment' % len(increment))
-        return thresholded, increment
-
-    def _borutaPy(self):
-        print('[features] Determining Features with Boruta')
-        if self.regression:
-            rf = RandomForestRegressor()
-        elif self.classification:
-            rf = RandomForestClassifier()
-        selector = BorutaPy(rf, n_estimators='auto', verbose=0)
-        selector.fit(self.input.to_numpy(), self.output.to_numpy())
-        bp_cols = self.input.keys()[selector.support_].to_list()
-        print('[features] Selected %i features with Boruta' % len(bp_cols))
-        return bp_cols
-
     def _removeColinearity(self):
-        nk = len(self.input.keys())
-        norm = (self.input - self.input.mean(skipna=True, numeric_only=True)).to_numpy()
-        ss = np.sqrt(np.sum(norm ** 2, axis=0))
-        corr_mat = np.zeros((nk, nk))
-        for i in range(nk):
-            for j in range(nk):
-                if i == j:
-                    continue
-                if corr_mat[i, j] == 0:
-                    c = abs(np.sum(norm[:, i] * norm[:, j]) / (ss[i] * ss[j]))
-                    corr_mat[i, j] = c
-                    corr_mat[j, i] = c
-        upper = np.triu(corr_mat)
-        self.colinearFeatures = self.input.keys()[np.sum(upper > self.informationThreshold, axis=0) > 0].to_list()
+        '''
+        Calculates the Pearson Correlation Coefficient for all input features.
+        Those higher than the information threshold are linearly codependent (i.e., describable by y = a x + b)
+        These features add little to no information and are therefore removed.
+        '''
+        # Check if not already executed
+        if os.path.exists(self.folder + 'Colinear_v%i.json' % self.version):
+            print('[Features] Loading Colinear features')
+            self.colinearFeatures = json.load(open(self.folder + 'Colinear_v%i.json' % self.version, 'r'))
+
+        # Else run
+        else:
+            nk = len(self.input.keys())
+            norm = (self.input - self.input.mean(skipna=True, numeric_only=True)).to_numpy()
+            ss = np.sqrt(np.sum(norm ** 2, axis=0))
+            corr_mat = np.zeros((nk, nk))
+            for i in range(nk):
+                for j in range(nk):
+                    if i == j:
+                        continue
+                    if corr_mat[i, j] == 0:
+                        c = abs(np.sum(norm[:, i] * norm[:, j]) / (ss[i] * ss[j]))
+                        corr_mat[i, j] = c
+                        corr_mat[j, i] = c
+            upper = np.triu(corr_mat)
+            self.colinearFeatures = self.input.keys()[np.sum(upper > self.informationThreshold, axis=0) > 0].to_list()
+
+        # Save & Store
+        json.dump(self.colinearFeatures, open(self.folder + 'Colinear_v%i.json' % self.version, 'w'))
         self.input = self.input.drop(self.colinearFeatures, axis=1)
         print('[Features] Removed %i Co-Linear features (%.3f %% threshold)' % (len(self.colinearFeatures), self.informationThreshold))
         return col_drop
@@ -1281,40 +1255,49 @@ class FeatureProcessing(object):
     def _addCrossFeatures(self):
         '''
         Calculates cross-feature features with m and multiplication.
+        Should be limited to say ~500.000 features (runs about 100-150 features / second)
         '''
-        # Make division todo List
-        keys = self.input.keys()
-        divList = []
-        for key in keys:
-            divList += [(key, k) for k in keys if k != key]
+        # Check if not already executed
+        if os.path.exists(self.folder + 'crossFeatures_v%i.json' % self.version):
+            self.crossFeatures = json.load(open(self.folder + 'crossFeatures_v%i.json' % self.version, 'r'))
 
-        # Make multiplication todo list
-        multiList = []
-        for i, keyA in enumerate(keys):
-            for j, keyB in enumerate(keys):
-                if j >= i:
-                    continue
-                multiList.append((keyA, keyB))
+        # Else, execute
+        else:
+            # Make division todo List
+            keys = self.input.keys()
+            divList = []
+            for key in keys:
+                divList += [(key, k) for k in keys if k != key]
 
-        # Analyse scores
-        scores = {}
-        for keyA, keyB in tqdm(divList):
-            feature = self.input[[keyA]] / self.input[[keyB]]
-            feature = (feature - feature.mean()) / feature.std()
-            feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
-            m = copy.copy(self.model)
-            m.fit(feature, self.output)
-            scores[keyA + '__d__' + keyB] = m.score(feature, self.output)
-        for keyA, keyB in tqdm(multiList):
-            feature = self.input[[keyA]] * self.input[[keyB]]
-            feature = (feature - feature.mean()) / feature.std()
-            feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
-            m = copy.copy(self.model)
-            m.fit(feature, self.output)
-            scores[keyA + '__x__' + keyB] = m.score(feature, self.output)
+            # Make multiplication todo list
+            multiList = []
+            for i, keyA in enumerate(keys):
+                for j, keyB in enumerate(keys):
+                    if j >= i:
+                        continue
+                    multiList.append((keyA, keyB))
 
-        # Select valuable features
-        self.crossFeatures = [k for k, v in scores.items() if v > 0.1]
+            # Analyse scores
+            scores = {}
+            for keyA, keyB in tqdm(divList):
+                feature = self.input[[keyA]] / self.input[[keyB]]
+                feature = (feature - feature.mean()) / feature.std()
+                feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
+                m = copy.copy(self.model)
+                m.fit(feature, self.output)
+                scores[keyA + '__d__' + keyB] = m.score(feature, self.output)
+            for keyA, keyB in tqdm(multiList):
+                feature = self.input[[keyA]] * self.input[[keyB]]
+                feature = (feature - feature.mean()) / feature.std()
+                feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
+                m = copy.copy(self.model)
+                m.fit(feature, self.output)
+                scores[keyA + '__x__' + keyB] = m.score(feature, self.output)
+
+            # Select valuable features
+            self.crossFeatures = [k for k, v in scores.items() if v > 0.1]
+
+        # Split and remove
         multiFeatures = [k for k in self.crossFeatures if '__x__' in k]
         divFeatures = [k for k in self.crossFeatures if '__d__' in k]
         newFeatures = []
@@ -1324,6 +1307,7 @@ class FeatureProcessing(object):
         for k in divFeatures:
             keyA, keyB = k.split('__d__')
             newFeatures.append(self.input[[keyA]] / self.input[[keyB]])
+        newFeatures = pd.DataFrame(newFeatures)
 
         # Process and add new features
         scaler = StandardScaler()
@@ -1331,8 +1315,8 @@ class FeatureProcessing(object):
         self.input[newFeatures.keys()] = newFeatures
 
         # Store
-        pickle.dump(scaler, open(self.folder + 'crossFeatureNorm.pickle', 'wb'))
-        json.dump(self.crossFeatures, open(self.folder + 'crossFeatures.json', 'w'))
+        pickle.dump(scaler, open(self.folder + 'crossFeatureNorm_v%i.pickle' % self.version, 'wb'))
+        json.dump(self.crossFeatures, open(self.folder + 'crossFeatures_v%i.json' % self.version, 'w'))
         print('[Features] Added %i cross features' % len(self.crossFeatures))
         return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
 
@@ -1412,6 +1396,55 @@ class FeatureProcessing(object):
         json.dump(self.laggedFeatures, open(self.folder + 'crossFeatures.json', 'w'))
         print('[Features] Added %i lagged features' % len(self.laggedFeatures))
         return {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+
+
+    def select(self, inputFrame, outputFrame):
+        self._cleanAndSet(inputFrame, outputFrame)
+        # Make different selectors
+        pps = self._predictivePowerScore()
+        rft, rfi = self._randomForestImportance()
+        bp = self._borutaPy()
+        return {'PPS': pps, 'RFT': rft, 'RFI': rfi, 'BP': bp}
+
+    def _predictivePowerScore(self):
+        print('[features] Determining Features with PPS')
+        data = self.input.copy()
+        data['target'] = self.output.copy()
+        pp_score = pps.predictors(data, "target")
+        pp_cols = pp_score['x'][pp_score['ppscore'] != 0].to_list()
+        print('[features] Selected %i features with Predictive Power Score' % len(pp_cols))
+        return pp_cols
+
+    def _randomForestImportance(self):
+        print('[features] Determining Features with RF')
+        if self.mode == 'r':
+            rf = RandomForestRegressor().fit(self.input, self.output[self.target])
+        elif self.mode == 'c':
+            rf = RandomForestClassifier().fit(self.input, self.output[self.target])
+        fi = rf.feature_importances_
+        sfi = fi.sum()
+        ind = np.flip(np.argsort(fi))
+        # Info Threshold
+        ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.info_threshold * sfi]
+        thresholded = self.input.keys()[ind_keep].to_list()
+        ind_keep = [ind[i] for i in range(len(ind)) if fi[i] > sfi / 100]
+        increment = self.input.keys()[ind_keep].to_list()
+        print('[features] Selected %i features with RF thresholded' % len(thresholded))
+        print('[features] Selected %i features with RF increment' % len(increment))
+        return thresholded, increment
+
+    def _borutaPy(self):
+        print('[features] Determining Features with Boruta')
+        if self.regression:
+            rf = RandomForestRegressor()
+        elif self.classification:
+            rf = RandomForestClassifier()
+        selector = BorutaPy(rf, n_estimators='auto', verbose=0)
+        selector.fit(self.input.to_numpy(), self.output.to_numpy())
+        bp_cols = self.input.keys()[selector.support_].to_list()
+        print('[features] Selected %i features with Boruta' % len(bp_cols))
+        return bp_cols
+
 
 class Normalize(object):
 
