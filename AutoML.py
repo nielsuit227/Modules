@@ -1051,7 +1051,7 @@ class DataProcessing(object):
         data = self._removeOutliers(data)
         data = self._removeMissingValues(data)
         data = self._removeConstants(data)
-        data = self._normalize(data)
+        # data = self._normalize(data) --> [Deprecated] Moved right before modelling
 
         # Finish
         self._store(data)
@@ -1284,14 +1284,12 @@ class FeatureProcessing(object):
             scores = {}
             for keyA, keyB in tqdm(divList):
                 feature = self.input[[keyA]] / self.input[[keyB]]
-                feature = (feature - feature.mean()) / feature.std()
                 feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
                 m = copy.copy(self.model)
                 m.fit(feature, self.output)
                 scores[keyA + '__d__' + keyB] = m.score(feature, self.output)
             for keyA, keyB in tqdm(multiList):
                 feature = self.input[[keyA]] * self.input[[keyB]]
-                feature = (feature - feature.mean()) / feature.std()
                 feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
                 m = copy.copy(self.model)
                 m.fit(feature, self.output)
@@ -1310,15 +1308,12 @@ class FeatureProcessing(object):
         for k in divFeatures:
             keyA, keyB = k.split('__d__')
             newFeatures.append(self.input[[keyA]] / self.input[[keyB]])
-        newFeatures = pd.concat(newFeatures, axis=1, ignore_index=True)
 
-        # Process and add new features
-        scaler = StandardScaler()
-        newFeatures = scaler.fit_transform(newFeatures)
+        # Add new features
+        newFeatures = pd.concat(newFeatures, axis=1, ignore_index=True)
         self.input[newFeatures.keys()] = newFeatures
 
         # Store
-        pickle.dump(scaler, open(self.folder + 'crossFeatureNorm_v%i.pickle' % self.version, 'wb'))
         json.dump(self.crossFeatures, open(self.folder + 'crossFeatures_v%i.json' % self.version, 'w'))
         print('[Features] Added %i cross features' % len(self.crossFeatures))
 
@@ -1455,6 +1450,10 @@ class FeatureProcessing(object):
         return {'PPS': pps, 'RFT': rft, 'RFI': rfi, 'BP': bp}
 
     def _predictivePowerScore(self):
+        '''
+        Calculates the Predictive Power Score (https://github.com/8080labs/ppscore)
+        Assymmetric correlation based on
+        '''
         print('[features] Determining Features with PPS')
         data = self.input.copy()
         data['target'] = self.output.copy()
