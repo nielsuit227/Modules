@@ -47,9 +47,9 @@ class Pipeline(object):
                  mode='regression',
 
                  # Data Processing
-                 num_cols=None,
-                 date_cols=None,
-                 cat_cols=None,
+                 num_cols=[],
+                 date_cols=[],
+                 cat_cols=[],
                  missing_values='interpolate',
                  outlier_removal='none',
                  z_score_threshold=4,
@@ -91,6 +91,9 @@ class Pipeline(object):
         assert mode == 'regression' or mode == 'classification'
         assert isinstance(target, str)
         assert isinstance(project, str)
+        assert isinstance(num_cols, list)
+        assert isinstance(date_cols, list)
+        assert isinstance(cat_cols, list)
         assert isinstance(shift, int)
         assert isinstance(max_diff, int)
         assert max_lags < 50
@@ -98,6 +101,9 @@ class Pipeline(object):
         assert max_diff < 5
 
         # Params needed
+        self.numCols = num_cols
+        self.dateCols = date_cols
+        self.catCols = cat_cols
         self.includeOutput = include_output
         self.shuffle = shuffle
         self.nSplits = n_splits
@@ -164,7 +170,7 @@ class Pipeline(object):
                 file.close()
 
     def _createDirs(self):
-        dirs = ['', 'Data/', 'Features', 'Models', 'Production', 'Validation', 'Sets']
+        dirs = ['', 'Data', 'Features', 'Models', 'Production', 'Validation', 'Sets']
         for dir in dirs:
             try:
                 os.makedirs(self.mainDir + dir)
@@ -240,6 +246,7 @@ class Pipeline(object):
         self._eda(data)
         self._dataProcessing(data)
         self._featureProcessing()
+        self._normalizing()
         self._initialModelling()
         self.gridSearch()
         # Production Env
@@ -420,6 +427,13 @@ class Pipeline(object):
                     # Apply Feature Set
                     self.Modelling.dataset = set
                     input, output = self.input.reindex(columns=cols), self.output.loc[:, self.target]
+
+                    # Normalize Feature Set (Done here to get one normalization file per feature set)
+                    normalizeFeatures = [k for k in input.keys() if k not in self.dateCols + self.catCols]
+                    scaler = StandardScaler()
+                    input[input.keys()] = scaler.fit_transform(input)
+                    pickle.dump(scaler, open(self.mainDir + 'Features/%s_%i.pickle' % (set, self.version), 'wb'))
+
 
                     # Sequence if necessary
                     if self.sequence:
@@ -1351,7 +1365,7 @@ class FeatureProcessing(object):
 
             # Analyse correlation
             scores = {}
-            for key in distances.keys():
+            for key in tqdm(distances.keys()):
                 m = copy.copy(self.model)
                 m.fit(distances[[key]], self.output)
                 scores[key] = m.score(distances[[key]], self.output)
@@ -1386,7 +1400,7 @@ class FeatureProcessing(object):
 
             # Calculate scores
             scores = {}
-            for diff in range(1, self.maxDiff+1):
+            for diff in tqdm(range(1, self.maxDiff+1)):
                 diffInput = diffInput.diff().fillna(0)
                 for key in keys:
                     m = copy.copy(self.model)
@@ -1424,7 +1438,7 @@ class FeatureProcessing(object):
             print('[Features] Analysing lagged features')
             keys = self.input.keys()
             scores = {}
-            for lag in range(1, self.maxLags):
+            for lag in tqdm(range(1, self.maxLags)):
                 for key in keys:
                     m = copy.copy(self.model)
                     m.fit(self.input[[key]][:-lag], self.output[lag:])
@@ -1442,19 +1456,27 @@ class FeatureProcessing(object):
 
 
     def select(self, inputFrame, outputFrame):
-        self._cleanAndSet(inputFrame, outputFrame)
-        # Make different selectors
-        pps = self._predictivePowerScore()
-        rft, rfi = self._randomForestImportance()
-        bp = self._borutaPy()
-        return {'PPS': pps, 'RFT': rft, 'RFI': rfi, 'BP': bp}
+        # Check if not exists
+        if os.path.exists(self.folder + 'FeatureSets_v%i.json' % self.version):
+            return json.load(open(self.folder + 'FeatureSets_v%i.json' % self.version, 'r'))
+
+        # Execute otherwise
+        else:
+            # Clean
+            self._cleanAndSet(inputFrame, outputFrame)
+
+            # Different Feature Sets
+            pps = self._predictivePowerScore()
+            rft, rfi = self._randomForestImportance()
+            bp = self._borutaPy()
+            return {'PPS': pps, 'RFT': rft, 'RFI': rfi, 'BP': bp}
 
     def _predictivePowerScore(self):
         '''
         Calculates the Predictive Power Score (https://github.com/8080labs/ppscore)
-        Assymmetric correlation based on
+        Assymmetric correlation based on single decision trees trained on 5.000 samples with 4-Fold validation.
         '''
-        print('[features] Determining Features with PPS')
+        print('[Features] Determining Features with PPS')
         data = self.input.copy()
         data['target'] = self.output.copy()
         pp_score = pps.predictors(data, "target")
@@ -1463,6 +1485,10 @@ class FeatureProcessing(object):
         return pp_cols
 
     def _randomForestImportance(self):
+        '''
+        Calculates Feature Importance with Random Forest, aka Mean Decrease in Gini Impurity
+        Symmetric correlation based on multiple features and multiple trees ensemble
+        '''
         print('[features] Determining Features with RF')
         if self.mode == 'r':
             rf = RandomForestRegressor().fit(self.input, self.output[self.target])
@@ -1491,96 +1517,6 @@ class FeatureProcessing(object):
         bp_cols = self.input.keys()[selector.support_].to_list()
         print('[features] Selected %i features with Boruta' % len(bp_cols))
         return bp_cols
-
-
-class Normalize(object):
-
-    def __init__(self,
-                 type='normal'):
-        '''
-        Normalization class.
-        :param type: Either minmax, scales to 0-1, or normal, scaling to a normal distribution.
-        '''
-        self.type = type
-        self.mean = None
-        self.var = None
-        self.max = None
-        self.min = None
-        self.output_mean = None
-        self.output_var = None
-        self.output_min = None
-        self.output_max = None
-        normalizationTypes = ['normal', 'minmax']
-        if type not in normalizationTypes:
-            raise ValueError('Type not implemented. Should be in ' + str(normalizationTypes))
-
-    def fit(self, data, output=None):
-        assert isinstance(data, pd.DataFrame)
-        # Note Stats
-        self.mean = data.mean()
-        self.var = data.var()
-        self.min = data.min()
-        self.max = data.max()
-        # Normalize
-        if self.type == 'normal':
-            data -= self.mean
-            data /= np.maximum(np.sqrt(self.var), np.ones_like(self.var))
-        elif self.type == 'minmax':
-            data -= self.min
-            data /= np.maximum(self.max - self.min, np.ones_like(self.min))
-        if output is not None:
-            self.output_mean = output.mean()
-            self.output_var = output.var()
-            self.output_min = output.min()
-            self.output_max = output.max()
-            if self.type == 'normal':
-                output -= self.output_mean
-                output /= np.maximum(np.sqrt(self.output_var), np.ones_like(self.output_var))
-            elif self.type == 'minmax':
-                output -= self.output_min
-                output /= np.maximum(self.output_max - self.output_min, np.ones_like(self.output_max))
-            return data, output
-        else:
-            return data
-
-    def convert(self, data, output=None):
-        # Normalize
-        if self.type == 'normal':
-            data -= self.mean
-            data /= np.sqrt(self.var)
-        elif self.type == 'minmax':
-            data -= self.min
-            data /= self.max - self.min
-        if output is not None:
-            if self.type == 'normal':
-                output -= self.output_mean
-                output /= np.sqrt(self.output_var)
-            elif self.type == 'minmax':
-                output -= self.output_min
-                output /= self.output_max - self.output_min
-            return data, output
-        else:
-            return data
-
-    def revert(self, data):
-        if self.type == 'normal':
-            data *= np.sqrt(self.var)
-            data += self.mean
-        elif self.type == 'minmax':
-            data *= self.max - self.min
-            data += data.min
-        return data
-
-    def revert_output(self, output):
-        if self.type == 'normal':
-            assert self.output_mean != None and self.output_var != None
-            output *= np.sqrt(self.output_var)
-            output += self.output_mean
-        elif self.type == 'minmax':
-            assert self.output_min != None and self.output_max != None
-            output *= self.output_max - self.output_min
-            output += self.output_min
-        return output
 
 class ExploratoryDataAnalysis(object):
 
