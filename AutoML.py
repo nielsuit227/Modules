@@ -114,6 +114,7 @@ class Pipeline(object):
         self.validateResults = validate_result
 
         # Instance initiating
+        self.mode = mode
         self.version = None
         self.input = None
         self.output = None
@@ -246,7 +247,6 @@ class Pipeline(object):
         self._eda(data)
         self._dataProcessing(data)
         self._featureProcessing()
-        self._normalizing()
         self._initialModelling()
         self.gridSearch()
         # Production Env
@@ -401,7 +401,7 @@ class Pipeline(object):
             self.colKeep = self.FeatureProcessing.select(self.input, self.output)
 
             # Store
-            self.input.to_csv(self.mainDir + 'Data/Extracted_v%i.csv' % self.version)
+            self.input.to_csv(self.mainDir + 'Data/Extracted_v%i.csv' % self.version, index_label='index')
             json.dump(self.colKeep, open(self.mainDir + 'Features/Sets_v%i.json' % self.version, 'w'))
 
     def _initialModelling(self):
@@ -431,9 +431,12 @@ class Pipeline(object):
                     # Normalize Feature Set (Done here to get one normalization file per feature set)
                     normalizeFeatures = [k for k in input.keys() if k not in self.dateCols + self.catCols]
                     scaler = StandardScaler()
-                    input[input.keys()] = scaler.fit_transform(input)
-                    pickle.dump(scaler, open(self.mainDir + 'Features/%s_%i.pickle' % (set, self.version), 'wb'))
-
+                    input[normalizeFeatures] = scaler.fit_transform(input[normalizeFeatures])
+                    pickle.dump(scaler, open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (set, self.version), 'wb'))
+                    if self.mode == 'regression':
+                        oScaler = StandardScaler()
+                        output = oScaler.fit_transform(output)
+                        pickle.dump(oScaler, open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (set, self.version), 'wb'))
 
                     # Sequence if necessary
                     if self.sequence:
@@ -695,6 +698,14 @@ class Pipeline(object):
 
         # Select data
         input = self.input[self.colKeep[feature_set]]
+
+        # Normalize Feature Set (Done here to get one normalization file per feature set)
+        normalizeFeatures = [k for k in input.keys() if k not in self.dateCols + self.catCols]
+        scaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+        input[normalizeFeatures] = scaler.transform(input[normalizeFeatures])
+        if self.mode == 'regression':
+            oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+            output = oScaler.transform(output)
 
         # Run for regression (different Cross-Validation & worst case (MAE vs ACC))
         if self.mode == 'regression':
@@ -1196,11 +1207,11 @@ class FeatureProcessing(object):
     def extract(self, inputFrame, outputFrame):
         self._cleanAndSet(inputFrame, outputFrame)
         # Manipulate features
-        # baseline = self._calcBaseline()
         self._removeColinearity()
         self._addCrossFeatures()
         self._addDiffFeatures()
         self._addKMeansFeatures()
+        self._calcBaseline()
         self._addLaggedFeatures()
         return self.input
 
@@ -1209,8 +1220,10 @@ class FeatureProcessing(object):
         assert isinstance(outputFrame, pd.Series), 'Output supports only Pandas Series'
         if len(outputFrame.unique()) == 2:
             self.model = tree.DecisionTreeClassifier(max_depth=3)
+            self.mode = 'classification'
         else:
             self.model = tree.DecisionTreeRegressor(max_depth=3)
+            self.mode = 'regression'
         # Bit of necessary data cleaning (shouldn't change anything)
         self.input = inputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
         self.output = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
@@ -1230,8 +1243,7 @@ class FeatureProcessing(object):
             m = copy.copy(self.model)
             m.fit(self.input[[key]], self.output)
             self.baseScore[key] = m.score(self.input[[key]], self.output)
-        json.dump(self.baseScore, open(self.folder + 'BaseScores.json', 'w'))
-        return {k: v for k, v in sorted(self.baseScore.items(), key=lambda item: item[1], reverse=True)}
+        json.dump(self.baseScore, open(self.folder + 'BaseScores_v%i.json' % self.version, 'w'))
 
     def _removeColinearity(self):
         '''
@@ -1385,7 +1397,8 @@ class FeatureProcessing(object):
         '''
 
         # Check if we're allowed
-        if self.maxLags == 0:
+        if self.maxDiff == 0:
+            print('[Features] Differenced features skipped, max diff = 0')
             return
 
         # Check if exist
@@ -1428,6 +1441,7 @@ class FeatureProcessing(object):
         '''
         # Check if allowed
         if self.maxLags == 0:
+            print('[Features] Lagged features skipped, max lags = 0')
             return
 
         # Check if exists
@@ -1447,7 +1461,10 @@ class FeatureProcessing(object):
                     scores[key + '__lag__%i' % lag] = m.score(self.input[[key]][:-lag], self.output[lag:])
 
             # Select
-            self.laggedFeatures = [k for k, v in scores.items() if v > self.baseScore[k[:k.find('__lag__')]]]
+            scores = {k: v - self.baseScore[k[:k.find('__lag__')]] for k, v in sorted(scores.items(),
+                                              lambda k, v: v - self.baseScore[k[:k.find('__lag__')]], reverse=True)}
+            items = min(250, sum(v > 0.1 for v in scores.values()))
+            self.laggedFeatures = [k for k, v in list(scores.items())[:items] if v > self.baseScore[k[:k.find('__lag__')]]]
             print('[Features] Added %i lagged features' % len(self.laggedFeatures))
 
         # Add selected
@@ -1492,15 +1509,15 @@ class FeatureProcessing(object):
         Symmetric correlation based on multiple features and multiple trees ensemble
         '''
         print('[features] Determining Features with RF')
-        if self.mode == 'r':
-            rf = RandomForestRegressor().fit(self.input, self.output[self.target])
-        elif self.mode == 'c':
-            rf = RandomForestClassifier().fit(self.input, self.output[self.target])
+        if self.mode == 'regression':
+            rf = RandomForestRegressor().fit(self.input, self.output)
+        elif self.mode == 'classification':
+            rf = RandomForestClassifier().fit(self.input, self.output)
         fi = rf.feature_importances_
         sfi = fi.sum()
         ind = np.flip(np.argsort(fi))
         # Info Threshold
-        ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.info_threshold * sfi]
+        ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.informationThreshold * sfi]
         thresholded = self.input.keys()[ind_keep].to_list()
         ind_keep = [ind[i] for i in range(len(ind)) if fi[i] > sfi / 100]
         increment = self.input.keys()[ind_keep].to_list()
@@ -1510,9 +1527,9 @@ class FeatureProcessing(object):
 
     def _borutaPy(self):
         print('[features] Determining Features with Boruta')
-        if self.regression:
+        if self.mode == 'regression':
             rf = RandomForestRegressor()
-        elif self.classification:
+        elif self.mode == 'classification':
             rf = RandomForestClassifier()
         selector = BorutaPy(rf, n_estimators='auto', verbose=0)
         selector.fit(self.input.to_numpy(), self.output.to_numpy())
