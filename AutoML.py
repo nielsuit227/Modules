@@ -123,6 +123,9 @@ class Pipeline(object):
         self.nSplits = n_splits
         self.gridSearchIterations = grid_search_iterations
         self.sequence = sequence
+        self.plotEDA = plot_eda
+        self.processData = process_data
+        self.validateResults = validate_result
 
         # Instance initiating
         self.input = None
@@ -131,14 +134,12 @@ class Pipeline(object):
         self.results = None
 
     def _setFlags(self):
-        if process_data is None:
+        if self.plotEDA is None:
+            self.plotEDA = self._boolAsk('Make all EDA graphs?')
+        if self.processData is None:
             self.processData = self._boolAsk('Process/prepare data?')
-        else:
-            self.processData = prep_data
-        if validate_results is None:
+        if self.validateResults is None:
             self.validateResults = self._boolAsk('Validate results?')
-        else:
-            self.validateResults = validate_results
 
     def _loadVersion(self):
         # Sets version
@@ -247,7 +248,7 @@ class Pipeline(object):
         print('[autoML] Done :)')
 
     def _eda(self):
-        if not self.skip_eda:
+        if self.plotEDA:
             print('[autoML] Starting Exploratory Data Analysis')
             output = data[self.target]
             input = data.drop(self.target, axis=1)
@@ -409,7 +410,8 @@ class Pipeline(object):
         # Run Modelling
         else:
             init = []
-            for set, cols in enumerate(self.col_keep):
+            for set, cols in enumerate(self.colKeep):
+                # Skip empty sets
                 if len(cols) == 0:
                     print('[autoML] Skipping %s features, empty set' % set)
                 else:
@@ -580,15 +582,15 @@ class Pipeline(object):
     def gridSearch(self, model=None, params=None, feature_set=None):
         """
         Runs a grid search. By default, takes the self.results, and runs for the top 3 optimizations.
-        There is the option to provide a model & data_ind, but both have to be provided. In this case,
+        There is the option to provide a model & feature_set, but both have to be provided. In this case,
         the model & data set combination will be optimized.
         :param model:
         :param params:
-        :param data_ind:
+        :param feature_set:
         :return:
         """
         assert model is not None and feature_set is not None or model == feature_set, \
-            'Model & data_ind need to be either both None or both provided.'
+            'Model & feature_set need to be either both None or both provided.'
 
         # If arguments are provided
         if model is not None:
@@ -609,13 +611,13 @@ class Pipeline(object):
                     params = self._getHyperParams(model)
 
                 # Run Grid Search
-                results = self._sortResults(self._gridSearchIteration(model, params, data_ind))
+                results = self._sortResults(self._gridSearchIteration(model, params, feature_set))
                 results.to_csv(self.mainDir + '/Hyperparameter Opt/%s_%s.csv' %
-                               (type(model).__name__, str(data_ind)), index_label='index')
+                               (type(model).__name__, feature_set), index_label='index')
                 params = results.iloc[0]['params']
 
             # Validate
-            self.validate(model, params, data_ind)
+            self.validate(model, params, feature_set)
             return
 
         # If arguments aren't provided
@@ -646,12 +648,12 @@ class Pipeline(object):
             # Else run
             else:
                 params = self._getHyperParams(model)
-                gridSearchResults = self._sortResults(self._gridSearchIteration(model, params, data_ind))
+                gridSearchResults = self._sortResults(self._gridSearchIteration(model, params, featureSet))
 
                 # Store
                 gridSearchResults['model'] = type(model).__name__
                 gridSearchResults['data_version'] = self.version
-                gridSearchResults['dataset'] = self.datasets[data_ind]
+                gridSearchResults['dataset'] = featureSet
                 gridSearchResults['type'] = 'Hyperparameter Opt'
                 self.results = self.results.append(gridSearchResults)
                 self.results.to_csv(self.mainDir + '/Results.csv', index=False)
@@ -659,11 +661,11 @@ class Pipeline(object):
 
             # Validate
             if self.validateResults:
-                self.validate(model, params, data_ind)
+                self._validateResult(model, params, featureSet)
 
     def _gridSearchIteration(self, model, params, feature_set):
         """
-        INTERNAL | Grid search for defined model, parameter set and data_ind.
+        INTERNAL | Grid search for defined model, parameter set and feature set.
         """
         print('\n[autoML] Starting Hyperparameter Optimization for %s on %s features (%i samples, %i features)' %
               (type(model).__name__, feature_set, len(input), len(self.colKeep[feature_set])))
@@ -691,27 +693,24 @@ class Pipeline(object):
 
         return results
 
-    def validate(self, master_model, params, data_ind):
-        ################
-        # We're updating here
-        ################
-
-        if not self.prep_data:
-            if self.boolask('Run Validation?') == False:
-                return
-
+    def _validateResult(self, master_model, params, feature_set):
         print('[autoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
-                                                len(self.col_keep[data_ind]), self.datasets[data_ind], params))
-        if not os.path.exists(self.mainDir + '/Validation/'): os.mkdir(self.mainDir + '/Validation')
+                                                len(self.colKeep[feature_set]), feature_set, params))
+        if not os.path.exists(self.mainDir + '/Validation/'): os.mkdir(self.mainDir + '/Validation/')
 
         # For Regression
-        if self.regression:
-            mae = []
-            fig, ax = plt.subplots(round(self.n_splits / 2), 2, sharex=True, sharey=True)
-            fig.suptitle('%i-Fold Cross Validated Predictions - %s' % (self.n_splits, type(master_model).__name__))
+        if self.mode == 'regression':
 
-            cv = KFold(n_splits=self.n_splits, shuffle=self.shuffle)
-            input, output = np.array(self.input[self.col_keep[data_ind]]), np.array(self.output)
+            # Cross-Validation Plots
+            fig, ax = plt.subplots(round(self.nSplits / 2), 2, sharex=True, sharey=True)
+            fig.suptitle('%i-Fold Cross Validated Predictions - %s' % (self.nSplits, type(master_model).__name__))
+
+            # Initialize iterables
+            mae = []
+            cv = KFold(n_splits=self.nSplits, shuffle=self.shuffle)
+            input, output = np.array(self.input[self.colKeep[feature_set]]), np.array(self.output)
+
+            # Cross Validate
             for i, (t, v) in enumerate(cv.split(input, output)):
                 ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
                 model = copy.copy(master_model)
@@ -721,29 +720,32 @@ class Pipeline(object):
 
                 # Metrics
                 mae.append(Metrics.mae(vo, predictions))
+
                 # Plot
                 ax[i // 2][i % 2].set_title('Fold-%i' % i)
                 ax[i // 2][i % 2].plot(vo, color='#2369ec')
                 ax[i // 2][i % 2].plot(predictions, color='#ffa62b', alpha=0.4)
+
+            # Print & Finish plot
             print('[autoML] MAE:        %.2f \u00B1 %.2f' % (np.mean(mae), np.std(mae)))
             ax[i // 2][i % 2].legend(['Output', 'Prediction'])
             plt.show()
 
         # For classification
-        if self.classification:
+        if self.mode == 'classification':
             # Initiating
             acc = []
             prec = []
             rec = []
             spec = []
-            cm = np.zeros((2, 2))
             aucs = []
             tprs = []
+            cm = np.zeros((2, 2))
             mean_fpr = np.linspace(0, 1, 100)
 
             # Modelling
-            cv = StratifiedKFold(n_splits=self.n_splits)
-            input, output = np.array(self.input[self.col_keep[data_ind]]), np.array(self.output)
+            cv = StratifiedKFold(n_splits=self.nSplits)
+            input, output = np.array(self.input[self.colKeep[feature_set]]), np.array(self.output)
             for i, (t, v) in enumerate(cv.split(input, output)):
                 n = len(v)
                 ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
@@ -761,10 +763,10 @@ class Pipeline(object):
                 prec.append(tp / (tp + fp) * 100)
                 rec.append(tp / (tp + fn) * 100)
                 spec.append(tn / (tn + fp) * 100)
-                cm += np.array([[tp, fp], [fn, tn]]) / self.n_splits
+                cm += np.array([[tp, fp], [fn, tn]]) / self.nSplits
 
             # Results
-            f1 = [2 * prec[i] * rec[i] / (prec[i] + rec[i]) for i in range(self.n_splits)]
+            f1 = [2 * prec[i] * rec[i] / (prec[i] + rec[i]) for i in range(self.nSplits)]
             p = np.mean(prec)
             r = np.mean(rec)
             print('[autoML] Accuracy:        %.2f \u00B1 %.2f %%' % (np.mean(acc), np.std(acc)))
@@ -809,23 +811,24 @@ class Pipeline(object):
             ax.legend(loc="lower right")
             fig.savefig(self.mainDir + '/Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
 
-    def prepare_production_files(self, file=None):
+    def _prepareProductionFiles(self, model=None, feature_set=None):
         # Get sorted results for this data version
-        results = self.sort_results(self.modelling_res[self.modelling_res['data_version'] == self.version])
-        # In the case that a string is provided with model and data ind
+        results = self._sortResults(self.results[self.results['data_version'] == self.version])
+
+        # In the case args are provided
         if file is not None:
-            model = file[:file.find('_')]
-            data_ind = int(file[file.find('_') + 1])
-            results = self.sort_results(results[np.logical_and(results['model'] == model, results['data_ind'] == data_ind)])
-            params = self.parse_json(results.iloc[0]['params'])
+            results = self._sortResults(results[np.logical_and(results['model'] == model, results['dataset'] == feature_set)])
+            params = self._parseJson(results.iloc[0]['params'])
+
+        # Otherwise find best
         else:
             model = results.iloc[0]['model']
-            data_ind = [i for i, ds in enumerate(self.datasets) if ds == results.iloc[0]['dataset']][0]
+            feature_set = results.iloc[0]['dataset']
             params = results.iloc[0]['params']
             if isinstance(params, str):
-                params = self.parse_json(params)
+                params = self._parseJson(params)
         self.notification('[%s] Preparing Production Env Files for %s, feature set %s' %
-                          (self.project, model, self.datasets[data_ind]))
+                          (self.project, model, feature_set))
         if self.classification:
             self.notification('[%s] Accuracy: %.2f \u00B1 %.2f' %
                               (self.project, results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
@@ -834,21 +837,20 @@ class Pipeline(object):
                               (self.project, results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
 
         # Copy Features & Normalization & Norm Features
-        shutil.copy(self.mainDir + '/Features/features_%i_v%i.json' % (data_ind, self.version),
-                    self.mainDir + '/Production/features.json')
+        shutil.copy(self.mainDir + '/Features/features_%i_v%i.json' % (feature_set, self.version),
+                    self.mainDir + '/Production/v%i/features.json' % self.version)
+        # todo update scaler so that it only takes the features as defined here
         shutil.copy(self.mainDir + '/Normalization/Normalization_v%i.pickle' % self.version,
-                    self.mainDir + '/Production/normalization.pickle')
-        shutil.copy(self.mainDir + '/Normalization/norm_features_v%i.json' % self.version,
-                    self.mainDir + '/Production/norm_features.json')
+                    self.mainDir + '/Production/v%i/normalization.pickle' % self.version)
         if self.regression:
             shutil.copy(self.mainDir + '/Normalization/Output_norm_v%i.pickle' % self.version,
-                        self.mainDir + '/Production/output_norm.pickle')
+                        self.mainDir + '/Production/v%i/output_norm.pickle' % self.version)
 
         # Model
         model = [mod for mod in self.modelling.return_models() if type(mod).__name__ == model][0]
         model.set_params(**params)
-        model.fit(self.input[self.col_keep[data_ind]], self.output)
-        joblib.dump(model, self.mainDir + '/Production/model.joblib')
+        model.fit(self.input[self.colKeep[feature_set]], self.output)
+        joblib.dump(model, self.mainDir + '/Production/v%i/model.joblib' % self.version)
 
         # Predict function
         f = open(self.mainDir + '/Production/Predict.py', 'w')
@@ -859,14 +861,9 @@ class Pipeline(object):
         pickle.dump(self, open(self.mainDir + '/Production/Pipeline.pickle', 'wb'))
         return
 
-    def predict(self, sample):
+    def predict(self, model, features, scaler, sample):
         # todo asserts for sample
-        cleaned = self.prep.clean(sample)
-        normed = self.norm.convert(cleaned)
-        sequenced = self.sequencer.convert(normed)
-        selected = sequenced[self.col_keep[self.data_ind]]
-        pred = self.best_model.predict(selected)
-        return self.norm.revert_output(pred)
+        return 'Not implemented'
 
     def returnPredictFunc(self):
         return '''import pandas as pd
@@ -1807,7 +1804,7 @@ class Modelling(object):
         output = np.array(output)
 
         # Data
-        print('[modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.n_splits, len(input[0])))
+        print('[modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.nSplits, len(input[0])))
 
         if self.store_results and 'Initial_Models.csv' in os.listdir(self.folder):
             results = pd.read_csv(self.folder + 'Initial_Models.csv')
