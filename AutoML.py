@@ -1462,7 +1462,7 @@ class FeatureProcessing(object):
 
             # Select
             scores = {k: v - self.baseScore[k[:k.find('__lag__')]] for k, v in sorted(scores.items(),
-                                              lambda k, v: v - self.baseScore[k[:k.find('__lag__')]], reverse=True)}
+                                              lambda k: k[1] - self.baseScore[k[0][:k[0].find('__lag__')]], reverse=True)}
             items = min(250, sum(v > 0.1 for v in scores.values()))
             self.laggedFeatures = [k for k, v in list(scores.items())[:items] if v > self.baseScore[k[:k.find('__lag__')]]]
             print('[Features] Added %i lagged features' % len(self.laggedFeatures))
