@@ -1310,7 +1310,9 @@ class FeatureProcessing(object):
                 scores[keyA + '__x__' + keyB] = m.score(feature, self.output)
 
             # Select valuable features
-            self.crossFeatures = [k for k, v in scores.items() if v > 0.1]
+            scores = {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+            items = min(250, sum(scores.values() > 0.1))
+            self.crossFeatures = [k for k, v in list(scores.items())[:items] if v > 0.1]
 
         # Split and remove
         multiFeatures = [k for k in self.crossFeatures if '__x__' in k]
@@ -1318,10 +1320,14 @@ class FeatureProcessing(object):
         newFeatures = []
         for k in multiFeatures:
             keyA, keyB = k.split('__x__')
-            newFeatures.append(self.input[keyA] * self.input[keyB])
+            feature = self.input[keyA] * self.input[keyB]
+            feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
+            newFeatures.append(feature)
         for k in divFeatures:
             keyA, keyB = k.split('__d__')
-            newFeatures.append(self.input[keyA] / self.input[keyB])
+            feature = self.input[keyA] / self.input[keyB]
+            feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
+            newFeatures.append(feature)
 
         # Add new features
         newFeatures = pd.concat(newFeatures, axis=1, ignore_index=True)
