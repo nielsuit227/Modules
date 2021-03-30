@@ -642,7 +642,7 @@ class Pipeline(object):
                 # Store results
                 results['model'] = type(model).__name__
                 results['data_version'] = self.version
-                results['dataset'] = featureSet
+                results['dataset'] = feature_set
                 results['type'] = 'Hyperparameter Opt'
                 self.results.append(results)
                 results.to_csv(self.mainDir + 'Hyperparameter Opt/%s_%s.csv' %
@@ -918,12 +918,12 @@ class Pipeline(object):
         joblib.dump(model, self.mainDir + 'Production/v%i/Model.joblib' % self.version)
 
         # Predict function
-        f = open(self.mainDir + 'Production/Predict.py', 'w')
+        f = open(self.mainDir + 'Production/v%i/Predict.py' % self.version, 'w')
         f.write(self.returnPredictFunc())
         f.close()
         
         # Pipeline
-        pickle.dump(self, open(self.mainDir + 'Production/Pipeline.pickle', 'wb'))
+        pickle.dump(self, open(self.mainDir + 'Production/v%i/Pipeline.pickle' % self.version, 'wb'))
 
         # Features
         self.bestFeatures = self.colKeep[feature_set]
