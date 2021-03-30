@@ -895,6 +895,9 @@ class Pipeline(object):
         pickle.dump(self, open(self.mainDir + 'Production/Pipeline.pickle', 'wb'))
         return
 
+    def _errorAnalysis(self):
+        return ''
+
     def predict(self, model, features, scaler, sample):
         # todo asserts for sample
         return 'Not implemented'
@@ -906,11 +909,14 @@ import struct, re
 
 
 def decode(data, dbc):
+    # Clean keys
     for key in data.keys():
         data = data.rename(columns={key: key.replace(' ', '')})
     dec_list = []
     float_inds = [1031, 1002, 997, 873, 934, 868, 1313, 1282, 1281, 1038, 1037, 1036, 1035, 1033, 1032, 1030, 1029,
                   1028, 1026, 1070, 1069, 1068, 1067, 1065, 1064, 1063, 1063, 1061, 1060, 1059, 1058]
+    
+    # Decode first 9000 samples
     for j in range(9000):
         row = data.iloc[j]
         row_id = int(row['ID'], 0)
@@ -943,42 +949,80 @@ def decode(data, dbc):
         except:
             # Bare exception is no issue. Exception is triggered for legacy messages.
             pass
+    
     # Store
-    decoded_data = pd.DataFrame(dec_list)
-    return decoded_data
-
-
-def preprocess(data):
+    data = pd.DataFrame(dec_list)
+    
     # Convert timestamps
     data['ts'] = pd.to_datetime(data['ts'])
     data = data.set_index('ts')
+    
     # Drop duplicates
     data = data.drop_duplicates()
     data = data.loc[:, ~data.columns.duplicated()]
+    
     # Merge rows
     new_data = pd.DataFrame(columns=[], index=data.index.drop_duplicates(keep='first'))
     for key in data.keys():
         key_series = pd.Series(data[~data[key].isna()][key])
         new_data[key] = key_series[~key_series.index.duplicated()]
     data = new_data
-    # Cat cols
-    cat_cols = ['ControlPilotState', 'ChargeState', 'CCSState', 'CCSStateNext', 'CCSShutdownCode',
-                'CCSReinitErrorCode', 'ChargerErrorEvent1', 'ChargerErrorEvent2', 'ChargerErrorEvent3',
-                'ChargerErrorEvent4', 'RFIDSwipeStatus']
-    for key in cat_cols:
-        if key in data.keys():
-            dummies = pd.get_dummies(data[key], prefix=key).replace(0, 1)
-            data = data.drop(key, axis=1).join(dummies)
-    # Re-sample
-    data = data.resample('ms').interpolate(limit_direction='both')
-    data = data.resample('s').asfreq()
+    
     # Cleaning Keys
     new_keys = {}
     for key in data.keys():
         new_keys[key] = re.sub('[^a-zA-Z0-9]', '_', key.lower())
     data = data.rename(columns=new_keys)
-    del new_keys
+            
+    # Synchronise
+    data = data.resample('ms').interpolate(limit_direction='both')
+    data = data.resample('s').asfreq()[1:]
+    
+    # Take last 15 seconds
+    data = data.iloc[-15:]
+
     return data
+    
+def process(data, features, scaler, centers)
+    # Collect features we need to add
+    multiFeatures = [k for k in features if '__x__' in k]
+    divFeatures = [k for k in features if '__d__' in k]
+    kMeansFeatures = [k for k in features if 'dist_c_' in k]
+    diffFeatures = [k for k in features if '__diff__ in k]
+    lagFeatures = [k for k in features if '__lag__' in k]
+    
+    # Multiplicative features
+    for key in multiFeatures:
+        keyA, keyB = key.split('__x__')
+        feature = data[keyA] * data[keyB]
+        data[key] = feature.replace([np.inf, -np.inf], 0).fillna(0)
+    
+    # Division features
+    for key in divFeatures:
+        keyA, keyB = key.split('__d__')
+        key = data[keyA] / data[keyB]
+        data[key] = feature.replace([np.inf -np.inf], 0).fillna(0)
+        
+    # K-Means features
+    for key in kMeansFeatures:
+        ind = int(key[key.find('dist_c_') + 7: key.rfind('_')])
+        data[key] = np.sqrt(np.square(centers[ind] - self.input).sum(axis=1))
+        
+    # Differenced features
+    for k in diffFeatures:
+        key, diff = k.split('__diff__')
+        feature = data[key]
+        for i in range(1, diff):
+            feature = feature.diff().fillna(0)
+        data[k] = feature
+    
+    # Lagged features
+    for k in lagFeatures:
+        key, lag = k.split('__lag__')
+        data[key] = data[key].shift(-int(lag), fill_value=0)
+        
+    # Return normalized
+    return scaler.transform(data[features])
 
 
 class Predict(object):
@@ -986,23 +1030,12 @@ class Predict(object):
     def __init__(self):
         self.version = 'v0.1.2'
 
-    def predict(self, model, features, all_features, normalization, dbc, data):
-        # Decode
+    def predict(self, model, features, scaler, dbc, data):
+        # Decode & Synchronise (all Tritium specific)
         data = decode(data, dbc)
 
         # Convert to timeseries & preprocess
-        data = preprocess(data)
-
-        # Normalize
-        for key in [x for x in all_features if x not in list(data.keys())]:
-            data.loc[:, key] = np.zeros(len(data))
-        data = data[all_features]
-        data[data.keys()] = normalization.transform(data)
-
-        # Select features
-        for key in [x for x in features if x not in list(data.keys())]:
-            data.loc[:, key] = np.zeros(len(data))
-        data = data[features]
+        data = process(data, features, scaler, centers)
 
         # Make prediction
         predictions = model.predict_proba(data.iloc[1:])[:, 1]
@@ -1356,18 +1389,13 @@ class FeatureProcessing(object):
         if os.path.exists(self.folder + 'K-MeansFeatures_v%i.json' % self.version):
             # Load features and cluster size
             self.kMeansFeatures = json.load(open(self.folder + 'K-MeansFeatures_v%i.json' % self.version, 'r'))
-            clusters = self.kMeansFeatures[0]
-            clusters = int(clusters[clusters.rfind('_'):])
+            centers = json.load(open(self.folder + 'Centers_v%i.json' % self.version, 'r'))
             print('[Features] Loaded %i K-Means features' % len(self.kMeansFeatures))
-
-            # Calculate distances
-            kmeans = cluster.MiniBatchKMeans(n_clusters=clusters)
-            columnNames = ['dist_c_%i_%i' % (i, clusters) for i in range(clusters)]
-            distances = pd.DataFrame(columns=columnNames, data=kmeans.fit_transform(self.input))
 
             # Add them
             for key in self.kMeansFeatures:
-                self.input[key] = distances[key]
+                ind = int(key[key.find('dist_c_') + 7: key.rfind('_')])
+                self.input[key] = np.sqrt(np.square(centers[ind] - self.input).sum(axis=1))
 
         # If not executed, analyse all
         else:
@@ -1389,7 +1417,8 @@ class FeatureProcessing(object):
             self.kMeansFeatures = [k for k, v in scores.items() if v > 0.1]
             for k in self.kMeansFeatures:
                 self.input[k] = distances[k]
-            json.dump(self.kMeansFeatures, open(self.folder + 'crossFeatures.json', 'w'))
+            json.dump(kmeans.cluster_centers_, open(self.folder + 'Centers_v%i.json' % self.version, 'w'))
+            json.dump(self.kMeansFeatures, open(self.folder + 'K-MeansFeatures_v%i.json' % self.version, 'w'))
             print('[Features] Added %i K-Means features (%i clusters)' % (len(self.kMeansFeatures), clusters))
 
     def _addDiffFeatures(self):
