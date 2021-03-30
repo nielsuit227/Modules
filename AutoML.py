@@ -382,7 +382,7 @@ class Pipeline(object):
             data = self.DataProcessing.clean(data)
 
         # Split and store in memory
-        self.output = data[self.target]
+        self.output = data[[self.target]]
         self.input = data
         if self.includeOutput is False:
             self.input = self.input.drop(self.target, axis=1)
@@ -395,10 +395,10 @@ class Pipeline(object):
 
         else:
             # Extract
-            self.input = self.FeatureProcessing.extract(self.input, self.output)
+            self.input = self.FeatureProcessing.extract(self.input, self.output[self.target])
 
             # Select
-            self.colKeep = self.FeatureProcessing.select(self.input, self.output)
+            self.colKeep = self.FeatureProcessing.select(self.input, self.output[self.target])
 
             # Store
             self.input.to_csv(self.mainDir + 'Data/Extracted_v%i.csv' % self.version, index_label='index')
@@ -436,7 +436,7 @@ class Pipeline(object):
                     pickle.dump(scaler, open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (set, self.version), 'wb'))
                     if self.mode == 'regression':
                         oScaler = StandardScaler()
-                        output = oScaler.fit_transform(output)
+                        output[self.target] = oScaler.fit_transform(output)
                         pickle.dump(oScaler, open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (set, self.version), 'wb'))
 
                     # Sequence if necessary
