@@ -143,6 +143,8 @@ class Pipeline(object):
         # Store production
         self.bestModel = None
         self.bestFeatures = None
+        self.bestScaler = None
+        self.bestOScaler = None
 
     def _setFlags(self):
         if self.plotEDA is None:
@@ -737,7 +739,7 @@ class Pipeline(object):
         if not os.path.exists(self.mainDir + 'Validation/'): os.mkdir(self.mainDir + 'Validation/')
 
         # Select data
-        input = self.input[self.colKeep[feature_set]]
+        input, output = self.input[self.colKeep[feature_set]], self.output
 
         # Normalize Feature Set (the input remains original)
         normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
@@ -897,11 +899,22 @@ class Pipeline(object):
             shutil.copy(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version),
                         self.mainDir + 'Production/v%i/OScaler.pickle' % self.version)
 
+        # Data (Normalization)
+        input, output = self.input[self.colKeep[feature_set]], self.output
+        normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
+        self.bestScaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+
+        input = self.bestScaler.transform(input[normalizeFeatures])
+        if self.mode == 'regression':
+            self.bestOScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+            output = self.bestOScaler.transform(output)
+        else:
+            output = self.output[self.target].to_numpy()
+
         # Model
-        model = [mod for mod in self.Modelling.return_models() if type(mod).__name__ == model][0]
-        model.set_params(**params)
-        model.fit(self.input[self.colKeep[feature_set]], self.output)
-        self.bestModel = model
+        self.bestModel = [mod for mod in self.Modelling.return_models() if type(mod).__name__ == model][0]
+        self.bestModel.set_params(**params)
+        self.bestModel.fit(input, output)
         joblib.dump(model, self.mainDir + 'Production/v%i/Model.joblib' % self.version)
 
         # Predict function
@@ -911,6 +924,9 @@ class Pipeline(object):
         
         # Pipeline
         pickle.dump(self, open(self.mainDir + 'Production/Pipeline.pickle', 'wb'))
+
+        # Features
+        self.bestFeatures = self.colKeep[feature_set]
         return
 
     def _errorAnalysis(self):
