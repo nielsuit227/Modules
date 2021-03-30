@@ -140,6 +140,10 @@ class Pipeline(object):
         self.Modelling = Modelling(mode=mode, shuffle=shuffle, store_models=store_models,
                                    store_results=False, folder=self.mainDir + 'Models/')
 
+        # Store production
+        self.bestModel = None
+        self.bestFeatures = None
+
     def _setFlags(self):
         if self.plotEDA is None:
             self.plotEDA = self._boolAsk('Make all EDA graphs?')
@@ -697,10 +701,10 @@ class Pipeline(object):
               (type(model).__name__, feature_set, len(self.input), len(self.colKeep[feature_set])))
 
         # Select data
-        input = self.input[self.colKeep[feature_set]]
+        input, output = self.input[self.colKeep[feature_set]], self.output
 
-        # Normalize Feature Set (Done here to get one normalization file per feature set)
-        normalizeFeatures = [k for k in input.keys() if k not in self.dateCols + self.catCols]
+        # Normalize Feature Set (the input remains original)
+        normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
         scaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
         input[normalizeFeatures] = scaler.transform(input[normalizeFeatures])
         if self.mode == 'regression':
@@ -712,7 +716,7 @@ class Pipeline(object):
             gridSearch = GridSearch(model, params,
                                    cv=KFold(n_splits=self.nSplits),
                                    scoring=Metrics.mae)
-            results = gridSearch.fit(input, self.output)
+            results = gridSearch.fit(input, output)
             results['worst_case'] = results['mean_score'] + results['std_score']
             results = results.sort_values('worst_case')
 
@@ -721,7 +725,7 @@ class Pipeline(object):
             gridSearch = GridSearch(model, params,
                                    cv=StratifiedKFold(n_splits=self.nSplits),
                                    scoring=Metrics.acc)
-            results = gridSearch.fit(input, self.output)
+            results = gridSearch.fit(input, output)
             results['worst_case'] = results['mean_score'] - results['std_score']
             results = results.sort_values('worst_case', ascending=False)
 
@@ -731,6 +735,19 @@ class Pipeline(object):
         print('[autoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
                                                 len(self.colKeep[feature_set]), feature_set, params))
         if not os.path.exists(self.mainDir + 'Validation/'): os.mkdir(self.mainDir + 'Validation/')
+
+        # Select data
+        input = self.input[self.colKeep[feature_set]]
+
+        # Normalize Feature Set (the input remains original)
+        normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
+        scaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+        input = scaler.transform(input[normalizeFeatures])
+        if self.mode == 'regression':
+            oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+            output = oScaler.transform(output)
+        else:
+            output = self.output[self.target].to_numpy()
 
         # For Regression
         if self.mode == 'regression':
@@ -742,8 +759,6 @@ class Pipeline(object):
             # Initialize iterables
             mae = []
             cv = KFold(n_splits=self.nSplits, shuffle=self.shuffle)
-            input, output = np.array(self.input[self.colKeep[feature_set]]), np.array(self.output)
-
             # Cross Validate
             for i, (t, v) in enumerate(cv.split(input, output)):
                 ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
@@ -863,6 +878,8 @@ class Pipeline(object):
             params = results.iloc[0]['params']
             if isinstance(params, str):
                 params = self._parseJson(params)
+
+        # Notify of results
         self._notification('[%s] Preparing Production Env Files for %s, feature set %s' %
                           (self.mainDir[:-1], model, feature_set))
         if self.mode == 'classification':
@@ -884,6 +901,7 @@ class Pipeline(object):
         model = [mod for mod in self.Modelling.return_models() if type(mod).__name__ == model][0]
         model.set_params(**params)
         model.fit(self.input[self.colKeep[feature_set]], self.output)
+        self.bestModel = model
         joblib.dump(model, self.mainDir + 'Production/v%i/Model.joblib' % self.version)
 
         # Predict function
