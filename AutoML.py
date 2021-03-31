@@ -931,6 +931,16 @@ class Pipeline(object):
         return
 
     def _errorAnalysis(self):
+        # Prepare data
+        input, output = self.bestScaler.transform(self.input[self.bestFeatures]), self.output
+        if self.mode == 'regression':
+            output = self.bestOScaler.transform(self.output)
+
+        # Prediction & error
+        prediction = model.predict_proba(input)[:, 1]
+        error = output - prediction
+
+        # Analy
         return ''
 
     def predict(self, model, features, scaler, sample):
