@@ -651,7 +651,7 @@ class Pipeline(object):
                 params = results.iloc[0]['params']
 
             # Validate
-            self.validate(model, params, feature_set)
+            self._validateResult(model, params, feature_set)
             return
 
         # If arguments aren't provided
@@ -797,7 +797,6 @@ class Pipeline(object):
 
             # Modelling
             cv = StratifiedKFold(n_splits=self.nSplits)
-            input, output = np.array(self.input[self.colKeep[feature_set]]), np.array(self.output)
             for i, (t, v) in enumerate(cv.split(input, output)):
                 n = len(v)
                 ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
@@ -929,6 +928,37 @@ class Pipeline(object):
         # Features
         self.bestFeatures = self.colKeep[feature_set]
         return
+
+    def _testProductionFiles(self):
+        '''
+        Test the production files. Not equivalent with predict function as features are stored in class memory.
+        '''
+        print('[AutoML] Testing Production files.')
+        # Load files
+        scaler = json.load(open(self.mainDir + 'Production/Scaler.json', 'r'))
+        if self.mode == 'regression':
+            oScaler = json.load(open(self.mainDir + 'Production/OScaler.json', 'r'))
+        features = json.load(open(self.mainDir + 'Production/Features.json', 'r'))
+        model = joblib.load(self.mainDir + 'Production/Model.joblib')
+
+        # Prepare inputs & Predict
+        input = scaler.transform(self.input[features])
+        output = self.output[self.target].to_numpy()
+        prediction = model.predict(input)
+
+        # Output for Regression
+        if self.mode == 'regression':
+            # Scale
+            originalPrediction = oScaler.inverse_transform(prediction)
+            output = oScaler.transform(output)
+
+            # Print
+            print('MAE (normalized):      %.3f' % Metrics.mae(output, prediction))
+            print('MAE (original):        %.3f' % Metrics.mae(self.output[self.target].to_numpy(), originalPrediction))
+
+        # Output for Classification
+        if self.mode == 'classification':
+            print('ACC:   %.3f' % Metrics.acc(output, prediction))
 
     def _errorAnalysis(self):
         # Prepare data
