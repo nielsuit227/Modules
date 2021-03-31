@@ -43,6 +43,7 @@ class Pipeline(object):
     def __init__(self,
                  target,
                  project='',
+                 version=None,
                  mode='regression',
 
                  # Data Processing
@@ -85,6 +86,7 @@ class Pipeline(object):
         if len(project) == 0: self.mainDir = 'AutoML/'
         else: self.mainDir = project if project[-1] == '/' else project + '/'
         self.target = re.sub('[^a-z0-9]', '_', target.lower())
+        self.version = version
 
         # Checks
         assert mode == 'regression' or mode == 'classification'
@@ -529,12 +531,12 @@ class Pipeline(object):
             elif isinstance(model, sklearn.ensemble.HistGradientBoostingRegressor):
                 return {
                     'max_iter': [100, 250],
-                    'max_bins': [100, 255],
-                    'loss': ['least_squares', 'least_absolute_deviation'],
-                    'l2_regularization': [0.001, 0.005, 0.01, 0.05],
-                    'learning_rate': [0.01, 0.1, 0.25, 0.4],
-                    'max_leaf_nodes': [31, 50, 75, 150],
-                    'early_stopping': [True]
+                    # 'max_bins': [100, 255],
+                    # 'loss': ['least_squares', 'least_absolute_deviation'],
+                    # 'l2_regularization': [0.001, 0.005, 0.01, 0.05],
+                    # 'learning_rate': [0.01, 0.1, 0.25, 0.4],
+                    # 'max_leaf_nodes': [31, 50, 75, 150],
+                    # 'early_stopping': [True],
                 }
             elif isinstance(model, sklearn.ensemble.RandomForestRegressor):
                 return {
@@ -893,7 +895,10 @@ class Pipeline(object):
         # Copy Features & Normalization & Norm Features
         json.dump(self.colKeep[feature_set], open(self.mainDir + 'Production/v%i/Features.json' % self.version, 'w'))
         shutil.copy(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version),
-                    self.mainDir + 'Production/v%i/Scaler.json' % self.version)
+                    self.mainDir + 'Production/v%i/Scaler.pickle' % self.version)
+        if any(['dist_c_' in key for key in self.colKeep[feature_set]]):
+            shutil.copy(self.mainDir + 'Features/Centers_v%i.json' % self.version,
+                        self.mainDir + 'Production/v%i/Centers.json' % self.version)
         if self.mode == 'regression':
             shutil.copy(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version),
                         self.mainDir + 'Production/v%i/OScaler.pickle' % self.version)
@@ -914,7 +919,7 @@ class Pipeline(object):
         self.bestModel = [mod for mod in self.Modelling.return_models() if type(mod).__name__ == model][0]
         self.bestModel.set_params(**params)
         self.bestModel.fit(input, output)
-        joblib.dump(model, self.mainDir + 'Production/v%i/Model.joblib' % self.version)
+        joblib.dump(self.bestModel, self.mainDir + 'Production/v%i/Model.joblib' % self.version)
 
         # Predict function
         f = open(self.mainDir + 'Production/v%i/Predict.py' % self.version, 'w')
@@ -972,9 +977,67 @@ class Pipeline(object):
         # Analy
         return ''
 
-    def predict(self, model, features, scaler, sample):
-        # todo asserts for sample
-        return 'Not implemented'
+    def predict(self, data):
+        '''
+        Full script to make predictions. Uses 'Production' folder with defined or latest version.
+        '''
+        # Load files
+        folder = 'Production/v%i/' % self.version
+        scaler = pickle.load(open(self.mainDir + folder + 'Scaler.pickle', 'rb'))
+        features = json.load(open(self.mainDir + folder + 'Features.json', 'r'))
+        model = joblib.load(self.mainDir + folder + 'Model.joblib')
+        if self.mode == 'regression':
+            oScaler = pickle.load(open(self.mainDir + folder + 'OScaler.pickle', 'rb'))
+        if 'Centers.csv' in os.listdir(self.mainDir + folder):
+            centers = pd.read_csv(self.mainDir + folder + 'Centers.csv')
+
+        # Features
+        multiFeatures = [features.pop(features.index(k)) for k in features if '__x__' in k]
+        divFeatures = [features.pop(features.index(k)) for k in features if '__d__' in k]
+        kMeansFeatures = [features.pop(features.index(k)) for k in features if 'dist_c_' in k]
+        diffFeatures = [features.pop(features.index(k)) for k in features if '__diff__' in k]
+        lagFeatures = [features.pop(features.index(k)) for k in features if '__lag__' in k]
+        input = data[features]
+
+        # Multiplicative features
+        for key in multiFeatures:
+            keyA, keyB = key.split('__x__')
+            feature = data[keyA] * data[keyB]
+            input[key] = feature.replace([np.inf, -np.inf], 0).fillna(0)
+
+        # Division features
+        for key in divFeatures:
+            keyA, keyB = key.split('__d__')
+            key = data[keyA] / data[keyB]
+            input[key] = feature.replace([np.inf -np.inf], 0).fillna(0)
+
+        # Differenced features
+        for k in diffFeatures:
+            key, diff = k.split('__diff__')
+            feature = data[key]
+            for i in range(1, diff):
+                feature = feature.diff().fillna(0)
+            input[k] = feature
+
+        # K-Means features
+        for key in kMeansFeatures:
+            ind = int(key[key.find('dist_c_') + 7: key.rfind('_')])
+            input[key] = np.sqrt(np.square(data[centers.keys()] - centers.iloc[ind]).sum(axis=1))
+
+        # Lagged features
+        for k in lagFeatures:
+            key, lag = k.split('__lag__')
+            input[key] = data[key].shift(-int(lag), fill_value=0)
+
+        # Normalize
+        input = scaler.transform(input)
+
+        # Predict
+        if self.mode == 'regression':
+            predictions = oScaler.inverse_transform(model.predict(data))
+        if self.mode == 'classification':
+            predictions = model.predict_proba(data)[:, 1]
+        return predictions
 
     def returnPredictFunc(self):
         return '''import pandas as pd
@@ -1056,47 +1119,6 @@ def decode(data, dbc):
     data = data.iloc[-15:]
 
     return data
-    
-def process(data, features, scaler, centers)
-    # Collect features we need to add
-    multiFeatures = [k for k in features if '__x__' in k]
-    divFeatures = [k for k in features if '__d__' in k]
-    kMeansFeatures = [k for k in features if 'dist_c_' in k]
-    diffFeatures = [k for k in features if '__diff__ in k]
-    lagFeatures = [k for k in features if '__lag__' in k]
-    
-    # Multiplicative features
-    for key in multiFeatures:
-        keyA, keyB = key.split('__x__')
-        feature = data[keyA] * data[keyB]
-        data[key] = feature.replace([np.inf, -np.inf], 0).fillna(0)
-    
-    # Division features
-    for key in divFeatures:
-        keyA, keyB = key.split('__d__')
-        key = data[keyA] / data[keyB]
-        data[key] = feature.replace([np.inf -np.inf], 0).fillna(0)
-        
-    # K-Means features
-    for key in kMeansFeatures:
-        ind = int(key[key.find('dist_c_') + 7: key.rfind('_')])
-        data[key] = np.sqrt(np.square(centers[ind] - self.input).sum(axis=1))
-        
-    # Differenced features
-    for k in diffFeatures:
-        key, diff = k.split('__diff__')
-        feature = data[key]
-        for i in range(1, diff):
-            feature = feature.diff().fillna(0)
-        data[k] = feature
-    
-    # Lagged features
-    for k in lagFeatures:
-        key, lag = k.split('__lag__')
-        data[key] = data[key].shift(-int(lag), fill_value=0)
-        
-    # Return normalized
-    return scaler.transform(data[features])
 
 
 class Predict(object):
@@ -1290,6 +1312,7 @@ class FeatureProcessing(object):
                  folder='',
                  version=''):
         self.input = None
+        self.originalInput = None
         self.output = None
         self.model = None
         self.mode = None
@@ -1330,6 +1353,7 @@ class FeatureProcessing(object):
             self.mode = 'regression'
         # Bit of necessary data cleaning (shouldn't change anything)
         self.input = inputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
+        self.originalInput = self.input
         self.output = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
 
     def _calcBaseline(self):
@@ -1381,7 +1405,7 @@ class FeatureProcessing(object):
 
         # Save & Store
         json.dump(self.colinearFeatures, open(self.folder + 'Colinear_v%i.json' % self.version, 'w'))
-        self.input = self.input.drop(self.colinearFeatures, axis=1)
+        self.originalInput = self.originalInput.drop(self.colinearFeatures, axis=1)
         print('[Features] Removed %i Co-Linear features (%.3f %% threshold)' % (len(self.colinearFeatures), self.informationThreshold))
 
     def _addCrossFeatures(self):
@@ -1460,22 +1484,22 @@ class FeatureProcessing(object):
         if os.path.exists(self.folder + 'K-MeansFeatures_v%i.json' % self.version):
             # Load features and cluster size
             self.kMeansFeatures = json.load(open(self.folder + 'K-MeansFeatures_v%i.json' % self.version, 'r'))
-            centers = json.load(open(self.folder + 'Centers_v%i.json' % self.version, 'r'))
+            centers = pd.read_csv(self.folder + 'Centers_v%i.csv' % self.version)
             print('[Features] Loaded %i K-Means features' % len(self.kMeansFeatures))
 
             # Add them
             for key in self.kMeansFeatures:
                 ind = int(key[key.find('dist_c_') + 7: key.rfind('_')])
-                self.input[key] = np.sqrt(np.square(centers[ind] - self.input).sum(axis=1))
+                self.input[key] = np.sqrt(np.square(self.originalInput - centers.iloc[ind]).sum(axis=1))
 
         # If not executed, analyse all
         else:
             print('[Features] Calculating and Analysing K-Means features')
             # Fit K-Means and calculate distances
-            clusters = min(max(int(np.log10(len(self.input)) * 8), 8), len(self.input.keys()))
+            clusters = min(max(int(np.log10(len(self.originalInput)) * 8), 8), len(self.originalInput.keys()))
             kmeans = cluster.MiniBatchKMeans(n_clusters=clusters)
             columnNames = ['dist_c_%i_%i' % (i, clusters) for i in range(clusters)]
-            distances = pd.DataFrame(columns=columnNames, data=kmeans.fit_transform(self.input))
+            distances = pd.DataFrame(columns=columnNames, data=kmeans.fit_transform(self.originalInput))
 
             # Analyse correlation
             scores = {}
@@ -1488,7 +1512,8 @@ class FeatureProcessing(object):
             self.kMeansFeatures = [k for k, v in scores.items() if v > 0.1]
             for k in self.kMeansFeatures:
                 self.input[k] = distances[k]
-            json.dump(kmeans.cluster_centers_.tolist(), open(self.folder + 'Centers_v%i.json' % self.version, 'w'))
+            centers = pd.DataFrame(columns=self.originalInput.keys(), data=kmeans.cluster_centers_)
+            centers.to_csv(self.folder + 'Centers_v%i.csv' % self.version, index=False)
             json.dump(self.kMeansFeatures, open(self.folder + 'K-MeansFeatures_v%i.json' % self.version, 'w'))
             print('[Features] Added %i K-Means features (%i clusters)' % (len(self.kMeansFeatures), clusters))
 
@@ -1511,8 +1536,8 @@ class FeatureProcessing(object):
         else:
             print('[Features] Analysing differenced features')
             # Copy data so we can diff without altering original data
-            keys = self.input.keys()
-            diffInput = copy.copy(self.input)
+            keys = self.originalInput.keys()
+            diffInput = copy.copy(self.originalInput)
 
             # Calculate scores
             scores = {}
@@ -1553,13 +1578,13 @@ class FeatureProcessing(object):
         # Else execute
         else:
             print('[Features] Analysing lagged features')
-            keys = self.input.keys()
+            keys = self.originalInput.keys()
             scores = {}
             for lag in tqdm(range(1, self.maxLags)):
                 for key in keys:
                     m = copy.copy(self.model)
-                    m.fit(self.input[[key]][:-lag], self.output[lag:])
-                    scores[key + '__lag__%i' % lag] = m.score(self.input[[key]][:-lag], self.output[lag:])
+                    m.fit(self.originalInput[[key]][:-lag], self.output[lag:])
+                    scores[key + '__lag__%i' % lag] = m.score(self.originalInput[[key]][:-lag], self.output[lag:])
 
             # Select
             scores = {k: v - self.baseScore[k[:k.find('__lag__')]] for k, v in sorted(scores.items(),
@@ -1571,7 +1596,7 @@ class FeatureProcessing(object):
         # Add selected
         for k in self.laggedFeatures:
             key, lag = k.split('__lag__')
-            self.input[k] = self.input[key].shift(-int(lag), fill_value=0)
+            self.input[k] = self.originalInput[key].shift(-int(lag), fill_value=0)
         json.dump(self.laggedFeatures, open(self.folder + 'laggedFeatures_v%i.json' % self.version, 'w'))
 
 
@@ -1596,7 +1621,7 @@ class FeatureProcessing(object):
         Calculates the Predictive Power Score (https://github.com/8080labs/ppscore)
         Assymmetric correlation based on single decision trees trained on 5.000 samples with 4-Fold validation.
         '''
-        print('[Features] Determining Features with PPS')
+        print('[Features] Determining features with PPS')
         data = self.input.copy()
         data['target'] = self.output.copy()
         pp_score = pps.predictors(data, "target")
@@ -1609,7 +1634,7 @@ class FeatureProcessing(object):
         Calculates Feature Importance with Random Forest, aka Mean Decrease in Gini Impurity
         Symmetric correlation based on multiple features and multiple trees ensemble
         '''
-        print('[Features] Determining Features with RF')
+        print('[Features] Determining features with RF')
         if self.mode == 'regression':
             rf = RandomForestRegressor().fit(self.input, self.output)
         elif self.mode == 'classification':
@@ -1627,7 +1652,7 @@ class FeatureProcessing(object):
         return thresholded, increment
 
     def _borutaPy(self):
-        print('[Features] Determining Features with Boruta')
+        print('[Features] Determining features with Boruta')
         if self.mode == 'regression':
             rf = RandomForestRegressor()
         elif self.mode == 'classification':
