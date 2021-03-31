@@ -645,8 +645,9 @@ class Pipeline(object):
                 results['dataset'] = feature_set
                 results['type'] = 'Hyperparameter Opt'
                 self.results.append(results)
-                results.to_csv(self.mainDir + 'Hyperparameter Opt/%s_%s.csv' %
-                               (type(model).__name__, feature_set), index_label='index')
+                self.results.to_csv(self.mainDir + 'Results.csv', index=False)
+
+                # Get params for validation
                 params = results.iloc[0]['params']
 
             # Validate
@@ -1222,7 +1223,8 @@ class DataProcessing(object):
                   n_nans * 100 / len(data) / len(data.keys()), self.missingValues))
         return data
 
-    def _normalize(self, data):
+    def __normalize(self, data):
+        ''' DEPRECATED -- NOT USED'''
         # Organise features that need normalizing, some where deleted
         features = [key for key in data.keys() if key not in self.catCols + self.dateCols + [self.target]]
 
@@ -1239,10 +1241,6 @@ class DataProcessing(object):
     def _store(self, data):
         # Store cleaned data
         data.to_csv(self.folder + 'Cleaned_v%i.csv' % self.version, index_label='index')
-        # Store normalization
-        pickle.dump(self.scaler, open(self.folder + 'Normalizer_v%i.pickle' % self.version, 'wb'))
-        if self.mode == 'r':
-            pickle.dump(self.oScaler, open(self.folder + 'Output_norm_v%i.pickle' % self.version, 'wb'))
 
 class FeatureProcessing(object):
 
