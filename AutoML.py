@@ -25,17 +25,16 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # Priority
-# split EDA in regression & classification
-# add report output
-# add prediction script to prod env
 # add cloud function script to prod env
+# smarter way to select models for hyperopt
+# --> Needs to incorporate number of features, mean acc/mae
 
 # Nicety
+# add report output
 # implement HalvingGridSearchCV (https://scikit-learn.org/stable/modules/grid_search.html#successive-halving-user-guide)
 # implement ensembles (http://www.cs.cornell.edu/~alexn/papers/shotgun.icml04.revised.rev2.pdf)
 # preprocessing check for big chunks of missing data
 # multiprocessing for EDA RF, GridSearch
-# flat=bool for sequence (needed for lightGBM)
 # implement autoencoder for Feature Extraction
 # implement transformers
 
@@ -1489,7 +1488,7 @@ class FeatureProcessing(object):
             self.kMeansFeatures = [k for k, v in scores.items() if v > 0.1]
             for k in self.kMeansFeatures:
                 self.input[k] = distances[k]
-            json.dump(kmeans.cluster_centers_, open(self.folder + 'Centers_v%i.json' % self.version, 'w'))
+            json.dump(kmeans.cluster_centers_.tolist(), open(self.folder + 'Centers_v%i.json' % self.version, 'w'))
             json.dump(self.kMeansFeatures, open(self.folder + 'K-MeansFeatures_v%i.json' % self.version, 'w'))
             print('[Features] Added %i K-Means features (%i clusters)' % (len(self.kMeansFeatures), clusters))
 
@@ -1602,7 +1601,7 @@ class FeatureProcessing(object):
         data['target'] = self.output.copy()
         pp_score = pps.predictors(data, "target")
         pp_cols = pp_score['x'][pp_score['ppscore'] != 0].to_list()
-        print('[features] Selected %i features with Predictive Power Score' % len(pp_cols))
+        print('[Features] Selected %i features with Predictive Power Score' % len(pp_cols))
         return pp_cols
 
     def _randomForestImportance(self):
@@ -1610,7 +1609,7 @@ class FeatureProcessing(object):
         Calculates Feature Importance with Random Forest, aka Mean Decrease in Gini Impurity
         Symmetric correlation based on multiple features and multiple trees ensemble
         '''
-        print('[features] Determining Features with RF')
+        print('[Features] Determining Features with RF')
         if self.mode == 'regression':
             rf = RandomForestRegressor().fit(self.input, self.output)
         elif self.mode == 'classification':
@@ -1623,12 +1622,12 @@ class FeatureProcessing(object):
         thresholded = self.input.keys()[ind_keep].to_list()
         ind_keep = [ind[i] for i in range(len(ind)) if fi[i] > sfi / 100]
         increment = self.input.keys()[ind_keep].to_list()
-        print('[features] Selected %i features with RF thresholded' % len(thresholded))
-        print('[features] Selected %i features with RF increment' % len(increment))
+        print('[Features] Selected %i features with RF thresholded' % len(thresholded))
+        print('[Features] Selected %i features with RF increment' % len(increment))
         return thresholded, increment
 
     def _borutaPy(self):
-        print('[features] Determining Features with Boruta')
+        print('[Features] Determining Features with Boruta')
         if self.mode == 'regression':
             rf = RandomForestRegressor()
         elif self.mode == 'classification':
@@ -1636,7 +1635,7 @@ class FeatureProcessing(object):
         selector = BorutaPy(rf, n_estimators='auto', verbose=0)
         selector.fit(self.input.to_numpy(), self.output.to_numpy())
         bp_cols = self.input.keys()[selector.support_].to_list()
-        print('[features] Selected %i features with Boruta' % len(bp_cols))
+        print('[Features] Selected %i features with Boruta' % len(bp_cols))
         return bp_cols
 
 class ExploratoryDataAnalysis(object):
@@ -1958,7 +1957,7 @@ class Modelling(object):
         output = np.array(output)
 
         # Data
-        print('[modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.nSplits, len(input[0])))
+        print('[Modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.nSplits, len(input[0])))
 
         if self.store_results and 'Initial_Models.csv' in os.listdir(self.folder):
             results = pd.read_csv(self.folder + 'Initial_Models.csv')
@@ -2005,7 +2004,7 @@ class Modelling(object):
                 joblib.dump(model, self.folder + type(model).__name__ + '_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
-            print('[modelling] %s train/val: %.2f %.2f, training time: %.1f s' %
+            print('[Modelling] %s train/val: %.2f %.2f, training time: %.1f s' %
                   (type(model).__name__.ljust(60), np.mean(t_acc), np.mean(v_acc), time.time() - t_start))
 
         # Store CSV
