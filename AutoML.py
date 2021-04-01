@@ -897,8 +897,8 @@ class Pipeline(object):
         shutil.copy(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version),
                     self.mainDir + 'Production/v%i/Scaler.pickle' % self.version)
         if any(['dist_c_' in key for key in self.colKeep[feature_set]]):
-            shutil.copy(self.mainDir + 'Features/Centers_v%i.json' % self.version,
-                        self.mainDir + 'Production/v%i/Centers.json' % self.version)
+            shutil.copy(self.mainDir + 'Features/Centers_v%i.csv' % self.version,
+                        self.mainDir + 'Production/v%i/Centers.csv' % self.version)
         if self.mode == 'regression':
             shutil.copy(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version),
                         self.mainDir + 'Production/v%i/OScaler.pickle' % self.version)
