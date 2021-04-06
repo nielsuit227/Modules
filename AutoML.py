@@ -107,13 +107,20 @@ class Pipeline(object):
         self.numCols = num_cols
         self.dateCols = date_cols
         self.catCols = cat_cols
+        self.missingValues = missing_values
+        self.outlierRemoval = outlier_removal
+        self.zScoreThreshold = z_score_threshold
         self.includeOutput = include_output
+        self.sequence = sequence
+        self.sequenceBack = back
+        self.sequenceForward = forward
+        self.sequenceShift = shift
+        self.sequenceDiff = diff
         self.normalize = normalize
         self.shuffle = shuffle
         self.nSplits = n_splits
         self.gridSearchIterations = grid_search_iterations
         self.useHalvingGridSearch = use_halving
-        self.sequence = sequence
         self.plotEDA = plot_eda
         self.processData = process_data
         self.validateResults = validate_result
@@ -163,11 +170,14 @@ class Pipeline(object):
         versions = os.listdir(self.mainDir + 'Production')
         if self.version is None:
             if len(versions) == 0:
+                print('[AutoML] No Production files found. Setting version 0.')
                 self.version = 0
-            # elif self.processData:
-            #     self.version = int(len(versions))
             else:
-                self.version = int(len(versions))# - 1
+                with open(self.mainDir + 'changelog.txt', 'r') as f:
+                    changelog = f.read()
+                changelog = changelog[changelog.find('v%i' % len(versions)):]
+                print('[AutoML] Loading last version (%s)' % changelog[:changelog.find('\n')])
+                self.version = int(len(versions))
 
         # Updates changelog
         if self.processData:
@@ -180,6 +190,7 @@ class Pipeline(object):
                 file = open(self.mainDir + 'changelog.txt', 'a')
                 file.write(('\nv%i: ' % self.version) + changelog)
                 file.close()
+                print('[AutoML] Set version v%i, %s' % (self.version, changelog))
 
     def _createDirs(self):
         dirs = ['', 'Data', 'Features', 'Models', 'Production', 'Validation', 'Sets']
@@ -255,7 +266,6 @@ class Pipeline(object):
         @param data: DataFrame including target
         '''
         # Execute pipeline
-        print('[AutoML] Version %i' % self.version)
         self._eda(data)
         self._dataProcessing(data)
         self._featureProcessing()
@@ -894,9 +904,9 @@ class Pipeline(object):
             print('[autoML] Specificity:     %.2f \u00B1 %.2f %%' % (np.mean(spec), np.std(spec)))
             print('[autoML] F1-score:        %.2f \u00B1 %.2f %%' % (np.mean(f1), np.std(f1)))
             print('[autoML] Confusion Matrix:')
-            print('[autoML] Pred \ true  |  ISO faulty   |   ISO operational      ')
-            print('[autoML]  ISO faulty  |  %s|  %.1f' % (('%.1f' % cm[0, 0]).ljust(13), cm[0, 1]))
-            print('[autoML]  ISO oper.   |  %s|  %.1f' % (('%.1f' % cm[1, 0]).ljust(13), cm[1, 1]))
+            print('[autoML] Pred \ true |  Faulty   |   Healthy      ')
+            print('[autoML]  Faulty     |  %s|  %.1f' % (('%.1f' % cm[0, 0]).ljust(9), cm[0, 1]))
+            print('[autoML]  Healthy    |  %s|  %.1f' % (('%.1f' % cm[1, 0]).ljust(9), cm[1, 1]))
 
             # Check whether plot is possible
             if isinstance(model, sklearn.linear_model.Lasso) or isinstance(model, sklearn.linear_model.Ridge):
@@ -938,6 +948,9 @@ class Pipeline(object):
 
         # In the case args are provided
         if model is not None and feature_set is not None:
+            # Take name if model instance is given
+            if not isinstance(model, str):
+                model = type(model).__name__
             results = self._sortResults(results[np.logical_and(results['model'] == model, results['dataset'] == feature_set)])
             params = self._parseJson(results.iloc[0]['params'])
 
@@ -1059,35 +1072,28 @@ class Pipeline(object):
         # Load files
         folder = 'Production/v%i/' % self.version
         features = json.load(open(self.mainDir + folder + 'Features.json', 'r'))
+
         if self.normalize:
             scaler = pickle.load(open(self.mainDir + folder + 'Scaler.pickle', 'rb'))
             if self.mode == 'regression':
                 oScaler = pickle.load(open(self.mainDir + folder + 'OScaler.pickle', 'rb'))
+        if self.mode == 'regression':
+            oScaler = pickle.load(open(self.mainDir + folder + 'OScaler.pickle', 'rb'))
         if 'Centers.csv' in os.listdir(self.mainDir + folder):
             centers = pd.read_csv(self.mainDir + folder + 'Centers.csv')
 
         # Clean data
-        # Keys
-        newKeys = {}
-        for key in data.keys():
-            newKeys[key] = re.sub('[^a-zA-Z0-9 \n\.]', '_', key.lower())
-        data = data.rename(columns=newKeys)
-
-        # Data Types
-        for key in data.keys():
-            data[key] = pd.to_numeric(data[key], errors='coerce')
-
-        # Outliers
-        # todo
-
-        # Missing values
-        ik = np.setdiff1d(data.keys().to_list(), self.dateCols)
-        data[ik] = data[ik].interpolate(limit_direction='both')
-        if data.isna().sum().sum() != 0:
-            data = data.fillna(0)
+        data = self.DataProcessing._cleanKeys(data)
+        data = self.DataProcessing._convertDataTypes(data)
+        data = self.DataProcessing._removeDuplicates(data)
+        data = self.DataProcessing._removeOutliers(data)
+        data = self.DataProcessing._removeMissingValues(data)
 
         # Save output
-        output = data[self.target].to_numpy().reshape((-1, 1))
+        if self.target in data.keys():
+            output = data[self.target].to_numpy().reshape((-1, 1))
+        else:
+            output = None
 
         # Features
         multiFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__x__' in k]
@@ -1095,6 +1101,12 @@ class Pipeline(object):
         kMeansFeatures = [features.pop(features.index(k)) for k in features[::-1] if 'dist_c_' in k]
         diffFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__diff__' in k]
         lagFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__lag__' in k]
+
+        # Fill missing features
+        for k in [k for k in features if k not in data.keys()]:
+            data[k] = np.zeros(len(data))
+
+        # Select
         input = data[features]
 
         # Multiplicative features
@@ -1106,8 +1118,8 @@ class Pipeline(object):
         # Division features
         for key in divFeatures:
             keyA, keyB = key.split('__d__')
-            key = data[keyA] / data[keyB]
-            input[key] = feature.replace([np.inf -np.inf], 0).fillna(0)
+            feature = data[keyA] / data[keyB]
+            input[key] = feature.replace([np.inf, -np.inf], 0).fillna(0)
 
         # Differenced features
         for k in diffFeatures:
@@ -1130,7 +1142,6 @@ class Pipeline(object):
         # Normalize
         if self.normalize:
             input = scaler.transform(input)
-
         # Return
         return input, output
 
@@ -1149,7 +1160,14 @@ class Pipeline(object):
             else:
                 predictions = model.predict(input)
         if self.mode == 'classification':
-            predictions = model.predict_proba(input)[:, 1]
+            input = input.astype('float32')
+            input[input == np.inf] = 0
+            input[input == -np.inf] = 0
+            try:
+                predictions = model.predict_proba(input)[:, 1]
+            except:
+                predictions = model.predict(input)
+
         return predictions
 
     def returnPredictFunc(self):
@@ -1251,7 +1269,6 @@ class Predict(object):
         return sum(predictions) / len(predictions) * 100
 '''
 
-
 class DataProcessing(object):
 
     def __init__(self,
@@ -1337,14 +1354,15 @@ class DataProcessing(object):
               (len(self.numCols), len(self.catCols), len(self.dateCols)))
         for key in self.dateCols:
             data[key] = pd.to_datetime(data[key], errors='coerce', infer_datetime_format=True, utc=True)
+        for key in [key for key in data.keys() if key not in self.dateCols and key not in self.catCols]:
+            data[key] = pd.to_numeric(data[key], errors='coerce', downcast='float')
         for key in self.catCols:
             dummies = pd.get_dummies(data[key])
             for dummy_key in dummies.keys():
                 dummies = dummies.rename(columns={dummy_key: key + '_' + str(dummy_key)})
             data = data.drop(key, axis=1).join(dummies)
-        for key in [key for key in data.keys() if key not in self.dateCols and key not in self.catCols]:
-            data[key] = pd.to_numeric(data[key], errors='coerce')
-        data[self.target] = pd.to_numeric(data[self.target], errors='coerce')
+        if self.target in data.keys():
+            data[self.target] = pd.to_numeric(data[self.target], errors='coerce')
         return data
 
     def _removeDuplicates(self, data):
@@ -1465,7 +1483,7 @@ class FeatureProcessing(object):
             self.model = tree.DecisionTreeRegressor(max_depth=3)
             self.mode = 'regression'
         # Bit of necessary data cleaning (shouldn't change anything)
-        self.input = inputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
+        self.input = inputFrame.astype('float32').replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
         self.originalInput = self.input
         self.output = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
 
@@ -1613,6 +1631,7 @@ class FeatureProcessing(object):
             kmeans = cluster.MiniBatchKMeans(n_clusters=clusters)
             columnNames = ['dist_c_%i_%i' % (i, clusters) for i in range(clusters)]
             distances = pd.DataFrame(columns=columnNames, data=kmeans.fit_transform(self.originalInput))
+            distances = distances.replace([np.inf, -np.inf], 0).fillna(0)
 
             # Analyse correlation
             scores = {}
