@@ -68,12 +68,14 @@ class Pipeline(object):
                  diff='none',
 
                  # Initial Modelling
+                 normalize=True,
                  shuffle=False,
                  n_splits=3,
                  store_models=True,
 
                  # Grid Search
                  grid_search_iterations=3,
+                 use_halving=False,
 
                  # Flags
                  plot_eda=None,
@@ -106,9 +108,11 @@ class Pipeline(object):
         self.dateCols = date_cols
         self.catCols = cat_cols
         self.includeOutput = include_output
+        self.normalize = normalize
         self.shuffle = shuffle
         self.nSplits = n_splits
         self.gridSearchIterations = grid_search_iterations
+        self.useHalvingGridSearch = use_halving
         self.sequence = sequence
         self.plotEDA = plot_eda
         self.processData = process_data
@@ -160,10 +164,10 @@ class Pipeline(object):
         if self.version is None:
             if len(versions) == 0:
                 self.version = 0
-            elif self.processData:
-                self.version = int(len(versions))
+            # elif self.processData:
+            #     self.version = int(len(versions))
             else:
-                self.version = int(len(versions)) - 1
+                self.version = int(len(versions))# - 1
 
         # Updates changelog
         if self.processData:
@@ -172,7 +176,7 @@ class Pipeline(object):
                 file.write('Dataset changelog. \nv0: Initial')
                 file.close()
             else:
-                changelog = input("Data changelog v%i:\n")
+                changelog = input("Data changelog v%i:\n" % self.version)
                 file = open(self.mainDir + 'changelog.txt', 'a')
                 file.write(('\nv%i: ' % self.version) + changelog)
                 file.close()
@@ -206,7 +210,7 @@ class Pipeline(object):
             "text": message,
             "username": "AutoML",
         }
-        requests.post(url, data=data)
+        # requests.post(url, data=data)
 
     def _sortResults(self, results):
         if self.mode == 'regression':
@@ -251,6 +255,7 @@ class Pipeline(object):
         @param data: DataFrame including target
         '''
         # Execute pipeline
+        print('[AutoML] Version %i' % self.version)
         self._eda(data)
         self._dataProcessing(data)
         self._featureProcessing()
@@ -437,14 +442,15 @@ class Pipeline(object):
                     input, output = self.input[cols], self.output
 
                     # Normalize Feature Set (Done here to get one normalization file per feature set)
-                    normalizeFeatures = [k for k in input.keys() if k not in self.dateCols + self.catCols]
-                    scaler = StandardScaler()
-                    input[normalizeFeatures] = scaler.fit_transform(input[normalizeFeatures])
-                    pickle.dump(scaler, open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (set, self.version), 'wb'))
-                    if self.mode == 'regression':
-                        oScaler = StandardScaler()
-                        output[self.target] = oScaler.fit_transform(output)
-                        pickle.dump(oScaler, open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (set, self.version), 'wb'))
+                    if self.normalize:
+                        normalizeFeatures = [k for k in input.keys() if k not in self.dateCols + self.catCols]
+                        scaler = StandardScaler()
+                        input[normalizeFeatures] = scaler.fit_transform(input[normalizeFeatures])
+                        pickle.dump(scaler, open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (set, self.version), 'wb'))
+                        if self.mode == 'regression':
+                            oScaler = StandardScaler()
+                            output[self.target] = oScaler.fit_transform(output)
+                            pickle.dump(oScaler, open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (set, self.version), 'wb'))
 
                     # Sequence if necessary
                     if self.sequence:
@@ -520,6 +526,7 @@ class Pipeline(object):
                     'iterations': [500, 1000, 2000],
                     'learning_rate': [0.001, 0.01, 0.03, 0.05, 0.1],
                     'l2_leaf_reg': [1, 3, 5],
+                    'verbose': [0],
                 }
             elif isinstance(model, sklearn.ensemble.GradientBoostingRegressor):
                 return {
@@ -682,7 +689,10 @@ class Pipeline(object):
             # Else run
             else:
                 params = self._getHyperParams(model)
-                gridSearchResults = self._sortResults(self._gridSearchIteration(model, params, featureSet))
+                if self.useHalvingGridSearch:
+                    gridSearchResults = self._sortResults(self._gridSearchIterationHalvingCV(model, params, featureSet))
+                else:
+                    gridSearchResults = self._sortResults(self._gridSearchIteration(model, params, featureSet))
 
                 # Store
                 gridSearchResults['model'] = type(model).__name__
@@ -708,12 +718,13 @@ class Pipeline(object):
         input, output = self.input[self.colKeep[feature_set]], self.output
 
         # Normalize Feature Set (the input remains original)
-        normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
-        scaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-        input[normalizeFeatures] = scaler.transform(input[normalizeFeatures])
-        if self.mode == 'regression':
-            oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-            output = oScaler.transform(output)
+        if self.normalize:
+            normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
+            scaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+            input[normalizeFeatures] = scaler.transform(input[normalizeFeatures])
+            if self.mode == 'regression':
+                oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+                output = oScaler.transform(output)
 
         # Run for regression (different Cross-Validation & worst case (MAE vs ACC))
         if self.mode == 'regression':
@@ -735,23 +746,79 @@ class Pipeline(object):
 
         return results
 
-    def _validateResult(self, master_model, params, feature_set):
-        print('[autoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
-                                                len(self.colKeep[feature_set]), feature_set, params))
-        if not os.path.exists(self.mainDir + 'Validation/'): os.mkdir(self.mainDir + 'Validation/')
+    def _gridSearchIterationHalvingCV(self, model, params, feature_set):
+        """
+        EXPERIMENTAL | Grid search for defined model, parameter set and feature set.
+        Contrary to normal function, uses Scikit-Learns GridHalvingCV. Special halvign algo
+        that uses subsets of data for early elimination. Speeds up significantly :)
+        """
+        from sklearn.experimental import enable_halving_search_cv
+        from sklearn.model_selection import HalvingGridSearchCV
+        print('\n[autoML] Starting Hyperparameter Optimization for %s on %s features (%i samples, %i features)' %
+              (type(model).__name__, feature_set, len(self.input), len(self.colKeep[feature_set])))
 
         # Select data
         input, output = self.input[self.colKeep[feature_set]], self.output
 
         # Normalize Feature Set (the input remains original)
-        normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
-        scaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-        input = scaler.transform(input[normalizeFeatures])
+        if self.normalize:
+            normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
+            scaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+            input[normalizeFeatures] = scaler.transform(input[normalizeFeatures])
+            if self.mode == 'regression':
+                oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+                output = oScaler.transform(output)
+
         if self.mode == 'regression':
-            oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-            output = oScaler.transform(output)
+            gridSearch = HalvingGridSearchCV(model, params,
+                                             cv=KFold(n_splits=self.nSplits),
+                                             scoring='neg_mean_absolute_error',
+                                             factor=5, n_jobs=4, verbose=2)
+            gridSearch.fit(input, output)
+            scikitResults = pd.DataFrame(gridSearch.cv_results_)
+            results = pd.DataFrame()
+            results[['params', 'mean_score', 'std_score', 'mean_time', 'std_time']] = scikitResults[['params', 'mean_test_score', 'std_test_score', 'mean_fit_time', 'std_fit_time']]
+            results['worst_case'] = - results['mean_score'] - results['std_score']
+            results = results.sort_values('worst_case')
+
+        if self.mode == 'classification':
+            gridSearch = HalvingGridSearchCV(model, params,
+                                             cv=StratifiedKFold(n_splits=self.nSplits),
+                                             scoring='accuracy',
+                                             factor=5, n_jobs=4, verbose=2)
+            gridSearch.fit(input, output)
+            scikitResults = pd.DataFrame(gridSearch.cv_results_)
+            results = pd.DataFrame()
+            results[['params', 'mean_score', 'std_score', 'mean_time', 'std_time']] = scikitResults[['params', 'mean_test_score', 'std_test_score', 'mean_fit_time', 'std_fit_time']]
+            results['worst_case'] = results['mean_score'] - results['std_score']
+            results = results.sort_values('worst_case')
+
+        return results
+
+    def _validateResult(self, master_model, params, feature_set):
+        print(self.colKeep.keys(), feature_set)
+        print('[autoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
+                                                len(self.colKeep[feature_set]), feature_set, params))
+        if not os.path.exists(self.mainDir + 'Validation/'): os.mkdir(self.mainDir + 'Validation/')
+
+        # DEBUG PURPOSES, REMOVE AT ANY Time
+        self.nSplits = 3
+
+        # Select data
+        input, output = self.input[self.colKeep[feature_set]], self.output
+
+        # Normalize Feature Set (the input remains original)
+        if self.normalize:
+            normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
+            scaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+            input = scaler.transform(input[normalizeFeatures])
+            if self.mode == 'regression':
+                oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+                output = oScaler.transform(output)
+                print('(%.1f, %.1f)' % (np.mean(output), np.std(output)))
         else:
-            output = self.output[self.target].to_numpy()
+            input, output = input.to_numpy(), output.to_numpy().reshape((-1, 1))
+
 
         # For Regression
         if self.mode == 'regression':
@@ -892,28 +959,38 @@ class Pipeline(object):
             self._notification('[%s] Mean Absolute Error: %.2f \u00B1 %.2f' %
                               (self.mainDir[:-1], results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
 
-        # Copy Features & Normalization & Norm Features
-        json.dump(self.colKeep[feature_set], open(self.mainDir + 'Production/v%i/Features.json' % self.version, 'w'))
-        shutil.copy(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version),
-                    self.mainDir + 'Production/v%i/Scaler.pickle' % self.version)
-        if any(['dist_c_' in key for key in self.colKeep[feature_set]]):
+        # Save Features
+        self.bestFeatures = self.colKeep[feature_set]
+        json.dump(self.bestFeatures, open(self.mainDir + 'Production/v%i/Features.json' % self.version, 'w'))
+
+        # Copy data
+        input, output = self.input[self.bestFeatures], self.output
+
+        # Save Scalers & Normalize
+        if self.normalize:
+            # Save
+            shutil.copy(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version),
+                        self.mainDir + 'Production/v%i/Scaler.pickle' % self.version)
+            if self.mode == 'regression':
+                shutil.copy(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version),
+                            self.mainDir + 'Production/v%i/OScaler.pickle' % self.version)
+
+            # Normalize
+            normalizeFeatures = [k for k in self.bestFeatures if k not in self.dateCols + self.catCols]
+            self.bestScaler = pickle.load(
+                open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+            input = self.bestScaler.transform(input[normalizeFeatures])
+            if self.mode == 'regression':
+                self.bestOScaler = pickle.load(
+                    open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
+                output = self.bestOScaler.transform(output)
+            else:
+                output = self.output[self.target].to_numpy()
+
+        # Cluster Features require additional 'Centers' file
+        if any(['dist_c_' in key for key in self.bestFeatures]):
             shutil.copy(self.mainDir + 'Features/Centers_v%i.csv' % self.version,
                         self.mainDir + 'Production/v%i/Centers.csv' % self.version)
-        if self.mode == 'regression':
-            shutil.copy(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version),
-                        self.mainDir + 'Production/v%i/OScaler.pickle' % self.version)
-
-        # Data (Normalization)
-        input, output = self.input[self.colKeep[feature_set]], self.output
-        normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
-        self.bestScaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-
-        input = self.bestScaler.transform(input[normalizeFeatures])
-        if self.mode == 'regression':
-            self.bestOScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-            output = self.bestOScaler.transform(output)
-        else:
-            output = self.output[self.target].to_numpy()
 
         # Model
         self.bestModel = [mod for mod in self.Modelling.return_models() if type(mod).__name__ == model][0]
@@ -928,41 +1005,42 @@ class Pipeline(object):
         
         # Pipeline
         pickle.dump(self, open(self.mainDir + 'Production/v%i/Pipeline.pickle' % self.version, 'wb'))
-
-        # Features
-        self.bestFeatures = self.colKeep[feature_set]
         return
 
-    def _testProductionFiles(self):
+    def testProductionFiles(self, data):
         '''
         Test the production files. Not equivalent with predict function as features are stored in class memory.
         '''
         print('[AutoML] Testing Production files.')
-        # Load files
-        scaler = json.load(open(self.mainDir + 'Production/Scaler.json', 'r'))
+        # Data Conversion
+        input, output = self._convertData(data)
+
+        # Prediction
+        folder = 'Production/v%i/' % self.version
         if self.mode == 'regression':
-            oScaler = json.load(open(self.mainDir + 'Production/OScaler.json', 'r'))
-        features = json.load(open(self.mainDir + 'Production/Features.json', 'r'))
-        model = joblib.load(self.mainDir + 'Production/Model.joblib')
+            oScaler = pickle.load(open(self.mainDir + folder + 'OScaler.pickle', 'rb'))
+        model = joblib.load(self.mainDir + folder + 'Model.joblib')
 
         # Prepare inputs & Predict
-        input = scaler.transform(self.input[features])
-        output = self.output[self.target].to_numpy()
-        prediction = model.predict(input)
+        normalizedPrediction = model.predict(input)
 
         # Output for Regression
         if self.mode == 'regression':
             # Scale
-            originalPrediction = oScaler.inverse_transform(prediction)
-            output = oScaler.transform(output)
+            prediction = oScaler.inverse_transform(normalizedPrediction)
+            normalizedOutput = oScaler.transform(output)
 
             # Print
-            print('MAE (normalized):      %.3f' % Metrics.mae(output, prediction))
-            print('MAE (original):        %.3f' % Metrics.mae(self.output[self.target].to_numpy(), originalPrediction))
+            print('Input  ~ (%.1f, %.1f)' % (np.mean(input), np.std(input)))
+            print('Output ~ (%.1f, %.1f)' % (np.mean(output), np.std(output)))
+            print('MAE (normalized):      %.3f' % Metrics.mae(normalizedOutput, normalizedPrediction))
+            print('MAE (original):        %.3f' % Metrics.mae(output, prediction))
+            return prediction
 
         # Output for Classification
         if self.mode == 'classification':
             print('ACC:   %.3f' % Metrics.acc(output, prediction))
+            return prediction
 
     def _errorAnalysis(self):
         # Prepare data
@@ -977,26 +1055,46 @@ class Pipeline(object):
         # Analy
         return ''
 
-    def predict(self, data):
-        '''
-        Full script to make predictions. Uses 'Production' folder with defined or latest version.
-        '''
+    def _convertData(self, data):
         # Load files
         folder = 'Production/v%i/' % self.version
-        scaler = pickle.load(open(self.mainDir + folder + 'Scaler.pickle', 'rb'))
         features = json.load(open(self.mainDir + folder + 'Features.json', 'r'))
-        model = joblib.load(self.mainDir + folder + 'Model.joblib')
-        if self.mode == 'regression':
-            oScaler = pickle.load(open(self.mainDir + folder + 'OScaler.pickle', 'rb'))
+        if self.normalize:
+            scaler = pickle.load(open(self.mainDir + folder + 'Scaler.pickle', 'rb'))
+            if self.mode == 'regression':
+                oScaler = pickle.load(open(self.mainDir + folder + 'OScaler.pickle', 'rb'))
         if 'Centers.csv' in os.listdir(self.mainDir + folder):
             centers = pd.read_csv(self.mainDir + folder + 'Centers.csv')
 
+        # Clean data
+        # Keys
+        newKeys = {}
+        for key in data.keys():
+            newKeys[key] = re.sub('[^a-zA-Z0-9 \n\.]', '_', key.lower())
+        data = data.rename(columns=newKeys)
+
+        # Data Types
+        for key in data.keys():
+            data[key] = pd.to_numeric(data[key], errors='coerce')
+
+        # Outliers
+        # todo
+
+        # Missing values
+        ik = np.setdiff1d(data.keys().to_list(), self.dateCols)
+        data[ik] = data[ik].interpolate(limit_direction='both')
+        if data.isna().sum().sum() != 0:
+            data = data.fillna(0)
+
+        # Save output
+        output = data[self.target].to_numpy().reshape((-1, 1))
+
         # Features
-        multiFeatures = [features.pop(features.index(k)) for k in features if '__x__' in k]
-        divFeatures = [features.pop(features.index(k)) for k in features if '__d__' in k]
-        kMeansFeatures = [features.pop(features.index(k)) for k in features if 'dist_c_' in k]
-        diffFeatures = [features.pop(features.index(k)) for k in features if '__diff__' in k]
-        lagFeatures = [features.pop(features.index(k)) for k in features if '__lag__' in k]
+        multiFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__x__' in k]
+        divFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__d__' in k]
+        kMeansFeatures = [features.pop(features.index(k)) for k in features[::-1] if 'dist_c_' in k]
+        diffFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__diff__' in k]
+        lagFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__lag__' in k]
         input = data[features]
 
         # Multiplicative features
@@ -1030,13 +1128,28 @@ class Pipeline(object):
             input[key] = data[key].shift(-int(lag), fill_value=0)
 
         # Normalize
-        input = scaler.transform(input)
+        if self.normalize:
+            input = scaler.transform(input)
+
+        # Return
+        return input, output
+
+    def predict(self, data):
+        '''
+        Full script to make predictions. Uses 'Production' folder with defined or latest version.
+        '''
+        # Feature Extraction, Selection and Normalization
+        input, output = self._convertData(data)
+        model = joblib.load(self.mainDir + 'Production/v%i/Model.joblib' % self.version)
 
         # Predict
         if self.mode == 'regression':
-            predictions = oScaler.inverse_transform(model.predict(data))
+            if self.normalize:
+                predictions = oScaler.inverse_transform(model.predict(input))
+            else:
+                predictions = model.predict(input)
         if self.mode == 'classification':
-            predictions = model.predict_proba(data)[:, 1]
+            predictions = model.predict_proba(input)[:, 1]
         return predictions
 
     def returnPredictFunc(self):
