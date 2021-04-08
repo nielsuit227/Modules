@@ -1,4 +1,4 @@
-import os, time, itertools, re, joblib, json, pickle, copy, shutil
+import os, time, itertools, re, joblib, json, pickle, copy, shutil, textwrap, inspect
 import numpy as np
 import pandas as pd
 import ppscore as pps
@@ -77,10 +77,14 @@ class Pipeline(object):
                  grid_search_iterations=3,
                  use_halving=False,
 
+                 # Production
+                 custom_code=None,
+
                  # Flags
                  plot_eda=None,
                  process_data=None,
-                 validate_result=None):
+                 validate_result=None,
+                 verbose=1):
         # Starting
         print('\n\n*** Starting Amplo AutoML - %s ***\n\n' % project)
 
@@ -89,6 +93,8 @@ class Pipeline(object):
         else: self.mainDir = project if project[-1] == '/' else project + '/'
         self.target = re.sub('[^a-z0-9]', '_', target.lower())
         self.version = version
+        self.verbose = verbose
+        self.customCode = custom_code
 
         # Checks
         assert mode == 'regression' or mode == 'classification'
@@ -171,7 +177,8 @@ class Pipeline(object):
         # Updates changelog
         if self.processData:
             if len(versions) == 0:
-                print('[AutoML] No Production files found. Setting version 0.')
+                if self.verbose > 0:
+                    print('[AutoML] No Production files found. Setting version 0.')
                 self.version = 0
                 file = open(self.mainDir + 'changelog.txt', 'w')
                 file.write('Dataset changelog. \nv0: Initial')
@@ -192,17 +199,20 @@ class Pipeline(object):
                     file = open(self.mainDir + 'changelog.txt', 'a')
                     file.write(changelog)
                     file.close()
-                print('[AutoML] Set version %s' % (changelog))
+                if self.verbose > 0:
+                    print('[AutoML] Set version %s' % (changelog))
         else:
             if len(versions) == 0:
-                print('[AutoML] No Production files found. Setting version 0.')
+                if self.verbose > 0:
+                    print('[AutoML] No Production files found. Setting version 0.')
                 self.version = 0
             else:
                 self.version = int(len(versions)) - 1
                 with open(self.mainDir + 'changelog.txt', 'r') as f:
                     changelog = f.read()
                 changelog = changelog[changelog.find('v%i' % self.version):]
-                print('[AutoML] Loading last version (%s)' % changelog[:changelog.find('\n')])
+                if self.verbose > 0:
+                    print('[AutoML] Loading last version (%s)' % changelog[:changelog.find('\n')])
 
     def _createDirs(self):
         dirs = ['', 'Data', 'Features', 'Models', 'Production', 'Validation', 'Sets']
@@ -292,121 +302,9 @@ class Pipeline(object):
             print('[AutoML] Starting Exploratory Data Analysis')
             self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder=self.mainDir)
 
-    def data_preparation(self, data):
-        ''' DEPRECATED '''
-        # Load
-        if not self.prep_data and len(columns) != 0:
-            print('[AutoML] Loading data version %i' % self.version)
-            self.input = pd.read_csv(self.mainDir + 'Data/Input_v%i.csv' % self.version, index_col='index')
-            self.output = pd.read_csv(self.mainDir + 'Data/Output_v%i.csv' % self.version, index_col='index')
-            self.colKeep = json.load(open(self.mainDir + 'Sets/Col_keep_v%i.json' % self.version, 'r'))
-            if len(set(self.output[self.target])) == 2:
-                self.classification = True
-                self.regression = False
-        # Execute
-        else:
-            # Clean
-            self.prep = Preprocessing(missingValues=self.missing_values)
-            data = self.prep.clean(data)
-
-            # Split data
-            self.output = data[self.target]
-            self.input = data
-            if self.include_output is False:
-                self.input = self.input.drop(self.target, axis=1)
-
-            # Check whether is classification
-            if len(set(self.output)) == 2:
-                self.classification = True
-                self.regression = False
-            if self.classification:
-                output_set = set(self.output)
-                if output_set != {-1, 1}:
-                    print('[AutoML] WARNING: Classification labels should be {-1, 1}, AutoML changed them.')
-                    self.output.loc[self.output == list(output_set)[0]] = -1
-                    self.output.loc[self.output == list(output_set)[1]] = 1
-
-            # Normalize
-            print('[AutoML] Normalizing Data.')
-            norm_features = self.input.keys().to_list()
-            scaler = StandardScaler()
-            if self.regression:
-                self.input[self.input.keys()] = scaler.fit_transform(self.input)
-                output_scaler = StandardScaler()
-                self.output[self.output.keys()] = output_scaler.fit_transform(self.output.to_numpy().reshape((-1, 1))).reshape((-1))
-                pickle.dump(output_scaler, open(self.mainDir + '/Normalization/Output_norm_v%i.pickle' % self.version, 'wb'))
-            elif self.classification:
-                self.input[self.input.keys()] = scaler.fit_transform(self.input)
-            self.norm = scaler  # Important for production env that scaler doesn't have a super class
-            pickle.dump(scaler, open(self.mainDir + '/Normalization/Normalization_v%i.pickle' % self.version, 'wb'))
-            json.dump(norm_features, open(self.mainDir + '/Normalization/norm_features_v%i.json' % self.version, 'w'))
-
-            # Stationarity Check
-            print('[AutoML] Stationarity Check')
-            if self.max_diff != 0:
-                varVec = np.zeros((self.max_diff + 1, len(self.input.keys())))
-                diffData = self.input.copy(deep=True)
-                for i in range(self.max_diff + 1):
-                    varVec[i, :] = diffData.std()
-                    diffData = diffData.diff(1)[1:]
-                self.diffOrder = np.argmin(np.sum(varVec, axis=1))
-                if self.diffOrder == 0:
-                    self.diff = 'none'
-                else:
-                    self.diff = 'diff'
-                    print('[AutoML] Optimal Differencing order: %i' % self.diffOrder)
-            else:
-                self.diff = 'none'
-
-
-            # Keep all
-            print('[AutoML] Storing input/output')
-            self.colKeep = [self.input.keys().to_list()]
-            self.input.to_csv(self.mainDir + '/Data/Input_v%i.csv' % self.version, index_label='index')
-            self.output.to_csv(self.mainDir + '/Data/Output_v%i.csv' % self.version, index_label='index')
-
-            # Keep based on PPScore
-            print('[AutoML] Determining Features with PPS')
-            data = self.input.copy()
-            data['target'] = self.output.copy()
-            pp_score = pps.predictors(data, "target")
-            self.colKeep.append(pp_score['x'][pp_score['ppscore'] != 0].to_list())
-
-            # Keep based on RF
-            print('[AutoML] Determining Features with RF')
-            if self.regression:
-                rf = RandomForestRegressor().fit(self.input, self.output[self.target])
-            elif self.classification:
-                rf = RandomForestClassifier().fit(self.input, self.output[self.target])
-            fi = rf.feature_importances_
-            sfi = fi.sum()
-            ind = np.flip(np.argsort(fi))
-            # Based on Info Threshold (97.5% of info)
-            ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.info_threshold * sfi]
-            self.col_keep.append(self.input.keys()[ind_keep].to_list())
-            # Based on Info Increment (1% increments)
-            ind_keep = [ind[i] for i in range(len(ind)) if fi[i] > sfi / 100]
-            self.col_keep.append(self.input.keys()[ind_keep].to_list())
-
-            # Keep based on BorutaPy -- Numerically EXHAUSTIVE
-            print('[AutoML] Determining Features with Boruta')
-            if self.regression:
-                rf = RandomForestRegressor()
-            elif self.classification:
-                rf = RandomForestClassifier()
-            selector = BorutaPy(rf, n_estimators='auto', verbose=0)
-            selector.fit(self.input.to_numpy(), self.output.to_numpy())
-            self.col_keep.append(self.input.keys()[selector.support_].to_list())
-
-            # Store to self
-            print('[AutoML] Storing data preparation meta data.')
-            for i in range(len(self.datasets)):
-                json.dump(self.col_keep[i], open(self.mainDir + 'Features/features_%i_v%i.json' % (i, self.version), 'w'))
-            json.dump(self.col_keep, open(self.mainDir + 'Sets/Col_keep_v%i.json' % self.version, 'w'))
-
     def _dataProcessing(self, data):
         # Load if possible
-        if not self.processData and os.path.exists(self.mainDir + 'Data/Cleaned_v%i.csv' % self.version):
+        if os.path.exists(self.mainDir + 'Data/Cleaned_v%i.csv' % self.version):
             data = pd.read_csv(self.mainDir + 'Data/Cleaned_v%i.csv' % self.version, index_col='index')
 
         # Clean
@@ -420,21 +318,11 @@ class Pipeline(object):
             self.input = self.input.drop(self.target, axis=1)
 
     def _featureProcessing(self):
-        # Load if possible
-        if not self.processData and os.path.exists(self.mainDir + 'Data/Extracted_v%i.csv' % self.version):
-            self.input = pd.read_csv(self.mainDir + 'Data/Extracted_v%i.csv' % self.version, index_col='index')
-            self.colKeep = json.load(open(self.mainDir + 'Features/Sets_v%i.json' % self.version, 'r'))
+        # Extract
+        self.input = self.FeatureProcessing.extract(self.input, self.output[self.target])
 
-        else:
-            # Extract
-            self.input = self.FeatureProcessing.extract(self.input, self.output[self.target])
-
-            # Select
-            self.colKeep = self.FeatureProcessing.select(self.input, self.output[self.target])
-
-            # Store
-            self.input.to_csv(self.mainDir + 'Data/Extracted_v%i.csv' % self.version, index_label='index')
-            json.dump(self.colKeep, open(self.mainDir + 'Features/Sets_v%i.json' % self.version, 'w'))
+        # Select
+        self.colKeep = self.FeatureProcessing.select(self.input, self.output[self.target])
 
     def _initialModelling(self):
         # Load existing results
@@ -522,18 +410,21 @@ class Pipeline(object):
             }
         elif model.__module__ == 'lightgbm.sklearn':
             return {
-                'boosting': ['gbdt', 'rf', 'dart'],
-                'learning_rate': [0.01, 0.1, 0.3],
-                'num_leaves': [31, 50, 75],
-                # 'n_estimators': [100, 250, 500],
+                'num_leaves': [10, 31, 50],
+                'min_child_samples': [100, 250, 500],
+                'min_child_weight': [1e-5, 1e-3, 1e-1],
+                'subsample': [0.2, 0.4, 0.6, 0.8],
+                'colsample_bytree':[0.4, 0.5, 0.6],
+                'reg_alpha': [0, 0.5, 1],
+                'reg_lambda': [0, 0.5, 1],
                 'n_jobs': [4],
-                'feature_fraction': [0.8, 1]
             }
         elif model.__module__ == 'xgboost.sklearn':
             return {
                 'max_depth': [3, 6, 9, 12],
                 'booster': ['gbtree', 'gblinear', 'dart'],
                 'learning_rate': [0.01, 0.1, 0.3],
+                'n_estimators': [100, 250, 500],
                 'verbosity': [0],
                 'n_jobs': [4],
             }
@@ -560,11 +451,9 @@ class Pipeline(object):
             elif isinstance(model, catboost.core.CatBoostRegressor):
                 return {
                     'loss_function': ['MAE', 'RMSE'],
-                    'n_estimators': [500],
                     'learning_rate': [0.001, 0.01, 0.03, 0.05, 0.1],
                     'l2_leaf_reg': [1, 3, 5],
                     'n_estimators': [50, 100, 200],
-                    'verbose': [0],
                 }
             elif isinstance(model, sklearn.ensemble.GradientBoostingRegressor):
                 return {
@@ -611,11 +500,8 @@ class Pipeline(object):
             elif isinstance(model, catboost.core.CatBoostClassifier):
                 return {
                     'loss_function': ['Logloss', 'MultiClass'],
-                    'iterations': [500],
-                    # 'iterations': [500, 1000, 2000],
                     'learning_rate': [0.001, 0.01, 0.03, 0.05, 0.1],
                     'l2_leaf_reg': [1, 3, 5],
-                    'verbose': [0],
                 }
             elif isinstance(model, sklearn.ensemble.BaggingClassifier):
                 return {
@@ -716,6 +602,12 @@ class Pipeline(object):
             self.results['type'] == 'Initial modelling',
             self.results['data_version'] == self.version,
         )])
+
+        # TODO Check if model is not already opitmized for a feature set
+        completedModels = list(set(self.results[np.logical_and(
+            self.results['type'] == 'Hyperparameter Opt',
+            self.results['data_version'] == self.version,
+        )]))
         for iteration in range(self.gridSearchIterations):
             # Grab settings
             settings = results.iloc[iteration]
@@ -820,12 +712,15 @@ class Pipeline(object):
         # Specify Halving Resource
         resource = 'n_samples'
         max_resources = 'auto'
-        # if model.__module__ == 'catboost.core':
-        #     resource = 'n_estimators'
-        #     max_resources = 1000
-        if model.__module__ == 'sklearn.ensemble._bagging':
+        if model.__module__ == 'catboost.core':
             resource = 'n_estimators'
-            max_resources = 50
+            max_resources = 3000
+            min_resources = 250
+        if model.__module__ == 'sklearn.ensemble._bagging' or model.__module__ == 'xgboost.sklearn'\
+                or model.__module__ == 'lightgbm.sklearn':
+            resource = 'n_estimators'
+            max_resources = 250
+            min_resources = 50
 
 
         # Optimization
@@ -833,6 +728,7 @@ class Pipeline(object):
             gridSearch = HalvingGridSearchCV(model, params,
                                              resource=resource,
                                              max_resources=max_resources,
+                                             min_resources=min_resources,
                                              cv=KFold(n_splits=self.nSplits),
                                              scoring='neg_mean_absolute_error',
                                              factor=5, n_jobs=4, verbose=1)
@@ -847,6 +743,7 @@ class Pipeline(object):
             gridSearch = HalvingGridSearchCV(model, params,
                                              resource=resource,
                                              max_resources=max_resources,
+                                             min_resources=min_resources,
                                              cv=StratifiedKFold(n_splits=self.nSplits),
                                              scoring='accuracy',
                                              factor=5, n_jobs=4, verbose=1)
@@ -1068,9 +965,10 @@ class Pipeline(object):
         joblib.dump(self.bestModel, self.mainDir + 'Production/v%i/Model.joblib' % self.version)
 
         # Predict function
-        f = open(self.mainDir + 'Production/v%i/Predict.py' % self.version, 'w')
-        f.write(self.returnPredictFunc())
-        f.close()
+        with open(self.mainDir + 'Production/v%i/Predict.py' % self.version, 'w') as f:
+            f.write(self.createPredictFunction(self.customCode))
+        with open(self.mainDir + 'Production/v%i/__init__.py' % self.version, 'w') as f:
+            f.write('')
         
         # Pipeline
         pickle.dump(self, open(self.mainDir + 'Production/v%i/Pipeline.pickle' % self.version, 'wb'))
@@ -1135,8 +1033,6 @@ class Pipeline(object):
                 oScaler = pickle.load(open(self.mainDir + folder + 'OScaler.pickle', 'rb'))
         if self.mode == 'regression':
             oScaler = pickle.load(open(self.mainDir + folder + 'OScaler.pickle', 'rb'))
-        if 'Centers.csv' in os.listdir(self.mainDir + folder):
-            centers = pd.read_csv(self.mainDir + folder + 'Centers.csv')
 
         # Clean data
         data = self.DataProcessing._cleanKeys(data)
@@ -1144,6 +1040,8 @@ class Pipeline(object):
         data = self.DataProcessing._removeDuplicates(data)
         data = self.DataProcessing._removeOutliers(data)
         data = self.DataProcessing._removeMissingValues(data)
+        if data.astype('float32').replace([np.inf, -np.inf], np.nan).isna().sum().sum() != 0:
+            raise ValueError('Data should not contain NaN or Infs after cleaning!')
 
         # Save output
         if self.target in data.keys():
@@ -1151,61 +1049,23 @@ class Pipeline(object):
         else:
             output = None
 
-        # Features
-        multiFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__x__' in k]
-        divFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__d__' in k]
-        kMeansFeatures = [features.pop(features.index(k)) for k in features[::-1] if 'dist_c_' in k]
-        diffFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__diff__' in k]
-        lagFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__lag__' in k]
+        # Convert Features
+        if 'Centers.csv' in os.listdir(self.mainDir + folder):
+            centers = pd.read_csv(self.mainDir + folder + 'Centers.csv')
+            input = self.FeatureProcessing.transform(data=data, features=features, centers=centers)
+        else:
+            input = self.FeatureProcessing.transform(data, features)
 
-        # Fill missing features for normalization
-        required = copy.copy(features)
-        required += [k for s in multiFeatures for k in s.split('__x__')]
-        required += [k for s in divFeatures for k in s.split('__d__')]
-        required += [k for k in centers.keys()]
-        required += [s.split('__diff__')[0] for s in diffFeatures]
-        required += [s.split('__lag__')[0] for s in multiFeatures]
-        for k in [k for k in required if k not in data.keys()]:
-            data[k] = np.zeros(len(data))
-
-        # Select
-        input = data[features]
-
-        # Multiplicative features
-        for key in multiFeatures:
-            keyA, keyB = key.split('__x__')
-            feature = data[keyA] * data[keyB]
-            input[key] = feature.replace([np.inf, -np.inf], 0).fillna(0)
-
-        # Division features
-        for key in divFeatures:
-            keyA, keyB = key.split('__d__')
-            feature = data[keyA] / data[keyB]
-            input[key] = feature.replace([np.inf, -np.inf], 0).fillna(0)
-
-        # Differenced features
-        for k in diffFeatures:
-            key, diff = k.split('__diff__')
-            feature = data[key]
-            for i in range(1, diff):
-                feature = feature.diff().fillna(0)
-            input[k] = feature
-
-        # K-Means features
-        for key in [k for k in centers.keys() if k not in data.keys()]:
-            data[key] = np.zeros(len(input))
-        for key in kMeansFeatures:
-            ind = int(key[key.find('dist_c_') + 7: key.rfind('_')])
-            input[key] = np.sqrt(np.square(data[centers.keys()] - centers.iloc[ind]).sum(axis=1))
-
-        # Lagged features
-        for k in lagFeatures:
-            key, lag = k.split('__lag__')
-            input[key] = data[key].shift(-int(lag), fill_value=0)
+        if input.astype('float32').replace([np.inf, -np.inf], np.nan).isna().sum().sum() != 0:
+            raise ValueError('Data should not contain NaN or Infs after adding featuers!')
 
         # Normalize
         if self.normalize:
             input = scaler.transform(input)
+
+        # Remove large features (buggy k-means features)
+        input[input.astype('float32') == np.inf] = 1e38
+
         # Return
         return input, output
 
@@ -1225,9 +1085,6 @@ class Pipeline(object):
             else:
                 predictions = model.predict(input)
         if self.mode == 'classification':
-            input = input.astype('float32')
-            input[input == np.inf] = 0
-            input[input == -np.inf] = 0
             try:
                 predictions = model.predict_proba(input)[:, 1]
             except:
@@ -1235,86 +1092,19 @@ class Pipeline(object):
 
         return predictions
 
-    def returnPredictFunc(self):
-        return '''import pandas as pd
+    def createPredictFunction(self, custom_code):
+        '''
+        This function returns a string, which can be used to make predictions.
+        This is in a predefined format, a Predict class, with a predict funtion taking the arguments
+        model: trained sklearn-like class with the .fit() function
+        features: list of strings containing all features fed to the model
+        scaler: trained sklearn-like class with .transform function
+        data: the data to predict on
+        Now this function has the arg decoding, which allows custom code injection
+        '''
+        return """import pandas as pd
 import numpy as np
-import struct, re
-
-
-def decode(data, dbc):
-    # Clean keys
-    for key in data.keys():
-        data = data.rename(columns={key: key.replace(' ', '')})
-    dec_list = []
-    float_inds = [1031, 1002, 997, 873, 934, 868, 1313, 1282, 1281, 1038, 1037, 1036, 1035, 1033, 1032, 1030, 1029,
-                  1028, 1026, 1070, 1069, 1068, 1067, 1065, 1064, 1063, 1063, 1061, 1060, 1059, 1058]
-    
-    # Decode first 9000 samples
-    for j in range(9000):
-        row = data.iloc[j]
-        row_id = int(row['ID'], 0)
-        can_bytes = bytes.fromhex(row['data'].strip()[2:])[::-1]
-
-        # Skip legacy packages
-        if row_id not in [265, 280, 769, 808, 866, 870, 871, 877, 879, 881, 885, 889, 891, 933, 943, 944, 945,
-                          1025, 1026, 1035, 1057, 1058, 1063, 1067, 1889]:
-            continue
-
-        # Decode
-        try:
-            decoded = dbc.decode_message(row_id, can_bytes)
-            decoded['ts'] = row['Recvtime']
-            # Check floats
-            if row_id in float_inds:
-                if len(dbc.get_message_by_frame_id(row_id).signals) == 2:
-                    x, y = struct.unpack('<ff', can_bytes)
-                    decoded[list(decoded.keys())[0]] = x
-                    decoded[list(decoded.keys())[1]] = y
-                else:
-                    signal = [s for s in dbc.get_message_by_frame_id(row_id).signals if s.length == 32][0]
-                    x, y = struct.unpack('<ff', can_bytes)
-                    if signal.start == 32:
-                        decoded[signal.name] = y
-                    elif signal.start == 0:
-                        decoded[signal.name] = x
-                # Store
-                dec_list.append(decoded)
-        except:
-            # Bare exception is no issue. Exception is triggered for legacy messages.
-            pass
-    
-    # Store
-    data = pd.DataFrame(dec_list)
-    
-    # Convert timestamps
-    data['ts'] = pd.to_datetime(data['ts'])
-    data = data.set_index('ts')
-    
-    # Drop duplicates
-    data = data.drop_duplicates()
-    data = data.loc[:, ~data.columns.duplicated()]
-    
-    # Merge rows
-    new_data = pd.DataFrame(columns=[], index=data.index.drop_duplicates(keep='first'))
-    for key in data.keys():
-        key_series = pd.Series(data[~data[key].isna()][key])
-        new_data[key] = key_series[~key_series.index.duplicated()]
-    data = new_data
-    
-    # Cleaning Keys
-    new_keys = {}
-    for key in data.keys():
-        new_keys[key] = re.sub('[^a-zA-Z0-9]', '_', key.lower())
-    data = data.rename(columns=new_keys)
-            
-    # Synchronise
-    data = data.resample('ms').interpolate(limit_direction='both')
-    data = data.resample('s').asfreq()[1:]
-    
-    # Take last 15 seconds
-    data = data.iloc[-15:]
-
-    return data
+import struct, re, copy
 
 
 class Predict(object):
@@ -1322,17 +1112,43 @@ class Predict(object):
     def __init__(self):
         self.version = 'v0.1.2'
 
-    def predict(self, model, features, scaler, dbc, data):
-        # Decode & Synchronise (all Tritium specific)
-        data = decode(data, dbc)
-
-        # Convert to timeseries & preprocess
-        data = process(data, features, scaler, centers)
-
-        # Make prediction
-        predictions = model.predict_proba(data.iloc[1:])[:, 1]
-        return sum(predictions) / len(predictions) * 100
-'''
+    def predict(self, model, features, data, **args):
+        ''' 
+        Prediction function for Amplo's AutoML. 
+        This is in a predefined format: 
+        - a 'Predict' class, with a 'predict' funtion taking the arguments:        
+            model: trained sklearn-like class with the .fit() function
+            features: list of strings containing all features fed to the model
+            data: the data to predict on
+        Note: May depend on additional named arguments within args. 
+        '''
+        ###############
+        # Custom Code #
+        ###############""" + textwrap.indent(custom_code, '    ') \
+    + self.DataProcessing.exportFunction() \
+    + self.FeatureProcessing.exportFunction() + '''
+        ###########
+        # Predict #
+        ###########
+        mode = '{}'
+        
+        # Normalize
+        if 'scaler' in args.keys():
+            data = args['scaler'].transform(input)
+        
+        if mode == 'regression':
+            if 'oScaler' in args.keys():
+                predictions = args['oScaler'].inverse_transform(model.predict(input))
+            else:
+                predictions = model.predict(input)
+        if mode == 'classification':
+            try:
+                predictions = model.predict_proba(input)[:, 1]
+            except:
+                predictions = model.predict(input)
+        
+        return predictions
+'''.format(self.mode)
 
 class DataProcessing(object):
 
@@ -1408,6 +1224,7 @@ class DataProcessing(object):
         return data
 
     def _cleanKeys(self, data):
+        # Clean Keys
         newKeys = {}
         for key in data.keys():
             newKeys[key] = re.sub('[^a-zA-Z0-9 \n\.]', '_', key.lower())
@@ -1415,37 +1232,34 @@ class DataProcessing(object):
         return data
 
     def _convertDataTypes(self, data):
-        print('[Data] Converted %i numerical, %i categorical and %i date columns' %
-              (len(self.numCols), len(self.catCols), len(self.dateCols)))
+        # Convert Data Types
         for key in self.dateCols:
-            data[key] = pd.to_datetime(data[key], errors='coerce', infer_datetime_format=True, utc=True)
+            data.loc[:, key] = pd.to_datetime(data[key], errors='coerce', infer_datetime_format=True, utc=True)
         for key in [key for key in data.keys() if key not in self.dateCols and key not in self.catCols]:
-            data[key] = pd.to_numeric(data[key], errors='coerce', downcast='float')
+            data.loc[:, key] = pd.to_numeric(data[key], errors='coerce', downcast='float')
         for key in self.catCols:
-            dummies = pd.get_dummies(data[key])
-            for dummy_key in dummies.keys():
-                dummies = dummies.rename(columns={dummy_key: key + '_' + re.sub('[^a-z0-9]', '_', str(dummy_key).lower())})
-            data = data.drop(key, axis=1).join(dummies)
+            if key in data.keys():
+                dummies = pd.get_dummies(data[key])
+                for dummy_key in dummies.keys():
+                    dummies = dummies.rename(columns={dummy_key: key + '_' + re.sub('[^a-z0-9]', '_', str(dummy_key).lower())})
+                data = data.drop(key, axis=1).join(dummies)
         if self.target in data.keys():
-            data[self.target] = pd.to_numeric(data[self.target], errors='coerce')
+            data.loc[:, self.target] = pd.to_numeric(data[self.target], errors='coerce')
         return data
 
     def _removeDuplicates(self, data):
-        n_rows, n_cols = len(data), len(data.keys())
-        data = data.drop_duplicates()
-        print('[Data] Dropped %i duplicate rows' % (n_rows - len(data)))
+        # Remove Duplicates
+        data.drop_duplicates(inplace=True)
         data = data.loc[:, ~data.columns.duplicated()]
-        print('[Data] Dropped %i duplicate columns' % (n_cols - len(data.keys())))
         return data
 
     def _removeConstants(self, data):
-        nCols = len(data.keys())
-        data = data.drop(data.keys()[data.min() == data.max()], axis=1)
-        print('[Data] Removed %i constant columns' % (nCols - len(data.keys())))
+        # Remove Constants
+        data.drop(columns=data.columns[data.nunique() == 1], inplace=True)
         return data
 
     def _removeOutliers(self, data):
-        n_nans = data.isna().sum().sum()
+        # Remove Outliers
         if self.outlierRemoval == 'boxplot':
             Q1 = data.quantile(0.25)
             Q3 = data.quantile(0.75)
@@ -1456,12 +1270,11 @@ class DataProcessing(object):
             Zscore = (data - data.mean(skipna=True, numeric_only=True)) \
                      / np.sqrt(data.var(skipna=True, numeric_only=True))
             data[Zscore > self.zScoreThreshold] = np.nan
-        print('[Data] Removed %i outliers.' % (data.isna().sum().sum() - n_nans))
         return data
 
     def _removeMissingValues(self, data):
+        # Remove Missing Values
         data = data.replace([np.inf, -np.inf], np.nan)
-        n_nans = data.isna().sum().sum()
         if self.missingValues == 'remove_rows':
             data = data[data.isna().sum(axis=1) == 0]
         elif self.missingValues == 'remove_cols':
@@ -1475,9 +1288,6 @@ class DataProcessing(object):
                 data = data.fillna(0)
         elif self.missingValues == 'mean':
             data = data.fillna(data.mean())
-        if n_nans > 0:
-            print('[Data] Filled %i (%.1f %%) missing values with %s' % (n_nans,
-                  n_nans * 100 / len(data) / len(data.keys()), self.missingValues))
         return data
 
     def __normalize(self, data):
@@ -1498,6 +1308,25 @@ class DataProcessing(object):
     def _store(self, data):
         # Store cleaned data
         data.to_csv(self.folder + 'Cleaned_v%i.csv' % self.version, index_label='index')
+
+    def exportFunction(self):
+        functionStrings = [
+            inspect.getsource(self._cleanKeys),
+            inspect.getsource(self._removeDuplicates).replace('self.', ''),
+            inspect.getsource(self._removeConstants),
+            inspect.getsource(self._removeOutliers).replace('self.', ''),
+            inspect.getsource(self._removeMissingValues).replace('self.', ''),
+        ]
+        functionStrings = '\n'.join([k[k.find('\n'): k.rfind('\n', 0, k.rfind('\n'))] for k in functionStrings])
+        return """
+        #################
+        # Data Cleaning #
+        #################
+        # Copy vars
+        catCols, dateCols, target = {}, {}, '{}'
+        outlierRemoval, missingValues, zScoreThreshold = '{}', '{}', '{}'
+""".format(self.catCols, self.dateCols, self.target, self.outlierRemoval, self.missingValues, self.zScoreThreshold) \
+        +  functionStrings
 
 class FeatureProcessing(object):
 
@@ -1533,10 +1362,101 @@ class FeatureProcessing(object):
         self._removeColinearity()
         self._addCrossFeatures()
         self._addDiffFeatures()
-        self._addKMeansFeatures()
+        # self._addKMeansFeatures()
         self._calcBaseline()
         self._addLaggedFeatures()
         return self.input
+
+    def select(self, inputFrame, outputFrame):
+        # Check if not exists
+        if os.path.exists(self.folder + 'Sets_v%i.json' % self.version):
+            return json.load(open(self.folder + 'Sets_v%i.json' % self.version, 'r'))
+
+        # Execute otherwise
+        else:
+            # Clean
+            self._cleanAndSet(inputFrame, outputFrame)
+
+            # Different Feature Sets
+            pps = self._predictivePowerScore()
+            rft, rfi = self._randomForestImportance()
+            bp = self._borutaPy()
+
+            # Store & Return
+            result = {'PPS': pps, 'RFT': rft, 'RFI': rfi, 'BP': bp}
+            json.dump(result, open(self.folder + 'Sets_v%i.json' % self.version, 'w'))
+            return result
+
+    def transform(self, data, features, **args):
+        # Split Features
+        multiFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__x__' in k]
+        divFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__d__' in k]
+        kMeansFeatures = [features.pop(features.index(k)) for k in features[::-1] if 'dist_c_' in k]
+        diffFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__diff__' in k]
+        lagFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__lag__' in k]
+
+        # Make sure centers are provided if kMeansFeatures are nonzero
+        if len(kMeansFeatures) != 0:
+            if 'centers' not in args:
+                raise ValueError('For K-Means features, the Centers need to be provided.')
+            centers = args['centers']
+
+        # Fill missing features for normalization
+        required = copy.copy(features)
+        required += [k for s in multiFeatures for k in s.split('__x__')]
+        required += [k for s in divFeatures for k in s.split('__d__')]
+        required += [s.split('__diff__')[0] for s in diffFeatures]
+        required += [s.split('__lag__')[0] for s in multiFeatures]
+        if len(kMeansFeatures) != 0:
+            required += [k for k in centers.keys()]
+        for k in [k for k in required if k not in data.keys()]:
+            data.loc[:, k] = np.zeros(len(data))
+
+        # Select
+        input = data[features]
+
+        # Multiplicative features
+        for key in multiFeatures:
+            keyA, keyB = key.split('__x__')
+            feature = data[keyA] * data[keyB]
+            input.loc[:, key] = feature.replace([np.inf, -np.inf], 0).fillna(0)
+
+        # Division features
+        for key in divFeatures:
+            keyA, keyB = key.split('__d__')
+            feature = data[keyA] / data[keyB]
+            input.loc[:, key] = feature.replace([np.inf, -np.inf], 0).fillna(0)
+
+        # Differenced features
+        for k in diffFeatures:
+            key, diff = k.split('__diff__')
+            feature = data[key]
+            for i in range(1, diff):
+                feature = feature.diff().fillna(0)
+            input.loc[:, k] = feature
+
+        # K-Means features
+        if len(kMeansFeatures) != 0:
+            for key in [k for k in centers.keys() if k not in data.keys()]:
+                data.loc[:, key] = np.zeros(len(input))
+            for key in kMeansFeatures:
+                ind = int(key[key.find('dist_c_') + 7: key.rfind('_')])
+                input.loc[:, key] = np.sqrt(np.square(data.loc[:, centers.keys()] - centers.iloc[ind]).sum(axis=1))
+
+        # Lagged features
+        for k in lagFeatures:
+            key, lag = k.split('__lag__')
+            input.loc[:, key] = data[key].shift(-int(lag), fill_value=0)
+
+        return input
+
+    def exportFunction(self):
+        code = inspect.getsource(self.transform)
+        return """
+        
+        ############
+        # Features #
+        ############""" + code[code.find('\n'): code.rfind('\n', 0, code.rfind('\n'))]
 
     def _cleanAndSet(self, inputFrame, outputFrame):
         assert isinstance(inputFrame, pd.DataFrame), 'Input supports only Pandas DataFrame'
@@ -1598,9 +1518,8 @@ class FeatureProcessing(object):
                         corr_mat[j, i] = c
             upper = np.triu(corr_mat)
             self.colinearFeatures = self.input.keys()[np.sum(upper > self.informationThreshold, axis=0) > 0].to_list()
+            json.dump(self.colinearFeatures, open(self.folder + 'Colinear_v%i.json' % self.version, 'w'))
 
-        # Save & Store
-        json.dump(self.colinearFeatures, open(self.folder + 'Colinear_v%i.json' % self.version, 'w'))
         self.originalInput = self.originalInput.drop(self.colinearFeatures, axis=1)
         print('[Features] Removed %i Co-Linear features (%.3f %% threshold)' % (len(self.colinearFeatures), self.informationThreshold))
 
@@ -1795,23 +1714,6 @@ class FeatureProcessing(object):
             key, lag = k.split('__lag__')
             self.input[k] = self.originalInput[key].shift(-int(lag), fill_value=0)
         json.dump(self.laggedFeatures, open(self.folder + 'laggedFeatures_v%i.json' % self.version, 'w'))
-
-
-    def select(self, inputFrame, outputFrame):
-        # Check if not exists
-        if os.path.exists(self.folder + 'FeatureSets_v%i.json' % self.version):
-            return json.load(open(self.folder + 'FeatureSets_v%i.json' % self.version, 'r'))
-
-        # Execute otherwise
-        else:
-            # Clean
-            self._cleanAndSet(inputFrame, outputFrame)
-
-            # Different Feature Sets
-            pps = self._predictivePowerScore()
-            rft, rfi = self._randomForestImportance()
-            bp = self._borutaPy()
-            return {'PPS': pps, 'RFT': rft, 'RFI': rfi, 'BP': bp}
 
     def _predictivePowerScore(self):
         '''
@@ -2148,36 +2050,37 @@ class Modelling(object):
             ridge = linear_model.RidgeClassifier()
             # lasso = linear_model.Lasso()
             # sgd = linear_model.SGDClassifier()
-            svc = svm.SVC(kernel='rbf')
+            svm = svm.SVC(kernel='rbf')
             # knc = neighbors.KNeighborsClassifier()
             # dtc = tree.DecisionTreeClassifier()
             # ada = ensemble.AdaBoostClassifier()
-            cat = catboost.CatBoostClassifier(verbose=0)
+            cat = catboost.CatBoostClassifier(verbose=0, n_estimators=1000, allow_writing_files=False)
             bag = ensemble.BaggingClassifier()
-            gbc = ensemble.GradientBoostingClassifier()
-            hgbc = ensemble.HistGradientBoostingClassifier()
-            rfc = ensemble.RandomForestClassifier()
+            gb = ensemble.GradientBoostingClassifier()
+            hgb = ensemble.HistGradientBoostingClassifier()
+            rf = ensemble.RandomForestClassifier()
             # mlp = neural_network.MLPClassifier()
-            xgb = xgboost.XGBClassifier()
-            lgbm = lightgbm.LGBMClassifier()
+            xgb = xgboost.XGBClassifier(n_estimators=250, verbosity=0)
+            lgbm = lightgbm.LGBMClassifier(n_estimators=250, verbose=-1, force_row_wise=True)
 
         elif self.mode == 'regression':
             ridge = linear_model.Ridge()
             # lasso = linear_model.Lasso()
             # sgd = linear_model.SGDRegressor()
-            svr = svm.SVR(kernel='rbf')
+            svm = svm.SVR(kernel='rbf')
             # knr = neighbors.KNeighborsRegressor()
             # dtr = tree.DecisionTreeRegressor()
             # ada = ensemble.AdaBoostRegressor()
-            cat = catboost.CatBoostRegressor(verbose=0)
-            gbr = ensemble.GradientBoostingRegressor()
-            hgbr = ensemble.HistGradientBoostingRegressor()
-            rfr = ensemble.RandomForestRegressor()
+            cat = catboost.CatBoostRegressor(verbose=0, n_estimators=1000, allow_writing_files=False)
+            bag = ensemble.BaggingRegressor()
+            gb = ensemble.GradientBoostingRegressor()
+            hgb = ensemble.HistGradientBoostingRegressor()
+            rf = ensemble.RandomForestRegressor()
             # mlp = neural_network.MLPRegressor()
-            xgb = xgboost.XGBRegressor()
-            lgbm = lightgbm.LGBMRegressor()
+            xgb = xgboost.XGBRegressor(n_estimators=250, verbosity=0)
+            lgbm = lightgbm.LGBMRegressor(n_estimators=250, verbose=-1, force_row_wise=True)
 
-        return [ridge, svc, cat, bag, gbc, hgbc, rfc, xgb, lgbm]
+        return [ridge, svm, cat, bag, gb, hgb, rf, xgb, lgbm]
 
     def _fit(self, input, output, cross_val, metric):
         # Convert to NumPy
