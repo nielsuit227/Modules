@@ -168,29 +168,41 @@ class Pipeline(object):
 
     def _loadVersion(self):
         versions = os.listdir(self.mainDir + 'Production')
-        if self.version is None:
+        # Updates changelog
+        if self.processData:
             if len(versions) == 0:
                 print('[AutoML] No Production files found. Setting version 0.')
                 self.version = 0
-            else:
-                with open(self.mainDir + 'changelog.txt', 'r') as f:
-                    changelog = f.read()
-                changelog = changelog[changelog.find('v%i' % len(versions)):]
-                print('[AutoML] Loading last version (%s)' % changelog[:changelog.find('\n')])
-                self.version = int(len(versions))
-
-        # Updates changelog
-        if self.processData:
-            if self.version == 0:
                 file = open(self.mainDir + 'changelog.txt', 'w')
                 file.write('Dataset changelog. \nv0: Initial')
                 file.close()
             else:
-                changelog = input("Data changelog v%i:\n" % self.version)
-                file = open(self.mainDir + 'changelog.txt', 'a')
-                file.write(('\nv%i: ' % self.version) + changelog)
-                file.close()
-                print('[AutoML] Set version v%i, %s' % (self.version, changelog))
+                self.version = len((versions))
+
+                # Check if not already started
+                with open(self.mainDir + 'changelog.txt', 'r') as f:
+                    changelog = f.read()
+
+                # Else ask for changelog
+                if 'v%i' % self.version in changelog:
+                    changelog = changelog[changelog.find('v%i' % self.version):]
+                    changelog = changelog[:changelog.find('\n')]
+                else:
+                    changelog = '\nv%i: ' % self.version + input("Data changelog v%i:\n" % self.version)
+                    file = open(self.mainDir + 'changelog.txt', 'a')
+                    file.write(changelog)
+                    file.close()
+                print('[AutoML] Set version %s' % (changelog))
+        else:
+            if len(versions) == 0:
+                print('[AutoML] No Production files found. Setting version 0.')
+                self.version = 0
+            else:
+                self.version = int(len(versions)) - 1
+                with open(self.mainDir + 'changelog.txt', 'r') as f:
+                    changelog = f.read()
+                changelog = changelog[changelog.find('v%i' % self.version):]
+                print('[AutoML] Loading last version (%s)' % changelog[:changelog.find('\n')])
 
     def _createDirs(self):
         dirs = ['', 'Data', 'Features', 'Models', 'Production', 'Validation', 'Sets']
@@ -242,7 +254,7 @@ class Pipeline(object):
                         .replace("False", "false")\
                         .replace("None", "null"))
             except:
-                print('[autoML] Cannot validate, imparsable JSON.')
+                print('[AutoML] Cannot validate, imparsable JSON.')
                 print(json_string)
                 return json_string
 
@@ -266,27 +278,25 @@ class Pipeline(object):
         @param data: DataFrame including target
         '''
         # Execute pipeline
-        self._eda(data)
         self._dataProcessing(data)
+        self._eda(data)
         self._featureProcessing()
         self._initialModelling()
         self.gridSearch()
         # Production Env
         self._prepareProductionFiles()
-        print('[autoML] Done :)')
+        print('[AutoML] Done :)')
 
     def _eda(self, data):
         if self.plotEDA:
-            print('[autoML] Starting Exploratory Data Analysis')
-            output = data[self.target]
-            input = data.drop(self.target, axis=1)
-            self.eda = ExploratoryDataAnalysis(input, output=output, folder=self.mainDir + 'EDA')
+            print('[AutoML] Starting Exploratory Data Analysis')
+            self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder=self.mainDir)
 
     def data_preparation(self, data):
         ''' DEPRECATED '''
         # Load
         if not self.prep_data and len(columns) != 0:
-            print('[autoML] Loading data version %i' % self.version)
+            print('[AutoML] Loading data version %i' % self.version)
             self.input = pd.read_csv(self.mainDir + 'Data/Input_v%i.csv' % self.version, index_col='index')
             self.output = pd.read_csv(self.mainDir + 'Data/Output_v%i.csv' % self.version, index_col='index')
             self.colKeep = json.load(open(self.mainDir + 'Sets/Col_keep_v%i.json' % self.version, 'r'))
@@ -312,12 +322,12 @@ class Pipeline(object):
             if self.classification:
                 output_set = set(self.output)
                 if output_set != {-1, 1}:
-                    print('[autoML] WARNING: Classification labels should be {-1, 1}, AutoML changed them.')
+                    print('[AutoML] WARNING: Classification labels should be {-1, 1}, AutoML changed them.')
                     self.output.loc[self.output == list(output_set)[0]] = -1
                     self.output.loc[self.output == list(output_set)[1]] = 1
 
             # Normalize
-            print('[autoML] Normalizing Data.')
+            print('[AutoML] Normalizing Data.')
             norm_features = self.input.keys().to_list()
             scaler = StandardScaler()
             if self.regression:
@@ -332,7 +342,7 @@ class Pipeline(object):
             json.dump(norm_features, open(self.mainDir + '/Normalization/norm_features_v%i.json' % self.version, 'w'))
 
             # Stationarity Check
-            print('[autoML] Stationarity Check')
+            print('[AutoML] Stationarity Check')
             if self.max_diff != 0:
                 varVec = np.zeros((self.max_diff + 1, len(self.input.keys())))
                 diffData = self.input.copy(deep=True)
@@ -344,26 +354,26 @@ class Pipeline(object):
                     self.diff = 'none'
                 else:
                     self.diff = 'diff'
-                    print('[autoML] Optimal Differencing order: %i' % self.diffOrder)
+                    print('[AutoML] Optimal Differencing order: %i' % self.diffOrder)
             else:
                 self.diff = 'none'
 
 
             # Keep all
-            print('[autoML] Storing input/output')
+            print('[AutoML] Storing input/output')
             self.colKeep = [self.input.keys().to_list()]
             self.input.to_csv(self.mainDir + '/Data/Input_v%i.csv' % self.version, index_label='index')
             self.output.to_csv(self.mainDir + '/Data/Output_v%i.csv' % self.version, index_label='index')
 
             # Keep based on PPScore
-            print('[autoML] Determining Features with PPS')
+            print('[AutoML] Determining Features with PPS')
             data = self.input.copy()
             data['target'] = self.output.copy()
             pp_score = pps.predictors(data, "target")
             self.colKeep.append(pp_score['x'][pp_score['ppscore'] != 0].to_list())
 
             # Keep based on RF
-            print('[autoML] Determining Features with RF')
+            print('[AutoML] Determining Features with RF')
             if self.regression:
                 rf = RandomForestRegressor().fit(self.input, self.output[self.target])
             elif self.classification:
@@ -379,7 +389,7 @@ class Pipeline(object):
             self.col_keep.append(self.input.keys()[ind_keep].to_list())
 
             # Keep based on BorutaPy -- Numerically EXHAUSTIVE
-            print('[autoML] Determining Features with Boruta')
+            print('[AutoML] Determining Features with Boruta')
             if self.regression:
                 rf = RandomForestRegressor()
             elif self.classification:
@@ -389,7 +399,7 @@ class Pipeline(object):
             self.col_keep.append(self.input.keys()[selector.support_].to_list())
 
             # Store to self
-            print('[autoML] Storing data preparation meta data.')
+            print('[AutoML] Storing data preparation meta data.')
             for i in range(len(self.datasets)):
                 json.dump(self.col_keep[i], open(self.mainDir + 'Features/features_%i_v%i.json' % (i, self.version), 'w'))
             json.dump(self.col_keep, open(self.mainDir + 'Sets/Col_keep_v%i.json' % self.version, 'w'))
@@ -442,9 +452,9 @@ class Pipeline(object):
             for set, cols in self.colKeep.items():
                 # Skip empty sets
                 if len(cols) == 0:
-                    print('[autoML] Skipping %s features, empty set' % set)
+                    print('[AutoML] Skipping %s features, empty set' % set)
                 else:
-                    print('[autoML] Initial Modelling for %s features (%i)' % (set, len(cols)))
+                    print('[AutoML] Initial Modelling for %s features (%i)' % (set, len(cols)))
 
                     # Apply Feature Set
                     self.Modelling.dataset = set
@@ -510,6 +520,23 @@ class Pipeline(object):
                 'alpha': [1e-4, 1e-3, 1e-5],
                 'shuffle': [False],
             }
+        elif model.__module__ == 'lightgbm.sklearn':
+            return {
+                'boosting': ['gbdt', 'rf', 'dart'],
+                'learning_rate': [0.01, 0.1, 0.3],
+                'num_leaves': [31, 50, 75],
+                # 'n_estimators': [100, 250, 500],
+                'n_jobs': [4],
+                'feature_fraction': [0.8, 1]
+            }
+        elif model.__module__ == 'xgboost.sklearn':
+            return {
+                'max_depth': [3, 6, 9, 12],
+                'booster': ['gbtree', 'gblinear', 'dart'],
+                'learning_rate': [0.01, 0.1, 0.3],
+                'verbosity': [0],
+                'n_jobs': [4],
+            }
 
         # Regressor specific hyperparameters
         elif self.mode == 'regression':
@@ -533,9 +560,10 @@ class Pipeline(object):
             elif isinstance(model, catboost.core.CatBoostRegressor):
                 return {
                     'loss_function': ['MAE', 'RMSE'],
-                    'iterations': [500, 1000, 2000],
+                    'n_estimators': [500],
                     'learning_rate': [0.001, 0.01, 0.03, 0.05, 0.1],
                     'l2_leaf_reg': [1, 3, 5],
+                    'n_estimators': [50, 100, 200],
                     'verbose': [0],
                 }
             elif isinstance(model, sklearn.ensemble.GradientBoostingRegressor):
@@ -583,14 +611,15 @@ class Pipeline(object):
             elif isinstance(model, catboost.core.CatBoostClassifier):
                 return {
                     'loss_function': ['Logloss', 'MultiClass'],
-                    'iterations': [500, 1000, 2000],
+                    'iterations': [500],
+                    # 'iterations': [500, 1000, 2000],
                     'learning_rate': [0.001, 0.01, 0.03, 0.05, 0.1],
                     'l2_leaf_reg': [1, 3, 5],
                     'verbose': [0],
                 }
             elif isinstance(model, sklearn.ensemble.BaggingClassifier):
                 return {
-                    'n_estimators': [5, 10, 15, 25, 50],
+                    # 'n_estimators': [5, 10, 15, 25, 50],
                     'max_features': [0.5, 0.75, 1.0],
                     'bootstrap': [False, True],
                     'bootstrap_features': [True, False],
@@ -620,7 +649,7 @@ class Pipeline(object):
         # Raise error if nothing is returned
         raise NotImplementedError('Hyperparameter tuning not implemented for ', type(model).__name__)
 
-    def gridSearch(self, model=None, params=None, feature_set=None):
+    def gridSearch(self, model=None, feature_set=None, params=None):
         """
         Runs a grid search. By default, takes the self.results, and runs for the top 3 optimizations.
         There is the option to provide a model & feature_set, but both have to be provided. In this case,
@@ -636,6 +665,11 @@ class Pipeline(object):
         # If arguments are provided
         if model is not None:
 
+            # Get model string
+            if isinstance(model, str):
+                models = self.Modelling.return_models()
+                model = models[[i for i in range(len(models)) if type(models[i]).__name__ == model][0]]
+
             # Organise existing results
             results = self.results[np.logical_and(
                 self.results['model'] == type(model).__name__,
@@ -645,6 +679,7 @@ class Pipeline(object):
 
             # Check if exists and load
             if ('Hyperparameter Opt' == results['type']).any():
+                print('[AutoML] Loading optimization results.')
                 hyperOptResults = results[results['type'] == 'Hyperparameter Opt']
                 params = self._parseJson(hyperOptResults.iloc[0]['params'])
 
@@ -655,18 +690,21 @@ class Pipeline(object):
                     params = self._getHyperParams(model)
 
                 # Run Grid Search
-                results = self._sortResults(self._gridSearchIteration(model, params, feature_set))
+                if self.useHalvingGridSearch:
+                    gridSearchResults = self._sortResults(self._gridSearchIterationHalvingCV(model, params, feature_set))
+                else:
+                    gridSearchResults = self._sortResults(self._gridSearchIteration(model, params, feature_set))
 
                 # Store results
-                results['model'] = type(model).__name__
-                results['data_version'] = self.version
-                results['dataset'] = feature_set
-                results['type'] = 'Hyperparameter Opt'
-                self.results.append(results)
+                gridSearchResults['model'] = type(model).__name__
+                gridSearchResults['data_version'] = self.version
+                gridSearchResults['dataset'] = feature_set
+                gridSearchResults['type'] = 'Hyperparameter Opt'
+                self.results = self.results.append(gridSearchResults)
                 self.results.to_csv(self.mainDir + 'Results.csv', index=False)
 
                 # Get params for validation
-                params = results.iloc[0]['params']
+                params = self._parseJson(results.iloc[0]['params'])
 
             # Validate
             self._validateResult(model, params, feature_set)
@@ -711,7 +749,7 @@ class Pipeline(object):
                 gridSearchResults['type'] = 'Hyperparameter Opt'
                 self.results = self.results.append(gridSearchResults)
                 self.results.to_csv(self.mainDir + 'Results.csv', index=False)
-                params = gridSearchResults.iloc[0]['params']
+                params = self._parseJson(gridSearchResults.iloc[0]['params'])
 
             # Validate
             if self.validateResults:
@@ -721,7 +759,7 @@ class Pipeline(object):
         """
         INTERNAL | Grid search for defined model, parameter set and feature set.
         """
-        print('\n[autoML] Starting Hyperparameter Optimization for %s on %s features (%i samples, %i features)' %
+        print('\n[AutoML] Starting Hyperparameter Optimization for %s on %s features (%i samples, %i features)' %
               (type(model).__name__, feature_set, len(self.input), len(self.colKeep[feature_set])))
 
         # Select data
@@ -764,11 +802,11 @@ class Pipeline(object):
         """
         from sklearn.experimental import enable_halving_search_cv
         from sklearn.model_selection import HalvingGridSearchCV
-        print('\n[autoML] Starting Hyperparameter Optimization for %s on %s features (%i samples, %i features)' %
+        print('\n[AutoML] Starting Hyperparameter Optimization (halving) for %s on %s features (%i samples, %i features)' %
               (type(model).__name__, feature_set, len(self.input), len(self.colKeep[feature_set])))
 
         # Select data
-        input, output = self.input[self.colKeep[feature_set]], self.output
+        input, output = self.input[self.colKeep[feature_set]], self.output.values.ravel()
 
         # Normalize Feature Set (the input remains original)
         if self.normalize:
@@ -779,11 +817,25 @@ class Pipeline(object):
                 oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
                 output = oScaler.transform(output)
 
+        # Specify Halving Resource
+        resource = 'n_samples'
+        max_resources = 'auto'
+        # if model.__module__ == 'catboost.core':
+        #     resource = 'n_estimators'
+        #     max_resources = 1000
+        if model.__module__ == 'sklearn.ensemble._bagging':
+            resource = 'n_estimators'
+            max_resources = 50
+
+
+        # Optimization
         if self.mode == 'regression':
             gridSearch = HalvingGridSearchCV(model, params,
+                                             resource=resource,
+                                             max_resources=max_resources,
                                              cv=KFold(n_splits=self.nSplits),
                                              scoring='neg_mean_absolute_error',
-                                             factor=5, n_jobs=4, verbose=2)
+                                             factor=5, n_jobs=4, verbose=1)
             gridSearch.fit(input, output)
             scikitResults = pd.DataFrame(gridSearch.cv_results_)
             results = pd.DataFrame()
@@ -793,9 +845,11 @@ class Pipeline(object):
 
         if self.mode == 'classification':
             gridSearch = HalvingGridSearchCV(model, params,
+                                             resource=resource,
+                                             max_resources=max_resources,
                                              cv=StratifiedKFold(n_splits=self.nSplits),
                                              scoring='accuracy',
-                                             factor=5, n_jobs=4, verbose=2)
+                                             factor=5, n_jobs=4, verbose=1)
             gridSearch.fit(input, output)
             scikitResults = pd.DataFrame(gridSearch.cv_results_)
             results = pd.DataFrame()
@@ -806,8 +860,7 @@ class Pipeline(object):
         return results
 
     def _validateResult(self, master_model, params, feature_set):
-        print(self.colKeep.keys(), feature_set)
-        print('[autoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
+        print('[AutoML] Validating results for %s (%i %s features) (%s)' % (type(master_model).__name__,
                                                 len(self.colKeep[feature_set]), feature_set, params))
         if not os.path.exists(self.mainDir + 'Validation/'): os.mkdir(self.mainDir + 'Validation/')
 
@@ -826,6 +879,8 @@ class Pipeline(object):
                 oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
                 output = oScaler.transform(output)
                 print('(%.1f, %.1f)' % (np.mean(output), np.std(output)))
+            else:
+                output = output.to_numpy().reshape((-1, 1))
         else:
             input, output = input.to_numpy(), output.to_numpy().reshape((-1, 1))
 
@@ -857,7 +912,7 @@ class Pipeline(object):
                 ax[i // 2][i % 2].plot(predictions, color='#ffa62b', alpha=0.4)
 
             # Print & Finish plot
-            print('[autoML] MAE:        %.2f \u00B1 %.2f' % (np.mean(mae), np.std(mae)))
+            print('[AutoML] MAE:        %.2f \u00B1 %.2f' % (np.mean(mae), np.std(mae)))
             ax[i // 2][i % 2].legend(['Output', 'Prediction'])
             plt.show()
 
@@ -898,15 +953,15 @@ class Pipeline(object):
             f1 = [2 * prec[i] * rec[i] / (prec[i] + rec[i]) for i in range(self.nSplits)]
             p = np.mean(prec)
             r = np.mean(rec)
-            print('[autoML] Accuracy:        %.2f \u00B1 %.2f %%' % (np.mean(acc), np.std(acc)))
-            print('[autoML] Precision:       %.2f \u00B1 %.2f %%' % (p, np.std(prec)))
-            print('[autoML] Recall:          %.2f \u00B1 %.2f %%' % (r, np.std(rec)))
-            print('[autoML] Specificity:     %.2f \u00B1 %.2f %%' % (np.mean(spec), np.std(spec)))
-            print('[autoML] F1-score:        %.2f \u00B1 %.2f %%' % (np.mean(f1), np.std(f1)))
-            print('[autoML] Confusion Matrix:')
-            print('[autoML] Pred \ true |  Faulty   |   Healthy      ')
-            print('[autoML]  Faulty     |  %s|  %.1f' % (('%.1f' % cm[0, 0]).ljust(9), cm[0, 1]))
-            print('[autoML]  Healthy    |  %s|  %.1f' % (('%.1f' % cm[1, 0]).ljust(9), cm[1, 1]))
+            print('[AutoML] Accuracy:        %.2f \u00B1 %.2f %%' % (np.mean(acc), np.std(acc)))
+            print('[AutoML] Precision:       %.2f \u00B1 %.2f %%' % (p, np.std(prec)))
+            print('[AutoML] Recall:          %.2f \u00B1 %.2f %%' % (r, np.std(rec)))
+            print('[AutoML] Specificity:     %.2f \u00B1 %.2f %%' % (np.mean(spec), np.std(spec)))
+            print('[AutoML] F1-score:        %.2f \u00B1 %.2f %%' % (np.mean(f1), np.std(f1)))
+            print('[AutoML] Confusion Matrix:')
+            print('[AutoML] Pred \ true |  Faulty   |   Healthy      ')
+            print('[AutoML]  Faulty     |  %s|  %.1f' % (('%.1f' % cm[0, 0]).ljust(9), cm[0, 1]))
+            print('[AutoML]  Healthy    |  %s|  %.1f' % (('%.1f' % cm[1, 0]).ljust(9), cm[1, 1]))
 
             # Check whether plot is possible
             if isinstance(model, sklearn.linear_model.Lasso) or isinstance(model, sklearn.linear_model.Ridge):
@@ -940,7 +995,7 @@ class Pipeline(object):
             ax.legend(loc="lower right")
             fig.savefig(self.mainDir + 'Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
 
-    def _prepareProductionFiles(self, model=None, feature_set=None):
+    def _prepareProductionFiles(self, model=None, feature_set=None, params=None):
         if not os.path.exists(self.mainDir + 'Production/v%i/' % self.version):
             os.mkdir(self.mainDir + 'Production/v%i/' % self.version)
         # Get sorted results for this data version
@@ -951,8 +1006,9 @@ class Pipeline(object):
             # Take name if model instance is given
             if not isinstance(model, str):
                 model = type(model).__name__
-            results = self._sortResults(results[np.logical_and(results['model'] == model, results['dataset'] == feature_set)])
-            params = self._parseJson(results.iloc[0]['params'])
+            if params is None:
+                results = self._sortResults(results[np.logical_and(results['model'] == model, results['dataset'] == feature_set)])
+                params = self._parseJson(results.iloc[0]['params'])
 
         # Otherwise find best
         else:
@@ -1102,8 +1158,14 @@ class Pipeline(object):
         diffFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__diff__' in k]
         lagFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__lag__' in k]
 
-        # Fill missing features
-        for k in [k for k in features if k not in data.keys()]:
+        # Fill missing features for normalization
+        required = copy.copy(features)
+        required += [k for s in multiFeatures for k in s.split('__x__')]
+        required += [k for s in divFeatures for k in s.split('__d__')]
+        required += [k for k in centers.keys()]
+        required += [s.split('__diff__')[0] for s in diffFeatures]
+        required += [s.split('__lag__')[0] for s in multiFeatures]
+        for k in [k for k in required if k not in data.keys()]:
             data[k] = np.zeros(len(data))
 
         # Select
@@ -1130,6 +1192,8 @@ class Pipeline(object):
             input[k] = feature
 
         # K-Means features
+        for key in [k for k in centers.keys() if k not in data.keys()]:
+            data[key] = np.zeros(len(input))
         for key in kMeansFeatures:
             ind = int(key[key.find('dist_c_') + 7: key.rfind('_')])
             input[key] = np.sqrt(np.square(data[centers.keys()] - centers.iloc[ind]).sum(axis=1))
@@ -1150,8 +1214,9 @@ class Pipeline(object):
         Full script to make predictions. Uses 'Production' folder with defined or latest version.
         '''
         # Feature Extraction, Selection and Normalization
-        input, output = self._convertData(data)
         model = joblib.load(self.mainDir + 'Production/v%i/Model.joblib' % self.version)
+        print('[AutoML] Predicting with %s, v%i' % (type(model).__name__, self.version))
+        input, output = self._convertData(data)
 
         # Predict
         if self.mode == 'regression':
@@ -1359,7 +1424,7 @@ class DataProcessing(object):
         for key in self.catCols:
             dummies = pd.get_dummies(data[key])
             for dummy_key in dummies.keys():
-                dummies = dummies.rename(columns={dummy_key: key + '_' + str(dummy_key)})
+                dummies = dummies.rename(columns={dummy_key: key + '_' + re.sub('[^a-z0-9]', '_', str(dummy_key).lower())})
             data = data.drop(key, axis=1).join(dummies)
         if self.target in data.keys():
             data[self.target] = pd.to_numeric(data[self.target], errors='coerce')
@@ -2077,36 +2142,42 @@ class Modelling(object):
     def return_models(self):
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
         from sklearn.experimental import enable_hist_gradient_boosting
-        import catboost
+        import catboost, xgboost, lightgbm
+
         if self.mode == 'classification':
             ridge = linear_model.RidgeClassifier()
-            lasso = linear_model.Lasso()
-            sgd = linear_model.SGDClassifier()
+            # lasso = linear_model.Lasso()
+            # sgd = linear_model.SGDClassifier()
             svc = svm.SVC(kernel='rbf')
-            knc = neighbors.KNeighborsClassifier()
-            dtc = tree.DecisionTreeClassifier()
-            ada = ensemble.AdaBoostClassifier()
+            # knc = neighbors.KNeighborsClassifier()
+            # dtc = tree.DecisionTreeClassifier()
+            # ada = ensemble.AdaBoostClassifier()
             cat = catboost.CatBoostClassifier(verbose=0)
             bag = ensemble.BaggingClassifier()
             gbc = ensemble.GradientBoostingClassifier()
             hgbc = ensemble.HistGradientBoostingClassifier()
             rfc = ensemble.RandomForestClassifier()
-            mlp = neural_network.MLPClassifier()
-            return [ridge, lasso, sgd, svc, knc, dtc, ada, cat, bag, gbc, hgbc, mlp]
+            # mlp = neural_network.MLPClassifier()
+            xgb = xgboost.XGBClassifier()
+            lgbm = lightgbm.LGBMClassifier()
+
         elif self.mode == 'regression':
             ridge = linear_model.Ridge()
-            lasso = linear_model.Lasso()
-            sgd = linear_model.SGDRegressor()
+            # lasso = linear_model.Lasso()
+            # sgd = linear_model.SGDRegressor()
             svr = svm.SVR(kernel='rbf')
-            knr = neighbors.KNeighborsRegressor()
-            dtr = tree.DecisionTreeRegressor()
-            ada = ensemble.AdaBoostRegressor()
+            # knr = neighbors.KNeighborsRegressor()
+            # dtr = tree.DecisionTreeRegressor()
+            # ada = ensemble.AdaBoostRegressor()
             cat = catboost.CatBoostRegressor(verbose=0)
             gbr = ensemble.GradientBoostingRegressor()
             hgbr = ensemble.HistGradientBoostingRegressor()
             rfr = ensemble.RandomForestRegressor()
-            mlp = neural_network.MLPRegressor()
-            return [ridge, lasso, sgd, svr, knr, dtr, ada, cat, gbr, hgbr, mlp]
+            # mlp = neural_network.MLPRegressor()
+            xgb = xgboost.XGBRegressor()
+            lgbm = lightgbm.LGBMRegressor()
+
+        return [ridge, svc, cat, bag, gbc, hgbc, rfc, xgb, lgbm]
 
     def _fit(self, input, output, cross_val, metric):
         # Convert to NumPy
