@@ -10,8 +10,7 @@ import matplotlib.pyplot as plt
 import multiprocessing as mp
 
 from boruta import BorutaPy
-import catboost
-import sklearn
+import catboost, xgboost, lightgbm, sklearn
 from sklearn import neural_network, tree, cluster
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import plot_roc_curve, auc
@@ -300,7 +299,7 @@ class Pipeline(object):
     def _eda(self, data):
         if self.plotEDA:
             print('[AutoML] Starting Exploratory Data Analysis')
-            self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder=self.mainDir)
+            self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder=self.mainDir, version=self.version)
 
     def _dataProcessing(self, data):
         # Load if possible
@@ -424,7 +423,6 @@ class Pipeline(object):
                 'max_depth': [3, 6, 9, 12],
                 'booster': ['gbtree', 'gblinear', 'dart'],
                 'learning_rate': [0.01, 0.1, 0.3],
-                'n_estimators': [100, 250, 500],
                 'verbosity': [0],
                 'n_jobs': [4],
             }
@@ -712,6 +710,7 @@ class Pipeline(object):
         # Specify Halving Resource
         resource = 'n_samples'
         max_resources = 'auto'
+        min_resources = 'exhaust'
         if model.__module__ == 'catboost.core':
             resource = 'n_estimators'
             max_resources = 3000
@@ -1061,7 +1060,7 @@ class Pipeline(object):
 
         # Normalize
         if self.normalize:
-            input = scaler.transform(input)
+            input[input.keys()] = scaler.transform(input)
 
         # Remove large features (buggy k-means features)
         input[input.astype('float32') == np.inf] = 1e38
@@ -1765,7 +1764,7 @@ class FeatureProcessing(object):
 class ExploratoryDataAnalysis(object):
 
     def __init__(self, data, differ=0, pretag='', output=None, maxSamples=10000, seasonPeriods=[24 * 60, 7 * 24 * 60],
-                 lags=60, skip_completed=True, folder=''):
+                 lags=60, skip_completed=True, folder='', version=None):
         '''
         Doing all the fun EDA in an automized script :)
         :param data: Pandas Dataframe
@@ -1777,7 +1776,17 @@ class ExploratoryDataAnalysis(object):
 
         # Register data
         self.data = data.astype('float32').fillna(0)
-        self.output = output.astype('float32').fillna(0)
+        if output is not None:
+            assert isinstance(output, pd.DataFrame) or isnstance(output, pd.Series)
+            if isinstance(output, pd.DataFrame): output = output[output.keys()[0]]
+            self.output = output.astype('float32').fillna(0)
+            if self.output.nunique() == 2:
+                self.mode = 'classification'
+                assert set(self.output.values) == {-1, 1}, 'Classes need to be {-1, 1}'
+            else:
+                self.mode = 'regression'
+        else:
+            self.mode = None
 
         # General settings
         self.seasonPeriods = seasonPeriods
@@ -1787,23 +1796,47 @@ class ExploratoryDataAnalysis(object):
 
         # Storage settings
         self.tag = pretag
+        self.version = version if version is not None else 0
         self.folder = folder if folder == '' or folder[-1] == '/' else folder + '/'
         self.skip = skip_completed
 
-        # Create dirs
-        self.createDirs()
+        # Create Base folder
+        if not os.path.exists(self.folder + 'EDA/'):
+            os.mkdir(self.folder + 'EDA')
+        self.folder += 'EDA/'
         self.run()
 
 
     def run(self):
         # Run all functions
+        if self.mode == 'classification':
+            self._runClassification()
+        else:
+            self._runRegression()
+
+    def _runClassification(self):
         print('[EDA] Generating Missing Values Plot')
         self.missingValues()
         print('[EDA] Generating Timeplots')
         self.timeplots()
         print('[EDA] Generating Boxplots')
         self.boxplots()
-        # self.seasonality()
+        if self.output is not None:
+            print('[EDA] Generating SHAP plot')
+            self.SHAP()
+            print('[EDA] Generating Feature Ranking Plot')
+            self.featureRanking()
+            print('[EDA] Predictive Power Score Plot')
+            self.predictivePowerScore()
+
+    def _runRegression(self):
+        print('[EDA] Generating Missing Values Plot')
+        self.missingValues()
+        print('[EDA] Generating Timeplots')
+        self.timeplots()
+        print('[EDA] Generating Boxplots')
+        self.boxplots()
+        self.seasonality()
         print('[EDA] Generating Colinearity Plots')
         self.colinearity()
         print('[EDA] Generating Diff Var Plot')
@@ -1824,76 +1857,115 @@ class ExploratoryDataAnalysis(object):
             print('[EDA] Predictive Power Score Plot')
             self.predictivePowerScore()
 
-    def createDirs(self):
-        dirs = ['EDA', 'EDA/Boxplots', 'EDA/Seasonality', 'EDA/Colinearity', 'EDA/Lags', 'EDA/Correlation',
-                'EDA/Correlation/ACF', 'EDA/Correlation/PACF', 'EDA/Correlation/Cross', 'EDA/NonLinear Correlation',
-                'EDA/Timeplots', 'EDA/ScatterPlots/']
-        for period in self.seasonPeriods:
-            dirs.append(self.folder + 'EDA/Seasonality/' + str(period))
-        for dir in dirs:
-            try:
-                os.makedirs(self.folder + dir)
-                if dir == 'EDA/Correlation':
-                    file = open(self.folder + 'EDA/Correlation/Readme.txt', 'w')
-                    edit = file.write(
-                        'Correlation Interpretation\n\nIf the series has positive autocorrelations for a high number of lags,\nit probably needs a higher order of differencing. If the lag-1 autocorrelation\nis zero or negative, or the autocorrelations are small and patternless, then \nthe series does not need a higher order of differencing. If the lag-1 autocorrleation\nis below -0.5, the series is likely to be overdifferenced. \nOptimum level of differencing is often where the variance is lowest. ')
-                    file.close()
-            except:
-                continue
-
     def missingValues(self):
-        if self.tag + 'MissingValues.png' in os.listdir(self.folder + 'EDA/'):
+        # Create folder
+        if not os.path.exists(self.folder + 'MissingValues/'):
+            os.mkdir(self.folder + 'MissingValues/')
+
+        # Skip if exists
+        if self.tag + 'v%i.png' % self.version in os.listdir(self.folder):
             return
+
+        # Plot
         import missingno
         ax = missingno.matrix(self.data, figsize=[24, 16])
         fig = ax.get_figure()
-        fig.savefig(self.folder + 'EDA/MissingValues.png')
+        fig.savefig(self.folder + 'MissingValues/v%i.png' % self.version)
 
     def boxplots(self):
+        # Create folder
+        if not os.path.exists(self.folder + 'Boxplots/'):
+            os.mkdir(self.folder + 'Boxplots/')
+
+        # Iterate through vars
         for key in tqdm(self.data.keys()):
-            if self.tag + key + '.png' in os.listdir(self.folder + 'EDA/Boxplots/'):
+
+            # Skip if existing
+            if self.tag + key + '.png' in os.listdir(self.folder + 'Boxplots/'):
                 continue
+
+            # Figure prep
             fig = plt.figure(figsize=[24, 16])
-            plt.boxplot(self.data[key])
             plt.title(key)
-            fig.savefig(self.folder + 'EDA/Boxplots/' + self.tag + key + '.png', format='png', dpi=300)
+
+            # Classification
+            if self.mode == 'classification':
+                plt.boxplot([self.data.loc[self.output == 1, key], self.data.loc[self.output == -1, key]], labels=['Faulty', 'Healthy'])
+                plt.legend(['Faulty', 'Healthy'])
+
+            # Regression
+            if self.mode == 'regression':
+                plt.boxplot(self.data[key])
+
+            # Store & Close
+            fig.savefig(self.folder + 'Boxplots/' + self.tag + key + '.png', format='png', dpi=300)
             plt.close()
 
     def timeplots(self):
+        # Create folder
+        if not os.path.exists(self.folder + 'Timeplots/'):
+            os.mkdir(self.folder + 'Timeplots/')
+
+        # Set matplot limit
         matplotlib.use('Agg')
         matplotlib.rcParams['agg.path.chunksize'] = 200000
+
         # Undersample
-        data = self.data.iloc[np.linspace(0, len(self.data) - 1, self.maxSamples).astype('int')]
-        # Plot
+        ind = np.linspace(0, len(self.data) - 1, self.maxSamples).astype('int')
+        data, output = self.data.iloc[ind], self.output.iloc[ind]
+
+        # Iterate through features
         for key in tqdm(data.keys()):
-            if self.tag + key + '.png' in os.listdir(self.folder + 'EDA/Timeplots/'):
+            # Skip if existing
+            if self.tag + key + '.png' in os.listdir(self.folder + 'Timeplots/'):
                 continue
+
+            # Figure preparation
             fig = plt.figure(figsize=[24, 16])
-            plt.plot(data.index, data[key])
             plt.title(key)
-            fig.savefig(self.folder + 'EDA/Timeplots/' + self.tag + key + '.png', format='png', dpi=100)
+
+            # Plot
+            if self.mode == 'classification':
+                cm = plt.get_cmap('bwr')
+            else:
+                cm = plt.get_cmap('summer')
+            nmOutput = (output - output.min()) / (output.max() - output.min())
+            plt.scatter(data.index, data[key], c=cm(nmOutput), alpha=0.3)
+
+            # Store & Close
+            fig.savefig(self.folder + 'Timeplots/' + self.tag + key + '.png', format='png', dpi=100)
             plt.close(fig)
 
     def seasonality(self):
+        # Create folder
+        if not os.path.exists(self.folder + 'Seasonality/'):
+            os.mkdir(self.folder + 'Seasonality/')
+
+        # Iterate through features
         for key in tqdm(self.data.keys()):
             for period in self.seasonPeriods:
-                if self.tag + key + '.png' in os.listdir(self.folder + 'EDA/Seasonality/'):
+                if self.tag + key + '.png' in os.listdir(self.folder + 'Seasonality/'):
                     continue
                 seasonality = STL(self.data[key], period=period).fit()
                 fig = plt.figure(figsize=[24, 16])
                 plt.plot(range(len(self.data)), self.data[key])
                 plt.plot(range(len(self.data)), seasonality)
                 plt.title(key + ', period=' + str(period))
-                fig.savefig(self.folder + 'EDA/Seasonality/' + self.tag + str(period)+'/'+key + '.png', format='png', dpi=300)
+                fig.savefig(self.folder + 'Seasonality/' + self.tag + str(period)+'/'+key + '.png', format='png', dpi=300)
                 plt.close()
 
     def colinearity(self):
+        # Skip if existing
         if self.tag + 'Minimum_Representation.png' in os.listdir(self.folder + 'EDA/Colinearity/'):
             return
+
+        # Plot thresholded matrix
         threshold = 0.95
         fig = plt.figure(figsize=[24, 16])
+        plt.title('Colinearity matrix, threshold %.2f' % threshold)
         sns.heatmap(abs(self.data.corr()) < threshold, annot=False, cmap='Greys')
-        fig.savefig(self.folder + 'EDA/Colinearity/' + self.tag + 'All_Features.png', format='png', dpi=300)
+        fig.savefig(self.folder + self.tag + 'Colinearity_Matrix.png', format='png', dpi=300)
+
         # Minimum representation
         corr_mat = self.data.corr().abs()
         upper = corr_mat.where(np.triu(np.ones(corr_mat.shape), k=1).astype(np.bool))
@@ -1901,40 +1973,70 @@ class ExploratoryDataAnalysis(object):
         minimal_rep = self.data.drop(self.data[col_drop], axis=1)
         fig = plt.figure(figsize=[24, 16])
         sns.heatmap(abs(minimal_rep.corr()) < threshold, annot=False, cmap='Greys')
-        fig.savefig(self.folder + 'EDA/Colinearity/' + self.tag + 'Minimum_Representation.png', format='png', dpi=300)
+        fig.savefig(self.folder + self.tag + 'Colinearity_Minimum_Representation.png', format='png', dpi=300)
 
     def differencing(self):
-        if self.tag + 'Variance.png' in os.listdir(self.folder + 'EDA/Lags/'):
+        # Create folder
+        if not os.path.exists(self.folder + 'Lags/'):
+            os.mkdir(self.folder + 'Lags/')
+
+        # Skip if existing
+        if self.tag + 'Variance.png' in os.listdir(self.folder + 'Lags/'):
             return
+
+        # Setup
         max_lags = 4
         varVec = np.zeros((max_lags, len(self.data.keys())))
         diffData = self.data / np.sqrt(self.data.var())
+
+        # Calculate variance per lag
         for i in range(max_lags):
             varVec[i, :] = diffData.var()
             diffData = diffData.diff(1)[1:]
+
+        # Plot
         fig = plt.figure(figsize=[24, 16])
-        plt.yscale('log')
-        plt.plot(varVec)
         plt.title('Variance for different lags')
+        plt.plot(varVec)
         plt.xlabel('Lag')
+        plt.yscale('log')
         plt.ylabel('Average variance')
-        fig.savefig(self.folder + 'EDA/Lags/'  + self.tag + 'Variance.png', format='png', dpi=300)
+        fig.savefig(self.folder + 'Lags/'  + self.tag + 'Variance.png', format='png', dpi=300)
 
     def completeAutoCorr(self):
+        # Create folder
+        if not os.path.exists(self.folder + 'Correlation/ACF/'):
+            os.makedirs(self.folder + 'Correlation/ACF/')
+
+        # Difference data
+        diffData = copy.copy(self.data)
         for i in range(self.differ):
-            self.data = self.data.diff(1)[1:]
+            diffData = diffData.diff(1)[1:]
+
+        # Iterate through features
         for key in tqdm(self.data.keys()):
-            if self.tag + key + '_differ_' + str(self.differ) + '.png' in os.listdir(self.folder + 'EDA/Correlation/ACF/'):
+            # Skip if existing
+            if self.tag + key + '_differ_' + str(self.differ) + '.png' in os.listdir(self.folder + 'Correlation/ACF/'):
                 continue
-            fig = plot_acf(self.data[key], fft=True)
+
+            # Plot
+            fig = plot_acf(diffData[key], fft=True)
             plt.title(key)
-            fig.savefig(self.folder + 'EDA/Correlation/ACF/' + self.tag + key + '_differ_' + str(self.differ) + '.png', format='png', dpi=300)
+            fig.savefig(self.folder + 'Correlation/ACF/' + self.tag + key + '_differ_' + str(self.differ) + '.png', format='png', dpi=300)
             plt.close()
 
     def partialAutoCorr(self):
+        # Create folder
+        if not os.path.exists(self.folder + 'Correlation/PACF/'):
+            os.makedirs(self.folder + 'Correlation/PACF/')
+
+        # Iterate through features
         for key in tqdm(self.data.keys()):
+            # Skip if existing
             if self.tag + key + '_differ_' + str(self.differ) + '.png' in os.listdir(self.folder + 'EDA/Correlation/PACF/'):
                 continue
+
+            # Plot
             try:
                 fig = plot_pacf(self.data[key])
                 fig.savefig(self.folder + 'EDA/Correlation/PACF/' + self.tag + key + '_differ_' + str(self.differ) + '.png', format='png', dpi=300)
@@ -1944,11 +2046,21 @@ class ExploratoryDataAnalysis(object):
                 continue
 
     def crossCorr(self):
-        folder = 'EDA/Correlation/Cross/'
+        # Create folder
+        if not os.path.exists(self.folder + 'Correlation/Cross/'):
+            os.makedirs(self.folder + 'Correlation/Cross/')
+
+        # Prepare
+        folder = 'Correlation/Cross/'
         output = self.output.to_numpy().reshape((-1))
+
+        # Iterate through features
         for key in tqdm(self.data.keys()):
+            # Skip if existing
             if self.tag + key + '_differ_' + str(self.differ) + '.png' in os.listdir(self.folder + folder):
                 continue
+
+            # Plot
             try:
                 fig = plt.figure(figsize=[24, 16])
                 plt.xcorr(self.data[key], output, maxlags=self.lags)
@@ -1959,62 +2071,101 @@ class ExploratoryDataAnalysis(object):
                 continue
 
     def scatters(self):
-        # Plots
+        # Create folder
+        if not os.path.exists(self.folder + 'Scatters/'):
+            os.mkdir(self.folder + 'Scatters/')
+
+        # Iterate through features
         for key in tqdm(self.data.keys()):
-            if self.tag + key + '.png' in os.listdir(self.folder + 'EDA/ScatterPlots/'):
+            # Skip if existing
+            if '{}{}.png'.format(self.tag, key) in os.listdir(self.folder + 'Scatters/'):
                 continue
+
+            # Plot
             fig = plt.figure(figsize=[24, 16])
             plt.scatter(self.output, self.data[key], alpha=0.2)
-            plt.xlabel('Output')
             plt.ylabel(key)
+            plt.xlabel('Output')
             plt.title('Scatterplot ' + key + ' - output')
-            fig.savefig(self.folder + 'EDA/ScatterPlots/' + self.tag + key + '.png', format='png', dpi=100)
+            fig.savefig(self.folder + 'Scatters/' + self.tag + key + '.png', format='png', dpi=100)
             plt.close(fig)
 
     def SHAP(self, args={}):
-        if self.tag + 'SHAP.png' in os.listdir(self.folder + 'EDA/Nonlinear Correlation'):
+        # Create folder
+        if not os.path.exists(self.folder + 'Features/'):
+            os.mkdir(self.folder + 'Features/')
+
+        # Skip if existing
+        if self.tag + 'SHAP.png' in os.listdir(self.folder + 'Features'):
             return
-        if set(self.output) == {1, -1}:
+
+        # Create model
+        if self.mode == 'classification':
             model = RandomForestClassifier(**args).fit(self.data, self.output)
         else:
             model = RandomForestRegressor(**args).fit(self.data, self.output)
 
+        # Calculate SHAP values
         import shap
+        shap_values = shap.TreeExplainer(model).shap_values(self.data)
+
+        # Plot
         fig = plt.figure(figsize=[8, 32])
         plt.subplots_adjust(left=0.4)
-        shap_values = shap.TreeExplainer(model).shap_values(self.data)
         shap.summary_plot(shap_values, self.data, plot_type='bar')
-        fig.savefig(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'SHAP.png', format='png', dpi=300)
+        fig.savefig(self.folder + 'Features/' + self.tag + 'SHAP.png', format='png', dpi=300)
 
-    def featureRanking(self, args={}):
-        if self.tag + 'RF.png' in os.listdir(self.folder + 'EDA/Nonlinear Correlation'):
+    def featureRanking(self, **args):
+        # Create folder
+        if not os.path.exists(self.folder + 'Features/'):
+            os.mkdir(self.folder + 'Features/')
+
+        # Skip if existing
+        if self.tag + 'RF.png' in os.listdir(self.folder + 'Features/'):
             return
-        if set(self.output) == {1, -1}:
+
+        # Create model
+        if self.mode == 'classification':
             model = RandomForestClassifier(**args).fit(self.data, self.output)
         else:
             model = RandomForestRegressor(**args).fit(self.data, self.output)
+
+        # Plot
         fig, ax = plt.subplots(figsize=[8, 12], constrained_layout=True)
         ind = np.argsort(model.feature_importances_)
         plt.barh(list(self.data.keys()[ind])[-15:], width=model.feature_importances_[ind][-15:])
-        results = pd.DataFrame({'x': self.data.keys(), 'score': model.feature_importances_})
-        results.to_csv(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'RF.csv')
-        fig.savefig(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'RF.png', format='png', dpi=300)
+        fig.savefig(self.folder + 'Features/' + self.tag + 'RF.png', format='png', dpi=300)
         plt.close()
 
+        # Store results
+        results = pd.DataFrame({'x': self.data.keys(), 'score': model.feature_importances_})
+        results.to_csv(self.folder + 'Features/' + self.tag + 'RF.csv')
+
     def predictivePowerScore(self):
-        if self.tag + 'Ppscore.png' in os.listdir(self.folder + 'EDA/Nonlinear Correlation'):
+        # Create folder
+        if not os.path.exists(self.folder + 'Features/'):
+            os.mkdir(self.folder + 'Features/')
+
+        # Skip if existing
+        if self.tag + 'Ppscore.png' in os.listdir(self.folder + 'Features/'):
             return
+
+        # Calculate PPS
         data = self.data.copy()
         if isinstance(self.output, pd.core.series.Series):
             data.loc[:, 'target'] = self.output
         elif isinstance(self.output, pd.DataFrame):
             data.loc[:, 'target'] = self.output.loc[:, self.output.keys()[0]]
         pp_score = pps.predictors(data, 'target').sort_values('ppscore')
+
+        # Plot
         fig, ax = plt.subplots(figsize=[8, 12], constrained_layout=True)
         plt.barh(pp_score['x'][-15:], width=pp_score['ppscore'][-15:])
-        fig.savefig(self.folder + 'EDA/Nonlinear Correlation/' + self.tag + 'Ppscore.png', format='png', dpi=400)
-        pp_score.to_csv(self.folder + 'EDA/Nonlinear Correlation/pp_score.csv')
+        fig.savefig(self.folder + 'Features/' + self.tag + 'Ppscore.png', format='png', dpi=400)
         plt.close()
+
+        # Store results
+        pp_score.to_csv(self.folder + 'Features/pp_score.csv')
 
 class Modelling(object):
 
@@ -2044,7 +2195,6 @@ class Modelling(object):
     def return_models(self):
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
         from sklearn.experimental import enable_hist_gradient_boosting
-        import catboost, xgboost, lightgbm
 
         if self.mode == 'classification':
             ridge = linear_model.RidgeClassifier()
