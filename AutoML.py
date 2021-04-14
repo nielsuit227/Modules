@@ -25,15 +25,10 @@ warnings.filterwarnings("ignore")
 
 # Priority
 # add cloud function script to prod env
-# smarter way to select models for hyperopt
-# --> Needs to incorporate number of features, mean acc/mae
 
 # Nicety
 # add report output
-# implement HalvingGridSearchCV (https://scikit-learn.org/stable/modules/grid_search.html#successive-halving-user-guide)
 # implement ensembles (http://www.cs.cornell.edu/~alexn/papers/shotgun.icml04.revised.rev2.pdf)
-# preprocessing check for big chunks of missing data
-# multiprocessing for EDA RF, GridSearch
 # implement autoencoder for Feature Extraction
 # implement transformers
 
@@ -474,7 +469,11 @@ class Pipeline(object):
             elif isinstance(model, sklearn.ensemble.RandomForestRegressor):
                 return {
                     'criterion': ['mse', 'mae'],
-                    'max_depth': [None, 5, 10, 25, 50],
+                    'max_depth': [None, 10, 25, 50, 75],
+                    'max_features': ['auto', 'sqrt'],
+                    'min_samples_split': [2, 5, 10],
+                    'min_samples_leaf': [1, 5, 10],
+                    'bootstrap': [True, False],
                 }
 
         # Classification specific hyperparameters
@@ -528,7 +527,11 @@ class Pipeline(object):
             elif isinstance(model, sklearn.ensemble.RandomForestClassifier):
                 return {
                     'criterion': ['gini', 'entropy'],
-                    'max_depth': [None, 5, 10, 25, 50],
+                    'max_depth': [None, 10, 25, 50, 75],
+                    'max_features': ['auto', 'sqrt'],
+                    'min_samples_split': [2, 5, 10],
+                    'min_samples_leaf': [1, 2, 4],
+                    'bootstrap': [True, False],
                 }
 
         # Raise error if nothing is returned
@@ -717,9 +720,9 @@ class Pipeline(object):
             max_resources = 3000
             min_resources = 250
         if model.__module__ == 'sklearn.ensemble._bagging' or model.__module__ == 'xgboost.sklearn'\
-                or model.__module__ == 'lightgbm.sklearn':
+                or model.__module__ == 'lightgbm.sklearn' or model.__module__ == 'sklearn.ensemble._forest':
             resource = 'n_estimators'
-            max_resources = 250
+            max_resources = 1000
             min_resources = 50
 
 
@@ -954,7 +957,7 @@ class Pipeline(object):
                 output = self.output[self.target].to_numpy()
 
         # Cluster Features require additional 'Centers' file
-        if any(['dist_c_' in key for key in self.bestFeatures]):
+        if any(['dist__' in key for key in self.bestFeatures]):
             shutil.copy(self.mainDir + 'Features/Centers_v%i.csv' % self.version,
                         self.mainDir + 'Production/v%i/Centers.csv' % self.version)
 
@@ -1065,6 +1068,7 @@ class Pipeline(object):
 
         # Remove large features (buggy k-means features)
         input[input.astype('float32') == np.inf] = 1e38
+        print(np.max(input.max()))
 
         # Return
         return input, output
@@ -1133,10 +1137,16 @@ class Predict(object):
         ###########
         mode = '{}'
         
+        # Remove large features
+        input[input.astype('float32') == np.inf] = 1e38
+        
         # Normalize
         if 'scaler' in args.keys():
-            data = args['scaler'].transform(input)
+            input = args['scaler'].transform(input)
+        else:
+            print('[WARNING] Not normalizing')
         
+        # Predict
         if mode == 'regression':
             if 'oScaler' in args.keys():
                 predictions = args['oScaler'].inverse_transform(model.predict(input))
@@ -1228,7 +1238,7 @@ class DataProcessing(object):
         # Clean Keys
         newKeys = {}
         for key in data.keys():
-            newKeys[key] = re.sub('[^a-zA-Z0-9 \n\.]', '_', key.lower())
+            newKeys[key] = re.sub('[^a-zA-Z0-9 \n\.]', '_', key.lower()).replace('__', '_')
         data = data.rename(columns=newKeys)
         return data
 
@@ -1250,13 +1260,13 @@ class DataProcessing(object):
 
     def _removeDuplicates(self, data):
         # Remove Duplicates
-        data.drop_duplicates(inplace=True)
+        data = data.drop_duplicates()
         data = data.loc[:, ~data.columns.duplicated()]
         return data
 
     def _removeConstants(self, data):
         # Remove Constants
-        data.drop(columns=data.columns[data.nunique() == 1], inplace=True)
+        data = data.drop(columns=data.columns[data.nunique() == 1])
         return data
 
     def _removeOutliers(self, data):
@@ -1364,7 +1374,7 @@ class FeatureProcessing(object):
         self._removeColinearity()
         self._addCrossFeatures()
         self._addDiffFeatures()
-        # self._addKMeansFeatures()
+        self._addKMeansFeatures()
         self._calcBaseline()
         self._addLaggedFeatures()
         return self.input
@@ -1391,11 +1401,12 @@ class FeatureProcessing(object):
 
     def transform(self, data, features, **args):
         # Split Features
-        multiFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__x__' in k]
-        divFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__d__' in k]
-        kMeansFeatures = [features.pop(features.index(k)) for k in features[::-1] if 'dist_c_' in k]
-        diffFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__diff__' in k]
-        lagFeatures = [features.pop(features.index(k)) for k in features[::-1] if '__lag__' in k]
+        multiFeatures = [k for k in features if '__x__' in k]
+        divFeatures = [k for k in features if '__d__' in k]
+        kMeansFeatures = [k for k in features if 'dist__' in k]
+        diffFeatures = [k for k in features if '__diff__' in k]
+        lagFeatures = [k for k in features if '__lag__' in k]
+        originalFeatures = [k for k in features if not '__' in k]
 
         # Make sure centers are provided if kMeansFeatures are nonzero
         if len(kMeansFeatures) != 0:
@@ -1404,7 +1415,7 @@ class FeatureProcessing(object):
             centers = args['centers']
 
         # Fill missing features for normalization
-        required = copy.copy(features)
+        required = copy.copy(originalFeatures)
         required += [k for s in multiFeatures for k in s.split('__x__')]
         required += [k for s in divFeatures for k in s.split('__d__')]
         required += [s.split('__diff__')[0] for s in diffFeatures]
@@ -1415,7 +1426,7 @@ class FeatureProcessing(object):
             data.loc[:, k] = np.zeros(len(data))
 
         # Select
-        input = data[features]
+        input = data[originalFeatures]
 
         # Multiplicative features
         for key in multiFeatures:
@@ -1439,11 +1450,21 @@ class FeatureProcessing(object):
 
         # K-Means features
         if len(kMeansFeatures) != 0:
-            for key in [k for k in centers.keys() if k not in data.keys()]:
-                data.loc[:, key] = np.zeros(len(input))
+            # Copy data and ensure center keys are inside
+            temp = copy.copy(data)
+            for key in [k for k in centers.keys() if k not in temp.keys()]:
+                temp.loc[:, key] = np.zeros(len(input))
+            # Split means and standard deviations from center data
+            stds = centers.iloc[-1]
+            means = centers.iloc[-2]
+            centers = centers.iloc[:-2]
+            # Normalize
+            temp -= means
+            temp /= stds
+            # Calculate centers
             for key in kMeansFeatures:
-                ind = int(key[key.find('dist_c_') + 7: key.rfind('_')])
-                input.loc[:, key] = np.sqrt(np.square(data.loc[:, centers.keys()] - centers.iloc[ind]).sum(axis=1))
+                ind = int(key[key.find('dist__') + 8: key.rfind('_')])
+                input.loc[:, key] = np.sqrt(np.square(temp.loc[:, centers.keys()] - centers.iloc[ind]).sum(axis=1))
 
         # Lagged features
         for k in lagFeatures:
@@ -1606,17 +1627,23 @@ class FeatureProcessing(object):
 
             # Add them
             for key in self.kMeansFeatures:
-                ind = int(key[key.find('dist_c_') + 7: key.rfind('_')])
+                ind = int(key[key.find('dist__') + 7: key.rfind('_')])
                 self.input[key] = np.sqrt(np.square(self.originalInput - centers.iloc[ind]).sum(axis=1))
 
         # If not executed, analyse all
         else:
             print('[Features] Calculating and Analysing K-Means features')
-            # Fit K-Means and calculate distances
+            # Prepare data
+            data = copy.copy(self.input)
+            means = data.mean()
+            stds = data.std()
+            data -= means
+            data /= stds
+            # Determine clusters
             clusters = min(max(int(np.log10(len(self.originalInput)) * 8), 8), len(self.originalInput.keys()))
             kmeans = cluster.MiniBatchKMeans(n_clusters=clusters)
-            columnNames = ['dist_c_%i_%i' % (i, clusters) for i in range(clusters)]
-            distances = pd.DataFrame(columns=columnNames, data=kmeans.fit_transform(self.originalInput))
+            columnNames = ['dist__%i_%i' % (i, clusters) for i in range(clusters)]
+            distances = pd.DataFrame(columns=columnNames, data=kmeans.fit_transform(data))
             distances = distances.replace([np.inf, -np.inf], 0).fillna(0)
 
             # Analyse correlation
@@ -1631,6 +1658,8 @@ class FeatureProcessing(object):
             for k in self.kMeansFeatures:
                 self.input[k] = distances[k]
             centers = pd.DataFrame(columns=self.originalInput.keys(), data=kmeans.cluster_centers_)
+            centers = centers.append(means, ignore_index=True)
+            centers = centers.append(stds, ignore_index=True)
             centers.to_csv(self.folder + 'Centers_v%i.csv' % self.version, index=False)
             json.dump(self.kMeansFeatures, open(self.folder + 'K-MeansFeatures_v%i.json' % self.version, 'w'))
             print('[Features] Added %i K-Means features (%i clusters)' % (len(self.kMeansFeatures), clusters))
