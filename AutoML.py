@@ -1108,6 +1108,17 @@ class Pipeline(object):
         data: the data to predict on
         Now this function has the arg decoding, which allows custom code injection
         '''
+        # Check if predict file exists already to increment version
+        if os.path.exists(self.mainDir + 'Production/v%i/Predict.py' % self.version):
+            with open(self.mainDir + 'Production/v%i/Predict.py' % self.version, 'r') as f:
+                predictFile = f.read()
+            ind = predictFile.find('self.version = ') + 16
+            oldVersion = predictFile[ind: predictFile.find("'", ind)]
+            minorVersion = int(oldVersion[oldVersion.find('.')+1:])
+            version = oldVersion[:oldVersion.find('.')+1] + str(minorVersion + 1)
+        else:
+            version = 'v%i.0' % self.version
+
         return """import pandas as pd
 import numpy as np
 import struct, re, copy
@@ -1116,7 +1127,7 @@ import struct, re, copy
 class Predict(object):
 
     def __init__(self):
-        self.version = 'v0.1.2'
+        self.version = '{}'
 
     def predict(self, model, features, data, **args):
         ''' 
@@ -1130,7 +1141,7 @@ class Predict(object):
         '''
         ###############
         # Custom Code #
-        ###############""" + textwrap.indent(custom_code, '    ') \
+        ###############""".format(version) + textwrap.indent(custom_code, '    ') \
     + self.DataProcessing.exportFunction() \
     + self.FeatureProcessing.exportFunction() + '''
         ###########
@@ -1207,7 +1218,7 @@ class DataProcessing(object):
 
         ### Algorithms
         missingValuesImplemented = ['remove_rows', 'remove_cols', 'interpolate', 'mean', 'zero']
-        outlierRemovalImplemented = ['boxplot', 'zscore', 'none']
+        outlierRemovalImplemented = ['boxplot', 'zscore', 'clip', 'none']
         if outlier_removal not in outlierRemovalImplemented:
             raise ValueError("Outlier Removal Algorithm not implemented. Should be in " + str(outlierRemovalImplemented))
         if missing_values not in missingValuesImplemented:
@@ -1282,7 +1293,7 @@ class DataProcessing(object):
             Zscore = (data - data.mean(skipna=True, numeric_only=True)) \
                      / np.sqrt(data.var(skipna=True, numeric_only=True))
             data[Zscore > self.zScoreThreshold] = np.nan
-        elif self.outlierRemoval == 'clip:':
+        elif self.outlierRemoval == 'clip':
             data = data.clip(lower=-1e12, upper=1e12)
         return data
 
@@ -1494,7 +1505,7 @@ class FeatureProcessing(object):
             self.model = tree.DecisionTreeRegressor(max_depth=3)
             self.mode = 'regression'
         # Bit of necessary data cleaning (shouldn't change anything)
-        inputFrame = inputFrame.astype('float32').replace(np.inf, 1e20).replace(-np.inf, -1e20).fillna(0).reset_index(drop=True)
+        inputFrame = inputFrame.astype('float32').replace(np.inf, 1e12).replace(-np.inf, -1e12).fillna(0).reset_index(drop=True)
         self.input = copy.copy(inputFrame)
         self.originalInput = copy.copy(inputFrame)
         self.output = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
@@ -1581,13 +1592,13 @@ class FeatureProcessing(object):
             scores = {}
             for keyA, keyB in tqdm(divList):
                 feature = self.input[[keyA]] / self.input[[keyB]]
-                feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
+                feature = feature.clip(lower=1e-12, upper=1e12).fillna(0)
                 m = copy.copy(self.model)
                 m.fit(feature, self.output)
                 scores[keyA + '__d__' + keyB] = m.score(feature, self.output)
             for keyA, keyB in tqdm(multiList):
                 feature = self.input[[keyA]] * self.input[[keyB]]
-                feature = feature.replace([np.inf, -np.inf], 0).fillna(0)
+                feature = feature.clip(lower=1e-12, upper=1e12).fillna(0)
                 m = copy.copy(self.model)
                 m.fit(feature, self.output)
                 scores[keyA + '__x__' + keyB] = m.score(feature, self.output)
@@ -1604,12 +1615,12 @@ class FeatureProcessing(object):
         for k in multiFeatures:
             keyA, keyB = k.split('__x__')
             feature = self.input[keyA] * self.input[keyB]
-            feature = feature.astype('float32').replace([np.inf, -np.inf], 0).fillna(0)
+            feature = feature.astype('float32').clip(lower=1e-12, upper=1e12).fillna(0)
             self.input[k] = feature
         for k in divFeatures:
             keyA, keyB = k.split('__d__')
             feature = self.input[keyA] / self.input[keyB]
-            feature = feature.astype('float32').replace([np.inf, -np.inf], 0).fillna(0)
+            feature = feature.astype('float32').clip(lower=1e-12, upper=1e12).fillna(0)
             self.input[k] = feature
 
         # Store
@@ -1626,30 +1637,39 @@ class FeatureProcessing(object):
         if os.path.exists(self.folder + 'K-MeansFeatures_v%i.json' % self.version):
             # Load features and cluster size
             self.kMeansFeatures = json.load(open(self.folder + 'K-MeansFeatures_v%i.json' % self.version, 'r'))
-            centers = pd.read_csv(self.folder + 'Centers_v%i.csv' % self.version)
+            kMeansData = pd.read_csv(self.folder + 'KMeans_v%i.csv' % self.version)
             print('[Features] Loaded %i K-Means features' % len(self.kMeansFeatures))
+
+            # Prepare data
+            data = copy.copy(self.originalInput)
+            centers = kMeansData.iloc[:-2]
+            means = kMeansData.iloc[-2]
+            stds = kMeansData.iloc[-1]
+            data -= means
+            data /= stds
 
             # Add them
             for key in self.kMeansFeatures:
                 ind = int(key[key.find('dist__') + 7: key.rfind('_')])
-                self.input[key] = np.sqrt(np.square(self.originalInput - centers.iloc[ind]).sum(axis=1))
+                self.input[key] = np.sqrt(np.square(data - centers.iloc[ind]).sum(axis=1))
 
         # If not executed, analyse all
         else:
             print('[Features] Calculating and Analysing K-Means features')
             # Prepare data
-            data = copy.copy(self.input)
+            data = copy.copy(self.originalInput)
             means = data.mean()
             stds = data.std()
             stds[stds == 0] = 1
             data -= means
             data /= stds
+
             # Determine clusters
             clusters = min(max(int(np.log10(len(self.originalInput)) * 8), 8), len(self.originalInput.keys()))
             kmeans = cluster.MiniBatchKMeans(n_clusters=clusters)
             columnNames = ['dist__%i_%i' % (i, clusters) for i in range(clusters)]
             distances = pd.DataFrame(columns=columnNames, data=kmeans.fit_transform(data))
-            distances = distances.replace([np.inf, -np.inf], 0).fillna(0)
+            distances = distances.clip(lower=1e-12, upper=1e12).fillna(0)
 
             # Analyse correlation
             scores = {}
@@ -1662,10 +1682,12 @@ class FeatureProcessing(object):
             self.kMeansFeatures = [k for k, v in scores.items() if v > 0.1]
             for k in self.kMeansFeatures:
                 self.input[k] = distances[k]
+
+            # Create output
             centers = pd.DataFrame(columns=self.originalInput.keys(), data=kmeans.cluster_centers_)
             centers = centers.append(means, ignore_index=True)
             centers = centers.append(stds, ignore_index=True)
-            centers.to_csv(self.folder + 'Centers_v%i.csv' % self.version, index=False)
+            centers.to_csv(self.folder + 'KMeans_v%i.csv' % self.version, index=False)
             json.dump(self.kMeansFeatures, open(self.folder + 'K-MeansFeatures_v%i.json' % self.version, 'w'))
             print('[Features] Added %i K-Means features (%i clusters)' % (len(self.kMeansFeatures), clusters))
 
