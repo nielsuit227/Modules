@@ -25,6 +25,7 @@ warnings.filterwarnings("ignore")
 
 # Priority
 # add cloud function script to prod env
+# add value limits on data preprocessing
 
 # Nicety
 # add report output
@@ -45,7 +46,7 @@ class Pipeline(object):
                  date_cols=[],
                  cat_cols=[],
                  missing_values='interpolate',
-                 outlier_removal='none',
+                 outlier_removal='clip',
                  z_score_threshold=4,
                  include_output=False,
 
@@ -1169,7 +1170,7 @@ class DataProcessing(object):
                  date_cols=None,
                  cat_cols=None,
                  missing_values='interpolate',
-                 outlier_removal='none',
+                 outlier_removal='clip',
                  z_score_threshold=4,
                  folder='',
                  version=1,
@@ -1281,6 +1282,8 @@ class DataProcessing(object):
             Zscore = (data - data.mean(skipna=True, numeric_only=True)) \
                      / np.sqrt(data.var(skipna=True, numeric_only=True))
             data[Zscore > self.zScoreThreshold] = np.nan
+        elif self.outlierRemoval == 'clip:':
+            data = data.clip(lower=-1e12, upper=1e12)
         return data
 
     def _removeMissingValues(self, data):
@@ -1491,8 +1494,9 @@ class FeatureProcessing(object):
             self.model = tree.DecisionTreeRegressor(max_depth=3)
             self.mode = 'regression'
         # Bit of necessary data cleaning (shouldn't change anything)
-        self.input = inputFrame.astype('float32').replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
-        self.originalInput = self.input
+        inputFrame = inputFrame.astype('float32').replace(np.inf, 1e20).replace(-np.inf, -1e20).fillna(0).reset_index(drop=True)
+        self.input = copy.copy(inputFrame)
+        self.originalInput = copy.copy(inputFrame)
         self.output = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
 
     def _calcBaseline(self):
@@ -1637,6 +1641,7 @@ class FeatureProcessing(object):
             data = copy.copy(self.input)
             means = data.mean()
             stds = data.std()
+            stds[stds == 0] = 1
             data -= means
             data /= stds
             # Determine clusters
