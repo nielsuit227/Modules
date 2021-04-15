@@ -758,6 +758,11 @@ class Pipeline(object):
             results['worst_case'] = results['mean_score'] - results['std_score']
             results = results.sort_values('worst_case')
 
+        # Update resource in params
+        if resource != 'n_samples':
+            for i in range(len(results)):
+                results.loc[results.index[i], 'params'][resource] = max_resources
+
         return results
 
     def _validateResult(self, master_model, params, feature_set):
@@ -959,8 +964,8 @@ class Pipeline(object):
 
         # Cluster Features require additional 'Centers' file
         if any(['dist__' in key for key in self.bestFeatures]):
-            shutil.copy(self.mainDir + 'Features/Centers_v%i.csv' % self.version,
-                        self.mainDir + 'Production/v%i/Centers.csv' % self.version)
+            shutil.copy(self.mainDir + 'Features/KMeans_v%i.csv' % self.version,
+                        self.mainDir + 'Production/v%i/KMeans.csv' % self.version)
 
         # Model
         self.bestModel = [mod for mod in self.Modelling.return_models() if type(mod).__name__ == model][0]
@@ -969,8 +974,9 @@ class Pipeline(object):
         joblib.dump(self.bestModel, self.mainDir + 'Production/v%i/Model.joblib' % self.version)
 
         # Predict function
+        predictCode = self.createPredictFunction(self.customCode)
         with open(self.mainDir + 'Production/v%i/Predict.py' % self.version, 'w') as f:
-            f.write(self.createPredictFunction(self.customCode))
+            f.write(predictCode)
         with open(self.mainDir + 'Production/v%i/__init__.py' % self.version, 'w') as f:
             f.write('')
         
@@ -1054,9 +1060,9 @@ class Pipeline(object):
             output = None
 
         # Convert Features
-        if 'Centers.csv' in os.listdir(self.mainDir + folder):
-            centers = pd.read_csv(self.mainDir + folder + 'Centers.csv')
-            input = self.FeatureProcessing.transform(data=data, features=features, centers=centers)
+        if 'KMeans.csv' in os.listdir(self.mainDir + folder):
+            k_means = pd.read_csv(self.mainDir + folder + 'KMeans.csv')
+            input = self.FeatureProcessing.transform(data=data, features=features, k_means=k_means)
         else:
             input = self.FeatureProcessing.transform(data, features)
 
@@ -1118,10 +1124,12 @@ class Pipeline(object):
             version = oldVersion[:oldVersion.find('.')+1] + str(minorVersion + 1)
         else:
             version = 'v%i.0' % self.version
-
+        print('Creating Prediction %s' % version)
+        dataProcess = self.DataProcessing.exportFunction()
+        featureProcess = self.FeatureProcessing.exportFunction()
         return """import pandas as pd
 import numpy as np
-import struct, re, copy
+import struct, re, copy, os
 
 
 class Predict(object):
@@ -1142,25 +1150,20 @@ class Predict(object):
         ###############
         # Custom Code #
         ###############""".format(version) + textwrap.indent(custom_code, '    ') \
-    + self.DataProcessing.exportFunction() \
-    + self.FeatureProcessing.exportFunction() + '''
+    + dataProcess + featureProcess \
+    + '''
         ###########
         # Predict #
         ###########
         mode = '{}'
         
-        # Remove large features
-        input[input.astype('float32') == np.inf] = 1e38
-        
         # Normalize
         if 'scaler' in args.keys():
             input = args['scaler'].transform(input)
-        else:
-            print('[WARNING] Not normalizing')
         
         # Predict
         if mode == 'regression':
-            if 'oScaler' in args.keys():
+            if 'o_scaler' in args.keys():
                 predictions = args['oScaler'].inverse_transform(model.predict(input))
             else:
                 predictions = model.predict(input)
@@ -1344,6 +1347,7 @@ class DataProcessing(object):
             inspect.getsource(self._removeMissingValues).replace('self.', ''),
         ]
         functionStrings = '\n'.join([k[k.find('\n'): k.rfind('\n', 0, k.rfind('\n'))] for k in functionStrings])
+
         return """
         #################
         # Data Cleaning #
@@ -1424,9 +1428,9 @@ class FeatureProcessing(object):
 
         # Make sure centers are provided if kMeansFeatures are nonzero
         if len(kMeansFeatures) != 0:
-            if 'centers' not in args:
+            if 'k_means' not in args:
                 raise ValueError('For K-Means features, the Centers need to be provided.')
-            centers = args['centers']
+            k_means = args['k_means']
 
         # Fill missing features for normalization
         required = copy.copy(originalFeatures)
@@ -1435,7 +1439,7 @@ class FeatureProcessing(object):
         required += [s.split('__diff__')[0] for s in diffFeatures]
         required += [s.split('__lag__')[0] for s in multiFeatures]
         if len(kMeansFeatures) != 0:
-            required += [k for k in centers.keys()]
+            required += [k for k in k_means.keys()]
         for k in [k for k in required if k not in data.keys()]:
             data.loc[:, k] = np.zeros(len(data))
 
@@ -1446,13 +1450,13 @@ class FeatureProcessing(object):
         for key in multiFeatures:
             keyA, keyB = key.split('__x__')
             feature = data[keyA] * data[keyB]
-            input.loc[:, key] = feature.replace([np.inf, -np.inf], 0).fillna(0)
+            input.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
 
         # Division features
         for key in divFeatures:
             keyA, keyB = key.split('__d__')
             feature = data[keyA] / data[keyB]
-            input.loc[:, key] = feature.replace([np.inf, -np.inf], 0).fillna(0)
+            input.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
 
         # Differenced features
         for k in diffFeatures:
@@ -1464,20 +1468,17 @@ class FeatureProcessing(object):
 
         # K-Means features
         if len(kMeansFeatures) != 0:
-            # Copy data and ensure center keys are inside
+            # Organise data
             temp = copy.copy(data)
-            for key in [k for k in centers.keys() if k not in temp.keys()]:
-                temp.loc[:, key] = np.zeros(len(input))
-            # Split means and standard deviations from center data
-            stds = centers.iloc[-1]
-            means = centers.iloc[-2]
-            centers = centers.iloc[:-2]
+            centers = k_means.iloc[:-2]
+            means = k_means.iloc[-2]
+            stds = k_means.iloc[-1]
             # Normalize
             temp -= means
             temp /= stds
             # Calculate centers
             for key in kMeansFeatures:
-                ind = int(key[key.find('dist__') + 8: key.rfind('_')])
+                ind = int(key[key.find('dist__') + 6: key.rfind('_')])
                 input.loc[:, key] = np.sqrt(np.square(temp.loc[:, centers.keys()] - centers.iloc[ind]).sum(axis=1))
 
         # Lagged features
@@ -1650,7 +1651,7 @@ class FeatureProcessing(object):
 
             # Add them
             for key in self.kMeansFeatures:
-                ind = int(key[key.find('dist__') + 7: key.rfind('_')])
+                ind = int(key[key.find('dist__') + 6: key.rfind('_')])
                 self.input[key] = np.sqrt(np.square(data - centers.iloc[ind]).sum(axis=1))
 
         # If not executed, analyse all
