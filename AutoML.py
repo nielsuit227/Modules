@@ -1317,6 +1317,9 @@ class DataProcessing(object):
                 data.loc[data[key] < Q1[key] - 1.5 * (Q3[key] - Q1[key]), key] = np.nan
                 data.loc[data[key] > Q3[key] + 1.5 * (Q3[key] - Q1[key]), key] = np.nan
         elif self.outlierRemoval == 'zscore':
+            zScore = (data - data.mean(skipna=True, numeric_only=True)) \
+                     / data.std(skipna=True, numeric_only=True)
+            data[zScore > self.zScoreThreshold] = np.nan
         elif self.outlierRemoval == 'clip':
             data = data.clip(lower=-1e12, upper=1e12)
         return data
