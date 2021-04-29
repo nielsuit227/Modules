@@ -771,20 +771,21 @@ class Pipeline(object):
 
         return results
 
-    def validate(self, model, feature_set):
+    def validate(self, model, feature_set, params=None):
         # Get model
         models = self.Modelling.return_models()
         model = models[[i for i in range(len(models)) if type(models[i]).__name__ == model][0]]
 
         # Get params
-        results = self.results[np.logical_and(
-            self.results['model'] == type(model).__name__,
-            self.results['data_version'] == self.version,
-        )]
-        results = self._sortResults(results[results['dataset'] == feature_set])
-        assert 'Hyperparameter Opt' in results['type'].values, 'Hyperparameters not optimized for this combination'
-        hyperOptResults = results[results['type'] == 'Hyperparameter Opt']
-        params = self._parseJson(hyperOptResults.iloc[0]['params'])
+        if params is not None:
+            results = self.results[np.logical_and(
+                self.results['model'] == type(model).__name__,
+                self.results['data_version'] == self.version,
+            )]
+            results = self._sortResults(results[results['dataset'] == feature_set])
+            assert 'Hyperparameter Opt' in results['type'].values, 'Hyperparameters not optimized for this combination'
+            hyperOptResults = results[results['type'] == 'Hyperparameter Opt']
+            params = self._parseJson(hyperOptResults.iloc[0]['params'])
 
         # Run validation
         self._validateResult(model, params, feature_set)
