@@ -30,6 +30,7 @@ warnings.filterwarnings("ignore")
 # Priority
 # implement warning for imputing keys
 # skip SVC/SVR for sample sizes > 25.000
+# Weighted loss for classification
 
 # Nicety
 # add report output
@@ -426,25 +427,7 @@ class Pipeline(object):
                 'alpha': [1e-4, 1e-3, 1e-5],
                 'shuffle': [False],
             }
-        elif model.__module__ == 'lightgbm.sklearn':
-            return {
-                'num_leaves': [10, 31, 50],
-                'min_child_samples': [100, 250, 500],
-                'min_child_weight': [1e-5, 1e-3, 1e-1],
-                'subsample': [0.2, 0.4, 0.6, 0.8],
-                'colsample_bytree':[0.4, 0.5, 0.6],
-                'reg_alpha': [0, 0.5, 1],
-                'reg_lambda': [0, 0.5, 1],
-                'n_jobs': [4],
-            }
-        elif model.__module__ == 'xgboost.sklearn':
-            return {
-                'max_depth': [3, 6, 9, 12],
-                'booster': ['gbtree', 'gblinear', 'dart'],
-                'learning_rate': [0.01, 0.1, 0.3],
-                'verbosity': [0],
-                'n_jobs': [4],
-            }
+
 
         # Regressor specific hyperparameters
         elif self.mode == 'regression':
@@ -498,6 +481,25 @@ class Pipeline(object):
                     'min_samples_leaf': [1, 5, 10],
                     'bootstrap': [True, False],
                 }
+            elif model.__module__ == 'xgboost.sklearn':
+                return {
+                    'max_depth': [3, 6, 9, 12],
+                    'booster': ['gbtree', 'gblinear', 'dart'],
+                    'learning_rate': [0.01, 0.1, 0.3],
+                    'verbosity': [0],
+                    'n_jobs': [4],
+                }
+            elif model.__module__ == 'lightgbm.sklearn':
+                return {
+                'num_leaves': [10, 31, 50],
+                'min_child_samples': [100, 250, 500],
+                'min_child_weight': [1e-5, 1e-3, 1e-1],
+                'subsample': [0.2, 0.4, 0.6, 0.8],
+                'colsample_bytree':[0.4, 0.5, 0.6],
+                'reg_alpha': [0, 0.5, 1],
+                'reg_lambda': [0, 0.5, 1],
+                'n_jobs': [4],
+            }
 
         # Classification specific hyperparameters
         elif self.mode == 'classification':
@@ -523,6 +525,7 @@ class Pipeline(object):
                     'loss_function': ['Logloss', 'MultiClass'],
                     'learning_rate': [0.001, 0.01, 0.03, 0.05, 0.1],
                     'l2_leaf_reg': [1, 3, 5],
+                    'scale_pos_weight': [0.1, 1, 10, 100]
                 }
             elif isinstance(model, sklearn.ensemble.BaggingClassifier):
                 return {
@@ -556,6 +559,27 @@ class Pipeline(object):
                     'min_samples_leaf': [1, 2, 4],
                     'bootstrap': [True, False],
                 }
+            elif model.__module__ == 'xgboost.sklearn':
+                return {
+                    'max_depth': [3, 6, 9, 12],
+                    'booster': ['gbtree', 'gblinear', 'dart'],
+                    'learning_rate': [0.01, 0.1, 0.3],
+                    'verbosity': [0],
+                    'n_jobs': [4],
+                    'scale_pos_weight': [0.1, 1, 10, 100]
+                }
+            elif model.__module__ == 'lightgbm.sklearn':
+                return {
+                'num_leaves': [10, 31, 50],
+                'min_child_samples': [100, 250, 500],
+                'min_child_weight': [1e-5, 1e-3, 1e-1],
+                'subsample': [0.2, 0.4, 0.6, 0.8],
+                'colsample_bytree':[0.4, 0.5, 0.6],
+                'reg_alpha': [0, 0.5, 1],
+                'reg_lambda': [0, 0.5, 1],
+                'n_jobs': [4],
+                'scale_pos_weight': [0.1, 1, 10, 100],
+            }
 
         # Raise error if nothing is returned
         raise NotImplementedError('Hyperparameter tuning not implemented for ', type(model).__name__)
