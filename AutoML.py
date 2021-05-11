@@ -21,11 +21,15 @@ from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 import warnings
+from scipy.linalg import LinAlgWarning
 warnings.filterwarnings("ignore")
+# warnings.filterwarnings(action='ignore', category=LinAlgWarning, module='sklearn')
+# warnings.filterwarnings(action='ignore', category=UserWarning)
+# pd.options.mode.chained_assignment = None
 
 # Priority
-# add cloud function script to prod env
-# add value limits on data preprocessing
+# implement warning for imputing keys
+# skip SVC/SVR for sample sizes > 25.000
 
 # Nicety
 # add report output
@@ -89,7 +93,6 @@ class Pipeline(object):
         if len(project) == 0: self.mainDir = 'AutoML/'
         else: self.mainDir = project if project[-1] == '/' else project + '/'
         self.target = re.sub('[^a-z0-9]', '_', target.lower())
-        self.version = version
         self.verbose = verbose
         self.customCode = custom_code
         self.fastRun = fast_run
@@ -131,7 +134,7 @@ class Pipeline(object):
 
         # Instance initiating
         self.mode = mode
-        self.version = None
+        self.version = version
         self.input = None
         self.output = None
         self.colKeep = None
@@ -172,46 +175,47 @@ class Pipeline(object):
             self.validateResults = self._boolAsk('Validate results?')
 
     def _loadVersion(self):
-        versions = os.listdir(self.mainDir + 'Production')
-        # Updates changelog
-        if self.processData:
-            if len(versions) == 0:
-                if self.verbose > 0:
-                    print('[AutoML] No Production files found. Setting version 0.')
-                self.version = 0
-                file = open(self.mainDir + 'changelog.txt', 'w')
-                file.write('Dataset changelog. \nv0: Initial')
-                file.close()
-            else:
-                self.version = len((versions))
-
-                # Check if not already started
-                with open(self.mainDir + 'changelog.txt', 'r') as f:
-                    changelog = f.read()
-
-                # Else ask for changelog
-                if 'v%i' % self.version in changelog:
-                    changelog = changelog[changelog.find('v%i' % self.version):]
-                    changelog = changelog[:changelog.find('\n')]
-                else:
-                    changelog = '\nv%i: ' % self.version + input("Data changelog v%i:\n" % self.version)
-                    file = open(self.mainDir + 'changelog.txt', 'a')
-                    file.write(changelog)
+        if self.version == None:
+            versions = os.listdir(self.mainDir + 'Production')
+            # Updates changelog
+            if self.processData:
+                if len(versions) == 0:
+                    if self.verbose > 0:
+                        print('[AutoML] No Production files found. Setting version 0.')
+                    self.version = 0
+                    file = open(self.mainDir + 'changelog.txt', 'w')
+                    file.write('Dataset changelog. \nv0: Initial')
                     file.close()
-                if self.verbose > 0:
-                    print('[AutoML] Set version %s' % (changelog))
-        else:
-            if len(versions) == 0:
-                if self.verbose > 0:
-                    print('[AutoML] No Production files found. Setting version 0.')
-                self.version = 0
+                else:
+                    self.version = len((versions))
+
+                    # Check if not already started
+                    with open(self.mainDir + 'changelog.txt', 'r') as f:
+                        changelog = f.read()
+
+                    # Else ask for changelog
+                    if 'v%i' % self.version in changelog:
+                        changelog = changelog[changelog.find('v%i' % self.version):]
+                        changelog = changelog[:max(0, changelog.find('\n'))]
+                    else:
+                        changelog = '\nv%i: ' % self.version + input("Data changelog v%i:\n" % self.version)
+                        file = open(self.mainDir + 'changelog.txt', 'a')
+                        file.write(changelog)
+                        file.close()
+                    if self.verbose > 0:
+                        print('[AutoML] Set version %s' % (changelog[1:]))
             else:
-                self.version = int(len(versions)) - 1
-                with open(self.mainDir + 'changelog.txt', 'r') as f:
-                    changelog = f.read()
-                changelog = changelog[changelog.find('v%i' % self.version):]
-                if self.verbose > 0:
-                    print('[AutoML] Loading last version (%s)' % changelog[:changelog.find('\n')])
+                if len(versions) == 0:
+                    if self.verbose > 0:
+                        print('[AutoML] No Production files found. Setting version 0.')
+                    self.version = 0
+                else:
+                    self.version = int(len(versions)) - 1
+                    with open(self.mainDir + 'changelog.txt', 'r') as f:
+                        changelog = f.read()
+                    changelog = changelog[changelog.find('v%i' % self.version):]
+                    if self.verbose > 0:
+                        print('[AutoML] Loading last version (%s)' % changelog[:changelog.find('\n')])
 
     def _createDirs(self):
         dirs = ['', 'Data', 'Features', 'Models', 'Production', 'Validation', 'Sets']
@@ -249,7 +253,7 @@ class Pipeline(object):
             results['worst_case'] = results['mean_score'] + results['std_score']
             results = results.sort_values('worst_case', ascending=True)
         elif self.mode == 'classification':
-            results['worst_case'] = results['mean_score'] - results['std_score']
+            results.loc[:, 'worst_case'] = results['mean_score'] - results['std_score']
             results = results.sort_values('worst_case', ascending=False)
         return results
 
@@ -318,6 +322,18 @@ class Pipeline(object):
         self.input = data
         if self.includeOutput is False:
             self.input = self.input.drop(self.target, axis=1)
+
+        # Assert classes in case of classification
+        if self.mode == 'classification':
+            assert self.output.nunique()[self.target] == 2, 'Only binary classification implemented currently.'
+            classes = set(self.output[self.target])
+            if classes != {0, 1}:
+                if 1 in classes:
+                    self.output.loc[self.output != 1] = 0
+                else:
+                    outputs = list(classes)
+                    self.output.loc[self.output == outputs[0]] = 0
+                    self.output.loc[self.output == outputs[1]] = 1
 
     def _featureProcessing(self):
         # Extract
@@ -850,6 +866,7 @@ class Pipeline(object):
             prec = []
             rec = []
             spec = []
+            f1 = []
             aucs = []
             tprs = []
             cm = np.zeros((2, 2))
@@ -867,13 +884,18 @@ class Pipeline(object):
 
                 # Metrics
                 tp = np.logical_and(np.sign(predictions) == 1, vo == 1).sum()
-                tn = np.logical_and(np.sign(predictions) == -1, vo == -1).sum()
-                fp = np.logical_and(np.sign(predictions) == 1, vo == -1).sum()
-                fn = np.logical_and(np.sign(predictions) == -1, vo == 1).sum()
+                tn = np.logical_and(np.sign(predictions) == 0, vo == 0).sum()
+                fp = np.logical_and(np.sign(predictions) == 1, vo == 0).sum()
+                fn = np.logical_and(np.sign(predictions) == 0, vo == 1).sum()
                 acc.append((tp + tn) / n * 100)
-                prec.append(tp / (tp + fp) * 100)
-                rec.append(tp / (tp + fn) * 100)
-                spec.append(tn / (tn + fp) * 100)
+                if tp + fp > 0:
+                    prec.append(tp / (tp + fp) * 100)
+                if tp + fn > 0:
+                    rec.append(tp / (tp + fn) * 100)
+                if tn + fp > 0:
+                    spec.append(tn / (tn + fp) * 100)
+                if tp + fp > 0 and tp + fn > 0:
+                    f1.append(2 * prec[-1] * rec[-1] / (prec[-1] + rec[-1]) if prec[-1] + rec[-1] > 0 else 0)
                 cm += np.array([[tp, fp], [fn, tn]]) / self.nSplits
 
                 # Plot
@@ -881,14 +903,10 @@ class Pipeline(object):
                 ax[i // 2][i % 2].plot(predictions, c='#ffa62b')
                 ax[i // 2][i % 2].set_title('Fold-%i' % i)
 
-
             # Results
-            f1 = [2 * prec[i] * rec[i] / (prec[i] + rec[i]) for i in range(self.nSplits)]
-            p = np.mean(prec)
-            r = np.mean(rec)
             print('[AutoML] Accuracy:        %.2f \u00B1 %.2f %%' % (np.mean(acc), np.std(acc)))
-            print('[AutoML] Precision:       %.2f \u00B1 %.2f %%' % (p, np.std(prec)))
-            print('[AutoML] Recall:          %.2f \u00B1 %.2f %%' % (r, np.std(rec)))
+            print('[AutoML] Precision:       %.2f \u00B1 %.2f %%' % (np.mean(prec), np.std(prec)))
+            print('[AutoML] Recall:          %.2f \u00B1 %.2f %%' % (np.mean(rec), np.std(rec)))
             print('[AutoML] Specificity:     %.2f \u00B1 %.2f %%' % (np.mean(spec), np.std(spec)))
             print('[AutoML] F1-score:        %.2f \u00B1 %.2f %%' % (np.mean(f1), np.std(f1)))
             print('[AutoML] Confusion Matrix:')
@@ -998,7 +1016,7 @@ class Pipeline(object):
         # Model
         self.bestModel = [mod for mod in self.Modelling.return_models() if type(mod).__name__ == model][0]
         self.bestModel.set_params(**params)
-        self.bestModel.fit(input, output)
+        self.bestModel.fit(input, output.values.ravel())
         joblib.dump(self.bestModel, self.mainDir + 'Production/v%i/Model.joblib' % self.version)
 
         # Predict function
@@ -1438,10 +1456,10 @@ class FeatureProcessing(object):
             # Different Feature Sets
             pps = self._predictivePowerScore()
             rft, rfi = self._randomForestImportance()
-            bp = self._borutaPy()
+            # bp = self._borutaPy()
 
             # Store & Return
-            result = {'PPS': pps, 'RFT': rft, 'RFI': rfi, 'BP': bp}
+            result = {'PPS': pps, 'RFT': rft, 'RFI': rfi}#, 'BP': bp}
             json.dump(result, open(self.folder + 'Sets_v%i.json' % self.version, 'w'))
             return result
 
@@ -1897,9 +1915,13 @@ class ExploratoryDataAnalysis(object):
             if isinstance(output, pd.DataFrame): output = output[output.keys()[0]]
             self.output = output.astype('float32').fillna(0)
             if self.output.nunique() == 2:
+                print('[AutoML] Mode set to classification.')
                 self.mode = 'classification'
-                assert set(self.output.values) == {-1, 1}, 'Classes need to be {-1, 1}'
+                if set(self.output.values) != {0, 1}:
+                    assert 1 in self.output.values, 'Ambiguous classes (either {0, 1} or {-1, 1})'
+                    self.output.loc[self.output.values != 1] = 0
             else:
+                print('[AutoML] Mode set to regression.')
                 self.mode = 'regression'
         else:
             self.mode = None
@@ -2316,6 +2338,7 @@ class Modelling(object):
         self.mode = mode
         self.shuffle = shuffle
         self.plot = plot
+        self.samples = None
         self.acc = []
         self.std = []
         self.nSplits = n_splits
@@ -2325,6 +2348,7 @@ class Modelling(object):
         self.folder = folder if folder[-1] == '/' else folder + '/'
 
     def fit(self, input, output):
+        self.samples = len(output)
         if self.mode == 'regression':
             from sklearn.model_selection import KFold
             cv = KFold(n_splits=self.nSplits, shuffle=self.shuffle)
@@ -2338,46 +2362,55 @@ class Modelling(object):
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
         from sklearn.experimental import enable_hist_gradient_boosting
 
+        models = []
+
         if self.mode == 'classification':
-            ridge = linear_model.RidgeClassifier()
+
+            models.append(linear_model.RidgeClassifier())
             # lasso = linear_model.Lasso()
             # sgd = linear_model.SGDClassifier()
-            svm = svm.SVC(kernel='rbf')
+            if self.samples < 25000:
+                models.append(svm.SVC(kernel='rbf'))
             # knc = neighbors.KNeighborsClassifier()
             # dtc = tree.DecisionTreeClassifier()
             # ada = ensemble.AdaBoostClassifier()
-            cat = catboost.CatBoostClassifier(verbose=0, n_estimators=1000, allow_writing_files=False)
-            bag = ensemble.BaggingClassifier()
-            gb = ensemble.GradientBoostingClassifier()
-            hgb = ensemble.HistGradientBoostingClassifier()
-            rf = ensemble.RandomForestClassifier()
+            models.append(catboost.CatBoostClassifier(verbose=0, n_estimators=1000, allow_writing_files=False))
+            if self.samples < 25000:
+                models.append(ensemble.BaggingClassifier())
+                models.append(ensemble.GradientBoostingClassifier())
+            else:
+                models.append(ensemble.HistGradientBoostingClassifier())
+            models.append(ensemble.RandomForestClassifier())
             # mlp = neural_network.MLPClassifier()
-            xgb = xgboost.XGBClassifier(n_estimators=250, verbosity=0)
-            lgbm = lightgbm.LGBMClassifier(n_estimators=250, verbose=-1, force_row_wise=True)
+            models.append(xgboost.XGBClassifier(n_estimators=250, verbosity=0, use_label_encoder=False))
+            models.append(lightgbm.LGBMClassifier(n_estimators=250, verbose=-1, force_row_wise=True))
 
         elif self.mode == 'regression':
-            ridge = linear_model.Ridge()
+            models.append(linear_model.Ridge())
             # lasso = linear_model.Lasso()
             # sgd = linear_model.SGDRegressor()
-            svm = svm.SVR(kernel='rbf')
+            if self.samples < 25000:
+                models.append(svm.SVR(kernel='rbf'))
             # knr = neighbors.KNeighborsRegressor()
             # dtr = tree.DecisionTreeRegressor()
             # ada = ensemble.AdaBoostRegressor()
-            cat = catboost.CatBoostRegressor(verbose=0, n_estimators=1000, allow_writing_files=False)
-            bag = ensemble.BaggingRegressor()
-            gb = ensemble.GradientBoostingRegressor()
-            hgb = ensemble.HistGradientBoostingRegressor()
-            rf = ensemble.RandomForestRegressor()
-            # mlp = neural_network.MLPRegressor()
-            xgb = xgboost.XGBRegressor(n_estimators=250, verbosity=0)
-            lgbm = lightgbm.LGBMRegressor(n_estimators=250, verbose=-1, force_row_wise=True)
+            models.append(catboost.CatBoostRegressor(verbose=0, n_estimators=1000, allow_writing_files=False))
+            models.append(ensemble.BaggingRegressor())
+            if self.samples < 25000:
+                models.append(ensemble.GradientBoostingRegressor())
+            else:
+                models.append(ensemble.HistGradientBoostingRegressor())
+            models.append(ensemble.RandomForestRegressor())
+            # mlp = neural_network.MLPRegressor())
+            models.append(xgboost.XGBRegressor(n_estimators=250, verbosity=0))
+            models.append(lightgbm.LGBMRegressor(n_estimators=250, verbose=-1, force_row_wise=True))
 
-        return [ridge, svm, cat, bag, gb, hgb, rf, xgb, lgbm]
+        return models
 
     def _fit(self, input, output, cross_val, metric):
         # Convert to NumPy
         input = np.array(input)
-        output = np.array(output)
+        output = np.array(output).ravel()
 
         # Data
         print('[Modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.nSplits, len(input[0])))
