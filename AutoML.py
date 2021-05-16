@@ -120,12 +120,12 @@ class Pipeline(object):
                  # Initial Modelling
                  normalize=True,
                  shuffle=False,
-                 n_splits=3,
+                 cv_splits=3,
                  store_models=True,
 
                  # Grid Search
                  grid_search_iterations=3,
-                 use_halving=False,
+                 use_halving=True,
 
                  # Production
                  custom_code='',
@@ -174,7 +174,7 @@ class Pipeline(object):
         self.sequenceDiff = diff
         self.normalize = normalize
         self.shuffle = shuffle
-        self.nSplits = n_splits
+        self.cvSplits = cv_splits
         self.gridSearchIterations = grid_search_iterations
         self.useHalvingGridSearch = use_halving
         self.plotEDA = plot_eda
@@ -282,6 +282,23 @@ class Pipeline(object):
             results.loc[:, 'worst_case'] = results['mean_score'] - results['std_score']
             results = results.sort_values('worst_case', ascending=False)
         return results
+
+    def _getBestParams(self, model, feature_set):
+        # Filter results for model and version
+        results = self.results[np.logical_and(
+            self.results['model'] == type(model).__name__,
+            self.results['data_version'] == self.version,
+        )]
+
+        # Filter results for feature set & sort them
+        results = self._sortResults(results[results['dataset'] == feature_set])
+
+        # Warning for unoptimized results
+        if 'Hyperparameter Opt' not in results['type'].values:
+            warnings.warn('Hyperparameters not optimized for this combination')
+
+        # Parse & return best parameters (regardless of if it's optimized)
+        return Utils.parseJson(results.iloc[0]['params'])
 
     def fit(self, data):
         '''
@@ -537,12 +554,12 @@ class Pipeline(object):
                 }
             elif isinstance(model, catboost.core.CatBoostClassifier):
                 return {
-                    'loss_function': ['Logloss', 'MultiClass'],
+                    'loss_function': ['Logloss' if self.output[self.target].nunique() == 2 else 'MultiClass'],
                     'learning_rate': uniform(0, 1),
                     'l2_leaf_reg': uniform(0, 10),
-                    'depth': randint(3, 15),
-                    'min_data_in_leaf': randint(1, 1000),
-                    'max_leaves': randint(10, 250),
+                    'depth': randint(1, 10),
+                    'min_data_in_leaf': randint(50, 500),
+                    'grow_policy': ['SymmetricTree', 'Depthwise', 'Lossguide'],
                 }
             elif isinstance(model, sklearn.ensemble.BaggingClassifier):
                 return {
@@ -734,7 +751,7 @@ class Pipeline(object):
         # Run for regression (different Cross-Validation & worst case (MAE vs ACC))
         if self.mode == 'regression':
             gridSearch = GridSearch(model, params,
-                                   cv=KFold(n_splits=self.nSplits),
+                                   cv=KFold(n_splits=self.cvSplits),
                                    scoring=mean_absolute_error)
             results = gridSearch.fit(input, output)
             results['worst_case'] = results['mean_score'] + results['std_score']
@@ -743,7 +760,7 @@ class Pipeline(object):
         # run for classification
         elif self.mode == 'classification':
             gridSearch = GridSearch(model, params,
-                                   cv=StratifiedKFold(n_splits=self.nSplits),
+                                   cv=StratifiedKFold(n_splits=self.cvSplits),
                                    scoring=mean_squared_error)
             results = gridSearch.fit(input, output)
             results['worst_case'] = results['mean_score'] - results['std_score']
@@ -777,7 +794,7 @@ class Pipeline(object):
         # Specify Halving Resource
         resource = 'n_samples'
         max_resources = 'auto'
-        min_resources = 'exhaust'
+        min_resources = int(0.2 * len(input)) if len(input) > 5000 else len(input)
         if model.__module__ == 'catboost.core':
             resource = 'n_estimators'
             max_resources = 3000
@@ -788,16 +805,15 @@ class Pipeline(object):
             max_resources = 1500
             min_resources = 50
 
-
         # Optimization
         if self.mode == 'regression':
             gridSearch = HalvingRandomSearchCV(model, params,
                                              resource=resource,
                                              max_resources=max_resources,
                                              min_resources=min_resources,
-                                             cv=KFold(n_splits=self.nSplits),
+                                             cv=KFold(n_splits=self.cvSplits),
                                              scoring='neg_mean_absolute_error',
-                                             factor=5, n_jobs=4, verbose=self.verbose)
+                                             factor=3, n_jobs=mp.cpu_count() - 1, verbose=self.verbose)
             gridSearch.fit(input, output)
             scikitResults = pd.DataFrame(gridSearch.cv_results_)
             results = pd.DataFrame()
@@ -810,9 +826,9 @@ class Pipeline(object):
                                              resource=resource,
                                              max_resources=max_resources,
                                              min_resources=min_resources,
-                                             cv=StratifiedKFold(n_splits=self.nSplits),
+                                             cv=StratifiedKFold(n_splits=self.cvSplits),
                                              scoring='accuracy',
-                                             factor=5, n_jobs=4, verbose=self.verbose)
+                                             factor=3, n_jobs=mp.cpu_count() - 1, verbose=self.verbose)
             gridSearch.fit(input, output)
             scikitResults = pd.DataFrame(gridSearch.cv_results_)
             results = pd.DataFrame()
@@ -828,20 +844,23 @@ class Pipeline(object):
         return results
 
     def validate(self, model, feature_set, params=None):
+        '''
+        Just a wrapper for the outside.
+        Parameters:
+        Model: The model to optimize, either string or class
+        Feature Set: String
+        (optional) params: Model parameters for which to validate
+        '''
+        assert feature_set in self.colKeep.keys(), 'Feature Set not available.'
+
         # Get model
-        models = self.Modelling.return_models()
-        model = models[[i for i in range(len(models)) if type(models[i]).__name__ == model][0]]
+        if isinstance(model, str):
+            models = self.Modelling.return_models()
+            model = models[[i for i in range(len(models)) if type(models[i]).__name__ == model][0]]
 
         # Get params
         if params is not None:
-            results = self.results[np.logical_and(
-                self.results['model'] == type(model).__name__,
-                self.results['data_version'] == self.version,
-            )]
-            results = self._sortResults(results[results['dataset'] == feature_set])
-            assert 'Hyperparameter Opt' in results['type'].values, 'Hyperparameters not optimized for this combination'
-            hyperOptResults = results[results['type'] == 'Hyperparameter Opt']
-            params = Utils.parseJson(hyperOptResults.iloc[0]['params'])
+            params = self._getBestParams(model, feature_set)
 
         # Run validation
         self._validateResult(model, params, feature_set)
@@ -869,12 +888,12 @@ class Pipeline(object):
         if self.mode == 'regression':
 
             # Cross-Validation Plots
-            fig, ax = plt.subplots(math.ceil(self.nSplits / 2), 2, sharex=True, sharey=True)
-            fig.suptitle('%i-Fold Cross Validated Predictions - %s' % (self.nSplits, type(master_model).__name__))
+            fig, ax = plt.subplots(math.ceil(self.cvSplits / 2), 2, sharex=True, sharey=True)
+            fig.suptitle('%i-Fold Cross Validated Predictions - %s' % (self.cvSplits, type(master_model).__name__))
 
             # Initialize iterables
             mae = []
-            cv = KFold(n_splits=self.nSplits, shuffle=self.shuffle)
+            cv = KFold(n_splits=self.cvSplits, shuffle=self.shuffle)
             # Cross Validate
             for i, (t, v) in enumerate(cv.split(input, output)):
                 ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
@@ -899,9 +918,9 @@ class Pipeline(object):
         # For BINARY classification
         elif self.mode == 'classification' and self.output[self.target].nunique() == 2:
             # Initiating
-            fig, ax = plt.subplots(math.ceil(self.nSplits / 2), 2, sharex=True, sharey=True)
+            fig, ax = plt.subplots(math.ceil(self.cvSplits / 2), 2, sharex=True, sharey=True)
             fig.suptitle('%i-Fold Cross Validated Predictions - %s (%s)' %
-                         (self.nSplits, type(master_model).__name__, feature_set))
+                         (self.cvSplits, type(master_model).__name__, feature_set))
             acc = []
             prec = []
             rec = []
@@ -913,7 +932,7 @@ class Pipeline(object):
             mean_fpr = np.linspace(0, 1, 100)
 
             # Modelling
-            cv = StratifiedKFold(n_splits=self.nSplits)
+            cv = StratifiedKFold(n_splits=self.cvSplits)
             for i, (t, v) in enumerate(cv.split(input, output)):
                 n = len(v)
                 ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
@@ -936,7 +955,7 @@ class Pipeline(object):
                     spec.append(tn / (tn + fp) * 100)
                 if tp + fp > 0 and tp + fn > 0:
                     f1.append(2 * prec[-1] * rec[-1] / (prec[-1] + rec[-1]) if prec[-1] + rec[-1] > 0 else 0)
-                cm += np.array([[tp, fp], [fn, tn]]) / self.nSplits
+                cm += np.array([[tp, fp], [fn, tn]]) / self.cvSplits
 
                 # Plot
                 ax[i // 2][i % 2].plot(vo, c='#2369ec', alpha=0.6)
@@ -989,17 +1008,17 @@ class Pipeline(object):
         # For MULTICLASS classification
         elif self.mode == 'classification':
             # Initiating
-            fig, ax = plt.subplots(math.ceil(self.nSplits / 2), 2, sharex=True, sharey=True)
+            fig, ax = plt.subplots(math.ceil(self.cvSplits / 2), 2, sharex=True, sharey=True)
             fig.suptitle('%i-Fold Cross Validated Predictions - %s (%s)' %
-                         (self.nSplits, type(master_model).__name__, feature_set))
+                         (self.cvSplits, type(master_model).__name__, feature_set))
             n_classes = self.output[self.target].nunique()
-            f1Score = np.zeros((self.nSplits, n_classes))
-            logLoss = np.zeros(self.nSplits)
-            avgAcc = np.zeros(self.nSplits)
+            f1Score = np.zeros((self.cvSplits, n_classes))
+            logLoss = np.zeros(self.cvSplits)
+            avgAcc = np.zeros(self.cvSplits)
 
 
             # Modelling
-            cv = StratifiedKFold(n_splits=self.nSplits)
+            cv = StratifiedKFold(n_splits=self.cvSplits)
             for i, (t, v) in enumerate(cv.split(input, output)):
                 n = len(v)
                 ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
@@ -1010,10 +1029,10 @@ class Pipeline(object):
 
                 # Metrics
                 f1Score[i] = f1_score(vo, predictions, average=None)
+                avgAcc[i] = accuracy_score(vo, predictions)
                 if hasattr(model, 'predict_proba'):
                     probabilities = model.predict_proba(vi)
                     logLoss[i] = log_loss(vo, probabilities)
-                    avgAcc[i] = accuracy_score(vo, probabilities)
 
                 # Plot
                 ax[i // 2][i % 2].plot(vo, c='#2369ec', alpha=0.6)
@@ -1022,10 +1041,10 @@ class Pipeline(object):
 
             # Results
             print('F1 scores:')
-            print('    '.join([' Class %i |' % i for i in range(n_classes)]))
-            print('    '.join([' %.2f '.ljust(9) % f1 + '|' for f1 in np.mean(f1Score, axis=0)]))
+            print(''.join([' Class %i |' % i for i in range(n_classes)]))
+            print(''.join([' %.2f '.ljust(9) % f1 + '|' for f1 in np.mean(f1Score, axis=0)]))
+            print('Average Accuracy: %.2f \u00B1 %.2f' % (np.mean(avgAcc), np.std(avgAcc)))
             if hasattr(model, 'predict_proba'):
-                print('Average Accuracy: %.2f \u00B1 %.2f' % (np.mean(avgAcc), np.std(avgAcc)))
                 print('Log Loss:         %.2f \u00B1 %.2f' % (np.mean(logLoss), np.std(logLoss)))
 
     def _prepareProductionFiles(self, model=None, feature_set=None, params=None):
@@ -2429,7 +2448,7 @@ class Modelling(object):
         self.samples = None
         self.acc = []
         self.std = []
-        self.nSplits = n_splits
+        self.cvSplits = n_splits
         self.dataset = str(dataset)
         self.store_results = store_results
         self.store_models = store_models
@@ -2439,11 +2458,11 @@ class Modelling(object):
         self.samples = len(output)
         if self.mode == 'regression':
             from sklearn.model_selection import KFold
-            cv = KFold(n_splits=self.nSplits, shuffle=self.shuffle)
+            cv = KFold(n_splits=self.cvSplits, shuffle=self.shuffle)
             return self._fit(input, output, cv, mean_absolute_error)
         if self.mode == 'classification':
             from sklearn.model_selection import StratifiedKFold
-            cv = StratifiedKFold(n_splits=self.nSplits, shuffle=self.shuffle)
+            cv = StratifiedKFold(n_splits=self.cvSplits, shuffle=self.shuffle)
             return self._fit(input, output, cv, average_accuracy)
 
     def return_models(self):
@@ -2499,7 +2518,7 @@ class Modelling(object):
         output = np.array(output).ravel()
 
         # Data
-        print('[Modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.nSplits, len(input[0])))
+        print('[Modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.cvSplits, len(input[0])))
 
         if self.store_results and 'Initial_Models.csv' in os.listdir(self.folder):
             results = pd.read_csv(self.folder + 'Initial_Models.csv')
