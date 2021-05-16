@@ -13,7 +13,8 @@ from boruta import BorutaPy
 import catboost, xgboost, lightgbm, sklearn
 from sklearn import neural_network, tree, cluster
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import plot_roc_curve, auc
+from sklearn.metrics import plot_roc_curve, auc, f1_score, log_loss, accuracy_score, r2_score, \
+    mean_squared_error, mean_absolute_error
 from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 
@@ -21,6 +22,7 @@ from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 import warnings
+from scipy.stats import uniform, randint
 from scipy.linalg import LinAlgWarning
 warnings.filterwarnings("ignore")
 # warnings.filterwarnings(action='ignore', category=LinAlgWarning, module='sklearn')
@@ -29,14 +31,60 @@ warnings.filterwarnings("ignore")
 
 # Priority
 # implement warning for imputing keys
-# skip SVC/SVR for sample sizes > 25.000
 # Weighted loss for classification
+# Unify loss function in pipeline
+# Parameterize _getHyperParameters()
+# Change input/output to X/Y
 
 # Nicety
 # add report output
 # implement ensembles (http://www.cs.cornell.edu/~alexn/papers/shotgun.icml04.revised.rev2.pdf)
 # implement autoencoder for Feature Extraction
 # implement transformers
+
+
+class Utils:
+    @staticmethod
+    def booleanInput(question):
+        x = input(question + ' [y / n]')
+        if x.lower() == 'n' or x.lower() == 'no':
+            return False
+        elif x.lower() == 'y' or x.lower() == 'yes':
+            return True
+        else:
+            print('Sorry, I did not understand. Please answer with "n" or "y"')
+            return self.booleanInput(question)
+
+    @staticmethod
+    def notification(notification):
+        import requests
+        print(message.replace(self.mainDir[:-1], 'autoML'))
+        oAuthToken = 'xoxb-1822915844353-1822989373697-zsFM6CuC6VGTxBjHUcdZHSdJ'
+        url = 'https://slack.com/api/chat.postMessage'
+        data = {
+            "token": oAuthToken,
+            "channel": "automl",
+            "text": message,
+            "username": "AutoML",
+        }
+        # requests.post(url, data=data)
+
+    @staticmethod
+    def parseJson(json_string):
+        if isinstance(json_string, dict): return json_string
+        else:
+            try:
+                return json.loads(json_string\
+                        .replace("'", '"')\
+                        .replace("True", "true")\
+                        .replace("False", "false")\
+                        .replace("nan", "NaN")\
+                        .replace("None", "null"))
+            except:
+                print('[AutoML] Cannot validate, imparsable JSON.')
+                print(json_string)
+                return json_string
+
 
 class Pipeline(object):
 
@@ -150,11 +198,11 @@ class Pipeline(object):
 
         # Sub- Classes
         self.DataProcessing = DataProcessing(target=self.target, num_cols=num_cols, date_cols=date_cols,
-                                             cat_cols=cat_cols, missing_values=missing_values,
+                                             cat_cols=cat_cols, missing_values=missing_values, mode=mode,
                                              outlier_removal=outlier_removal, z_score_threshold=z_score_threshold,
                                              folder=self.mainDir + 'Data/', version=self.version)
         self.FeatureProcessing = FeatureProcessing(max_lags=max_lags, max_diff=max_diff,
-                                                   extract_features=extract_features,
+                                                   extract_features=extract_features, mode=mode,
                                                    information_threshold=information_threshold,
                                                    folder=self.mainDir + 'Features/', version=self.version)
         self.Sequence = Sequence(back=back, forward=forward, shift=shift, diff=diff)
@@ -169,11 +217,11 @@ class Pipeline(object):
 
     def _setFlags(self):
         if self.plotEDA is None:
-            self.plotEDA = self._boolAsk('Make all EDA graphs?')
+            self.plotEDA = Utils.booleanInput('Make all EDA graphs?')
         if self.processData is None:
-            self.processData = self._boolAsk('Process/prepare data?')
+            self.processData = Utils.booleanInput('Process/prepare data?')
         if self.validateResults is None:
-            self.validateResults = self._boolAsk('Validate results?')
+            self.validateResults = Utils.booleanInput('Validate results?')
 
     def _loadVersion(self):
         if self.version == None:
@@ -226,29 +274,6 @@ class Pipeline(object):
             except:
                 continue
 
-    def _boolAsk(self, question):
-        x = input(question + ' [y / n]')
-        if x.lower() == 'n' or x.lower() == 'no':
-            return False
-        elif x.lower() == 'y' or x.lower() == 'yes':
-            return True
-        else:
-            print('Sorry, I did not understand. Please answer with "n" or "y"')
-            return self._boolAsk(question)
-
-    def _notification(self, message):
-        import requests
-        print(message.replace(self.mainDir[:-1], 'autoML'))
-        oAuthToken = 'xoxb-1822915844353-1822989373697-zsFM6CuC6VGTxBjHUcdZHSdJ'
-        url = 'https://slack.com/api/chat.postMessage'
-        data = {
-            "token": oAuthToken,
-            "channel": "automl",
-            "text": message,
-            "username": "AutoML",
-        }
-        # requests.post(url, data=data)
-
     def _sortResults(self, results):
         if self.mode == 'regression':
             results['worst_case'] = results['mean_score'] + results['std_score']
@@ -257,21 +282,6 @@ class Pipeline(object):
             results.loc[:, 'worst_case'] = results['mean_score'] - results['std_score']
             results = results.sort_values('worst_case', ascending=False)
         return results
-
-    def _parseJson(self, json_string):
-        if isinstance(json_string, dict): return json_string
-        else:
-            try:
-                return json.loads(json_string\
-                        .replace("'", '"')\
-                        .replace("True", "true")\
-                        .replace("False", "false")\
-                        .replace("nan", "NaN")\
-                        .replace("None", "null"))
-            except:
-                print('[AutoML] Cannot validate, imparsable JSON.')
-                print(json_string)
-                return json_string
 
     def fit(self, data):
         '''
@@ -312,10 +322,12 @@ class Pipeline(object):
     def _dataProcessing(self, data):
         # Load if possible
         if os.path.exists(self.mainDir + 'Data/Cleaned_v%i.csv' % self.version):
+            print('[AutoML] Loading Cleaned Data')
             data = pd.read_csv(self.mainDir + 'Data/Cleaned_v%i.csv' % self.version, index_col='index')
 
         # Clean
         else:
+            print('[AutoML] Cleaning Data')
             data = self.DataProcessing.clean(data)
 
         # Split and store in memory
@@ -326,15 +338,16 @@ class Pipeline(object):
 
         # Assert classes in case of classification
         if self.mode == 'classification':
-            assert self.output.nunique()[self.target] == 2, 'Only binary classification implemented currently.'
-            classes = set(self.output[self.target])
-            if classes != {0, 1}:
-                if 1 in classes:
-                    self.output.loc[self.output != 1] = 0
-                else:
-                    outputs = list(classes)
-                    self.output.loc[self.output == outputs[0]] = 0
-                    self.output.loc[self.output == outputs[1]] = 1
+            if self.output.nunique()[self.target] >= 50:
+                warnings.warn('More than 50 classes, you might want to reconsider')
+            # classes = set(self.output[self.target])
+            # if classes != {0, 1}:
+            #     if 1 in classes:
+            #         self.output.loc[self.output != 1] = 0
+            #     else:
+            #         outputs = list(classes)
+            #         self.output.loc[self.output == outputs[0]] = 0
+            #         self.output.loc[self.output == outputs[1]] = 1
 
     def _featureProcessing(self):
         # Extract
@@ -347,6 +360,7 @@ class Pipeline(object):
         # Load existing results
         if 'Results.csv' in os.listdir(self.mainDir):
             self.results = pd.read_csv(self.mainDir + 'Results.csv')
+            self.Modelling.samples = len(self.output)
 
         # Check if this version has been modelled
         if self.results is not None and \
@@ -403,20 +417,20 @@ class Pipeline(object):
             isinstance(model, sklearn.linear_model.Ridge) or \
                 isinstance(model, sklearn.linear_model.RidgeClassifier):
             return {
-                'alpha': [0.001, 0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 2, 3, 4, 5]
+                'alpha': uniform(0, 10),
             }
         elif isinstance(model, sklearn.svm.SVC) or \
                 isinstance(model, sklearn.svm.SVR):
             return {
                 'gamma': ['scale', 'auto', 0.001, 0.01, 0.1, 0.5, 1],
-                'C': [0.01, 0.1, 0.2, 0.5, 1, 2, 5],
+                'C': uniform(0, 10),
             }
         elif isinstance(model, sklearn.neighbors.KNeighborsRegressor) or \
                 isinstance(model, sklearn.neighbors.KNeighborsClassifier):
             return {
-                'n_neighbors': [5, 10, 25, 50],
+                'n_neighbors': randint(5, 50),
                 'weights': ['uniform', 'distance'],
-                'leaf_size': [10, 30, 50, 100],
+                'leaf_size': randint(10, 150),
                 'n_jobs': [mp.cpu_count()-1],
             }
         elif isinstance(model, sklearn.neural_network._multilayer_perceptron.MLPClassifier) or \
@@ -435,70 +449,71 @@ class Pipeline(object):
                 return {
                     'loss': ['squared_loss', 'huber', 'epsilon_insensitive', 'squared_epsilon_insensitive'],
                     'penalty': ['l2', 'l1', 'elasticnet'],
-                    'alpha': [0.001, 0.01, 0.1, 0.5, 1, 2],
+                    'alpha': randint(0, 5),
                 }
             elif isinstance(model, sklearn.tree.DecisionTreeRegressor):
                 return {
                     'criterion': ['mse', 'friedman_mse', 'mae', 'poisson'],
-                    'max_depth': [None, 5, 10, 25, 50],
+                    'max_depth': randint(5, 50),
                 }
             elif isinstance(model, sklearn.ensemble.AdaBoostRegressor):
                 return {
-                    'n_estimators': [25, 50, 100, 250],
+                    'n_estimators': randint(25, 250),
                     'loss': ['linear', 'square', 'exponential'],
-                    'learning_rate': [0.5, 0.75, 0.9, 0.95, 1]
+                    'learning_rate': uniform(0, 1)
                 }
             elif isinstance(model, catboost.core.CatBoostRegressor):
                 return {
                     'loss_function': ['MAE', 'RMSE'],
-                    'learning_rate': [0.001, 0.01, 0.03, 0.05, 0.1],
-                    'l2_leaf_reg': [1, 3, 5],
-                    'n_estimators': [50, 100, 200],
+                    'learning_rate': uniform(0, 1),
+                    'l2_leaf_reg': uniform(0, 10),
+                    'depth': randint(3, 15),
+                    'min_data_in_leaf': randint(1, 1000),
+                    'max_leaves': randint(10, 250),
                 }
             elif isinstance(model, sklearn.ensemble.GradientBoostingRegressor):
                 return {
                     'loss': ['ls', 'lad', 'huber'],
-                    'learning_rate': [0.001, 0.01, 0.1, 0.2, 0.4],
-                    'n_estimators': [100, 300, 500],
-                    'max_depth': [3, 5, 10],
+                    'learning_rate': uniform(0, 1),
+                    'max_depth': randint(3, 15),
                 }
             elif isinstance(model, sklearn.ensemble.HistGradientBoostingRegressor):
                 return {
-                    'max_iter': [100, 250],
-                    # 'max_bins': [100, 255],
-                    # 'loss': ['least_squares', 'least_absolute_deviation'],
-                    # 'l2_regularization': [0.001, 0.005, 0.01, 0.05],
-                    # 'learning_rate': [0.01, 0.1, 0.25, 0.4],
-                    # 'max_leaf_nodes': [31, 50, 75, 150],
-                    # 'early_stopping': [True],
+                    'max_iter': randint(100, 250),
+                    'max_bins': randint(100, 255),
+                    'loss': ['least_squares', 'least_absolute_deviation'],
+                    'l2_regularization': uniform(0, 10),
+                    'learning_rate': uniform(0, 1),
+                    'max_leaf_nodes': randint(30, 150),
+                    'early_stopping': [True],
                 }
             elif isinstance(model, sklearn.ensemble.RandomForestRegressor):
                 return {
                     'criterion': ['mse', 'mae'],
-                    'max_depth': [10, 25, 50, 75],
+                    'max_depth': randint(3, 15),
                     'max_features': ['auto', 'sqrt'],
-                    'min_samples_split': [2, 5, 10],
-                    'min_samples_leaf': [1, 5, 10],
+                    'min_samples_split': randint(2, 50),
+                    'min_samples_leaf': randint(1, 1000),
                     'bootstrap': [True, False],
                 }
             elif model.__module__ == 'xgboost.sklearn':
                 return {
-                    'max_depth': [3, 6, 9, 12],
+                    'max_depth': randint(3, 15),
                     'booster': ['gbtree', 'gblinear', 'dart'],
-                    'learning_rate': [0.01, 0.1, 0.3],
+                    'learning_rate': uniform(0, 10),
                     'verbosity': [0],
-                    'n_jobs': [4],
+                    'n_jobs': [mp.cpu_count() - 1],
                 }
             elif model.__module__ == 'lightgbm.sklearn':
                 return {
-                'num_leaves': [10, 31, 50],
-                'min_child_samples': [100, 250, 500],
-                'min_child_weight': [1e-5, 1e-3, 1e-1],
-                'subsample': [0.2, 0.4, 0.6, 0.8],
-                'colsample_bytree':[0.4, 0.5, 0.6],
-                'reg_alpha': [0, 0.5, 1],
-                'reg_lambda': [0, 0.5, 1],
-                'n_jobs': [4],
+                'num_leaves': randint(10, 150),
+                'min_child_samples': randint(1, 1000),
+                'min_child_weight': uniform(0, 1),
+                'subsample': uniform(0, 1),
+                'colsample_bytree': uniform(0, 1),
+                'reg_alpha': uniform(0, 1),
+                'reg_lambda': uniform(0, 1),
+                'n_jobs': [mp.cpu_count() - 1],
             }
 
         # Classification specific hyperparameters
@@ -507,78 +522,79 @@ class Pipeline(object):
                 return {
                     'loss': ['hinge', 'log', 'modified_huber', 'squared_hinge'],
                     'penalty': ['l2', 'l1', 'elasticnet'],
-                    'alpha': [0.001, 0.01, 0.1, 0.5, 1, 2],
-                    'max_iter': [500, 1000, 1500],
+                    'alpha': uniform(0, 10),
+                    'max_iter': randint(250, 2000),
                 }
             elif isinstance(model, sklearn.tree.DecisionTreeClassifier):
                 return {
                     'criterion': ['gini', 'entropy'],
-                    'max_depth': [None, 5, 10, 25, 50],
+                    'max_depth': randint(5, 50),
                 }
             elif isinstance(model, sklearn.ensemble.AdaBoostClassifier):
                 return {
-                    'n_estimators': [25, 50, 100, 250],
-                    'learning_rate': [0.5, 0.75, 0.9, 0.95, 1]
+                    'n_estimators': randint(25, 250),
+                    'learning_rate': uniform(0, 1)
                 }
             elif isinstance(model, catboost.core.CatBoostClassifier):
                 return {
                     'loss_function': ['Logloss', 'MultiClass'],
-                    'learning_rate': [0.001, 0.01, 0.03, 0.05, 0.1],
-                    'l2_leaf_reg': [1, 3, 5],
-                    'scale_pos_weight': [0.1, 1, 10, 100]
+                    'learning_rate': uniform(0, 1),
+                    'l2_leaf_reg': uniform(0, 10),
+                    'depth': randint(3, 15),
+                    'min_data_in_leaf': randint(1, 1000),
+                    'max_leaves': randint(10, 250),
                 }
             elif isinstance(model, sklearn.ensemble.BaggingClassifier):
                 return {
                     # 'n_estimators': [5, 10, 15, 25, 50],
-                    'max_features': [0.5, 0.75, 1.0],
+                    'max_features': uniform(0, 1),
                     'bootstrap': [False, True],
                     'bootstrap_features': [True, False],
-                    'n_jobs': [max(mp.cpu_count() - 2, 1)],
+                    'n_jobs': [mp.cpu_count() - 1],
                 }
             elif isinstance(model, sklearn.ensemble.GradientBoostingClassifier):
                 return {
                     'loss': ['deviance', 'exponential'],
-                    'learning_rate': [0.001, 0.01, 0.1, 0.2, 0.4],
-                    'n_estimators': [100, 300, 500],
-                    'max_depth': [None, 3, 5, 10],
+                    'learning_rate': uniform(0, 1),
+                    'max_depth': randint(3, 15),
                 }
             elif isinstance(model, sklearn.ensemble.HistGradientBoostingClassifier):
                 return {
-                    'max_bins': [100, 255],
-                    'l2_regularization': [0.001, 0.005, 0.01, 0.05],
-                    'learning_rate': [0.01, 0.1, 0.25, 0.4],
-                    'max_leaf_nodes': [31, 50, 75, 150],
+                    'max_iter': randint(100, 250),
+                    'max_bins': randint(100, 255),
+                    'l2_regularization': uniform(0, 10),
+                    'learning_rate': uniform(0, 1),
+                    'max_leaf_nodes': randint(30, 150),
                     'early_stopping': [True]
                 }
             elif isinstance(model, sklearn.ensemble.RandomForestClassifier):
                 return {
                     'criterion': ['gini', 'entropy'],
-                    'max_depth': [None, 10, 25, 50, 75],
+                    'max_depth': randint(3, 15),
                     'max_features': ['auto', 'sqrt'],
-                    'min_samples_split': [2, 5, 10],
-                    'min_samples_leaf': [1, 2, 4],
+                    'min_samples_split': randint(2, 50),
+                    'min_samples_leaf': randint(1, 1000),
                     'bootstrap': [True, False],
                 }
             elif model.__module__ == 'xgboost.sklearn':
                 return {
-                    'max_depth': [3, 6, 9, 12],
+                    'max_depth': randint(3, 15),
                     'booster': ['gbtree', 'gblinear', 'dart'],
-                    'learning_rate': [0.01, 0.1, 0.3],
+                    'learning_rate': uniform(0, 10),
                     'verbosity': [0],
-                    'n_jobs': [4],
-                    'scale_pos_weight': [0.1, 1, 10, 100]
+                    'n_jobs': [mp.cpu_count() - 1],
+                    'scale_pos_weight': uniform(0, 100)
                 }
             elif model.__module__ == 'lightgbm.sklearn':
                 return {
-                'num_leaves': [10, 31, 50],
-                'min_child_samples': [100, 250, 500],
-                'min_child_weight': [1e-5, 1e-3, 1e-1],
-                'subsample': [0.2, 0.4, 0.6, 0.8],
-                'colsample_bytree':[0.4, 0.5, 0.6],
-                'reg_alpha': [0, 0.5, 1],
-                'reg_lambda': [0, 0.5, 1],
-                'n_jobs': [4],
-                'scale_pos_weight': [0.1, 1, 10, 100],
+                'num_leaves': randint(10, 150),
+                'min_child_samples': randint(1, 1000),
+                'min_child_weight': uniform(0, 1),
+                'subsample': uniform(0, 1),
+                'colsample_bytree': uniform(0, 1),
+                'reg_alpha': uniform(0, 1),
+                'reg_lambda': uniform(0, 1),
+                'n_jobs': [mp.cpu_count() - 1],
             }
 
         # Raise error if nothing is returned
@@ -616,7 +632,7 @@ class Pipeline(object):
             if ('Hyperparameter Opt' == results['type']).any():
                 print('[AutoML] Loading optimization results.')
                 hyperOptResults = results[results['type'] == 'Hyperparameter Opt']
-                params = self._parseJson(hyperOptResults.iloc[0]['params'])
+                params = Utils.parseJson(hyperOptResults.iloc[0]['params'])
 
             # Or run
             else:
@@ -639,7 +655,7 @@ class Pipeline(object):
                 self.results.to_csv(self.mainDir + 'Results.csv', index=False)
 
                 # Get params for validation
-                params = self._parseJson(results.iloc[0]['params'])
+                params = Utils.parseJson(results.iloc[0]['params'])
 
             # Validate
             self._validateResult(model, params, feature_set)
@@ -673,7 +689,7 @@ class Pipeline(object):
             # If exists
             if ('Hyperparameter Opt' == modelResults['type']).any():
                 hyperOptRes = modelResults[modelResults['type'] == 'Hyperparameter Opt']
-                params = self._parseJson(hyperOptRes.iloc[0]['params'])
+                params = Utils.parseJson(hyperOptRes.iloc[0]['params'])
 
             # Else run
             else:
@@ -690,7 +706,7 @@ class Pipeline(object):
                 gridSearchResults['type'] = 'Hyperparameter Opt'
                 self.results = self.results.append(gridSearchResults)
                 self.results.to_csv(self.mainDir + 'Results.csv', index=False)
-                params = self._parseJson(gridSearchResults.iloc[0]['params'])
+                params = Utils.parseJson(gridSearchResults.iloc[0]['params'])
 
             # Validate
             if self.validateResults:
@@ -719,7 +735,7 @@ class Pipeline(object):
         if self.mode == 'regression':
             gridSearch = GridSearch(model, params,
                                    cv=KFold(n_splits=self.nSplits),
-                                   scoring=Metrics.mae)
+                                   scoring=mean_absolute_error)
             results = gridSearch.fit(input, output)
             results['worst_case'] = results['mean_score'] + results['std_score']
             results = results.sort_values('worst_case')
@@ -728,7 +744,7 @@ class Pipeline(object):
         elif self.mode == 'classification':
             gridSearch = GridSearch(model, params,
                                    cv=StratifiedKFold(n_splits=self.nSplits),
-                                   scoring=Metrics.acc)
+                                   scoring=mean_squared_error)
             results = gridSearch.fit(input, output)
             results['worst_case'] = results['mean_score'] - results['std_score']
             results = results.sort_values('worst_case', ascending=False)
@@ -742,7 +758,7 @@ class Pipeline(object):
         that uses subsets of data for early elimination. Speeds up significantly :)
         """
         from sklearn.experimental import enable_halving_search_cv
-        from sklearn.model_selection import HalvingGridSearchCV
+        from sklearn.model_selection import HalvingRandomSearchCV
         print('\n[AutoML] Starting Hyperparameter Optimization (halving) for %s on %s features (%i samples, %i features)' %
               (type(model).__name__, feature_set, len(self.input), len(self.colKeep[feature_set])))
 
@@ -775,7 +791,7 @@ class Pipeline(object):
 
         # Optimization
         if self.mode == 'regression':
-            gridSearch = HalvingGridSearchCV(model, params,
+            gridSearch = HalvingRandomSearchCV(model, params,
                                              resource=resource,
                                              max_resources=max_resources,
                                              min_resources=min_resources,
@@ -790,7 +806,7 @@ class Pipeline(object):
             results = results.sort_values('worst_case')
 
         if self.mode == 'classification':
-            gridSearch = HalvingGridSearchCV(model, params,
+            gridSearch = HalvingRandomSearchCV(model, params,
                                              resource=resource,
                                              max_resources=max_resources,
                                              min_resources=min_resources,
@@ -825,7 +841,7 @@ class Pipeline(object):
             results = self._sortResults(results[results['dataset'] == feature_set])
             assert 'Hyperparameter Opt' in results['type'].values, 'Hyperparameters not optimized for this combination'
             hyperOptResults = results[results['type'] == 'Hyperparameter Opt']
-            params = self._parseJson(hyperOptResults.iloc[0]['params'])
+            params = Utils.parseJson(hyperOptResults.iloc[0]['params'])
 
         # Run validation
         self._validateResult(model, params, feature_set)
@@ -868,7 +884,7 @@ class Pipeline(object):
                 predictions = model.predict(vi).reshape((-1))
 
                 # Metrics
-                mae.append(Metrics.mae(vo, predictions))
+                mae.append(mean_absolute_error(vo, predictions))
 
                 # Plot
                 ax[i // 2][i % 2].set_title('Fold-%i' % i)
@@ -880,8 +896,8 @@ class Pipeline(object):
             ax[i // 2][i % 2].legend(['Output', 'Prediction'])
             plt.show()
 
-        # For classification
-        if self.mode == 'classification':
+        # For BINARY classification
+        elif self.mode == 'classification' and self.output[self.target].nunique() == 2:
             # Initiating
             fig, ax = plt.subplots(math.ceil(self.nSplits / 2), 2, sharex=True, sharey=True)
             fig.suptitle('%i-Fold Cross Validated Predictions - %s (%s)' %
@@ -970,6 +986,48 @@ class Pipeline(object):
             ax.legend(loc="lower right")
             fig.savefig(self.mainDir + 'Validation/ROC_%s.png' % type(model).__name__, format='png', dpi=200)
 
+        # For MULTICLASS classification
+        elif self.mode == 'classification':
+            # Initiating
+            fig, ax = plt.subplots(math.ceil(self.nSplits / 2), 2, sharex=True, sharey=True)
+            fig.suptitle('%i-Fold Cross Validated Predictions - %s (%s)' %
+                         (self.nSplits, type(master_model).__name__, feature_set))
+            n_classes = self.output[self.target].nunique()
+            f1Score = np.zeros((self.nSplits, n_classes))
+            logLoss = np.zeros(self.nSplits)
+            avgAcc = np.zeros(self.nSplits)
+
+
+            # Modelling
+            cv = StratifiedKFold(n_splits=self.nSplits)
+            for i, (t, v) in enumerate(cv.split(input, output)):
+                n = len(v)
+                ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
+                model = copy.copy(master_model)
+                model.set_params(**params)
+                model.fit(ti, to)
+                predictions = model.predict(vi).reshape((-1))
+
+                # Metrics
+                f1Score[i] = f1_score(vo, predictions, average=None)
+                if hasattr(model, 'predict_proba'):
+                    probabilities = model.predict_proba(vi)
+                    logLoss[i] = log_loss(vo, probabilities)
+                    avgAcc[i] = accuracy_score(vo, probabilities)
+
+                # Plot
+                ax[i // 2][i % 2].plot(vo, c='#2369ec', alpha=0.6)
+                ax[i // 2][i % 2].plot(predictions, c='#ffa62b')
+                ax[i // 2][i % 2].set_title('Fold-%i' % i)
+
+            # Results
+            print('F1 scores:')
+            print('    '.join([' Class %i |' % i for i in range(n_classes)]))
+            print('    '.join([' %.2f '.ljust(9) % f1 + '|' for f1 in np.mean(f1Score, axis=0)]))
+            if hasattr(model, 'predict_proba'):
+                print('Average Accuracy: %.2f \u00B1 %.2f' % (np.mean(avgAcc), np.std(avgAcc)))
+                print('Log Loss:         %.2f \u00B1 %.2f' % (np.mean(logLoss), np.std(logLoss)))
+
     def _prepareProductionFiles(self, model=None, feature_set=None, params=None):
         if not os.path.exists(self.mainDir + 'Production/v%i/' % self.version):
             os.mkdir(self.mainDir + 'Production/v%i/' % self.version)
@@ -983,7 +1041,7 @@ class Pipeline(object):
                 model = type(model).__name__
             if params is None:
                 results = self._sortResults(results[np.logical_and(results['model'] == model, results['dataset'] == feature_set)])
-                params = self._parseJson(results.iloc[0]['params'])
+                params = Utils.parseJson(results.iloc[0]['params'])
 
         # Otherwise find best
         else:
@@ -991,17 +1049,17 @@ class Pipeline(object):
             feature_set = results.iloc[0]['dataset']
             params = results.iloc[0]['params']
             if isinstance(params, str):
-                params = self._parseJson(params)
+                params = Utils.parseJson(params)
 
         # Notify of results
-        self._notification('[%s] Preparing Production Env Files for %s, feature set %s' %
+        print('[AutoML] Preparing Production Env Files for %s, feature set %s' %
                           (self.mainDir[:-1], model, feature_set))
         print('[AutoML] ', params)
         if self.mode == 'classification':
-            self._notification('[%s] Accuracy: %.2f \u00B1 %.2f' %
+            print('[AutoML] Accuracy: %.2f \u00B1 %.2f' %
                               (self.mainDir[:-1], results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
         elif self.mode == 'regression':
-            self._notification('[%s] Mean Absolute Error: %.2f \u00B1 %.2f' %
+            print('[AutoML] Mean Absolute Error: %.2f \u00B1 %.2f' %
                               (self.mainDir[:-1], results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
 
         # Save Features
@@ -1080,13 +1138,13 @@ class Pipeline(object):
             # Print
             print('Input  ~ (%.1f, %.1f)' % (np.mean(input), np.std(input)))
             print('Output ~ (%.1f, %.1f)' % (np.mean(output), np.std(output)))
-            print('MAE (normalized):      %.3f' % Metrics.mae(normalizedOutput, normalizedPrediction))
-            print('MAE (original):        %.3f' % Metrics.mae(output, prediction))
+            print('MAE (normalized):      %.3f' % mean_absolute_error(normalizedOutput, normalizedPrediction))
+            print('MAE (original):        %.3f' % mean_absolute_error(output, prediction))
             return prediction
 
         # Output for Classification
         if self.mode == 'classification':
-            print('ACC:   %.3f' % Metrics.acc(output, prediction))
+            print('ACC:   %.3f' % average_accuracy(output, prediction))
             return prediction
 
     def _errorAnalysis(self):
@@ -1433,12 +1491,13 @@ class FeatureProcessing(object):
                  information_threshold=0.99,
                  extract_features=True,
                  folder='',
+                 mode=None,
                  version=''):
         self.input = None
         self.originalInput = None
         self.output = None
         self.model = None
-        self.mode = None
+        self.mode = mode
         self.threshold = None
         # Register
         self.baseScore= {}
@@ -1454,6 +1513,12 @@ class FeatureProcessing(object):
         self.extractFeatures = extract_features
         self.folder = folder if folder == '' or folder[-1] == '/' else folder + '/'
         self.version = version
+        # Tests
+        assert max_lags >= 0 and max_lags < 50, 'Max lags needs to be within [0, 50]'
+        assert max_diff >= 0 and max_diff < 3, 'Max diff needs to be within [0, 3]'
+        assert information_threshold > 0 and information_threshold < 1, 'Information threshold needs to be within [0, 1]'
+        assert mode is not None, 'Mode needs to be specified (regression or classification'
+
 
     def extract(self, inputFrame, outputFrame):
         self._cleanAndSet(inputFrame, outputFrame)
@@ -1569,12 +1634,10 @@ class FeatureProcessing(object):
     def _cleanAndSet(self, inputFrame, outputFrame):
         assert isinstance(inputFrame, pd.DataFrame), 'Input supports only Pandas DataFrame'
         assert isinstance(outputFrame, pd.Series), 'Output supports only Pandas Series'
-        if len(outputFrame.unique()) == 2:
+        if self.mode == 'classification':
             self.model = tree.DecisionTreeClassifier(max_depth=3)
-            self.mode = 'classification'
-        else:
+        elif self.mode == 'regression':
             self.model = tree.DecisionTreeRegressor(max_depth=3)
-            self.mode = 'regression'
         # Bit of necessary data cleaning (shouldn't change anything)
         inputFrame = inputFrame.astype('float32').replace(np.inf, 1e12).replace(-np.inf, -1e12).fillna(0).reset_index(drop=True)
         self.input = copy.copy(inputFrame)
@@ -1677,6 +1740,7 @@ class FeatureProcessing(object):
             # Select valuable features
             scores = {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
             items = min(250, sum(score > 0.1 for score in scores.values()))
+            # MLJAR: min(100, max(10, 0.1 * len(scores)))
             self.crossFeatures = [k for k, v in list(scores.items())[:items] if v > 0.1]
 
         # Split and Add
@@ -2376,11 +2440,11 @@ class Modelling(object):
         if self.mode == 'regression':
             from sklearn.model_selection import KFold
             cv = KFold(n_splits=self.nSplits, shuffle=self.shuffle)
-            return self._fit(input, output, cv, Metrics.mae)
+            return self._fit(input, output, cv, mean_absolute_error)
         if self.mode == 'classification':
             from sklearn.model_selection import StratifiedKFold
             cv = StratifiedKFold(n_splits=self.nSplits, shuffle=self.shuffle)
-            return self._fit(input, output, cv, Metrics.acc)
+            return self._fit(input, output, cv, average_accuracy)
 
     def return_models(self):
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
@@ -2393,41 +2457,39 @@ class Modelling(object):
             models.append(linear_model.RidgeClassifier())
             # lasso = linear_model.Lasso()
             # sgd = linear_model.SGDClassifier()
-            if self.samples < 25000:
-                models.append(svm.SVC(kernel='rbf'))
             # knc = neighbors.KNeighborsClassifier()
             # dtc = tree.DecisionTreeClassifier()
             # ada = ensemble.AdaBoostClassifier()
             models.append(catboost.CatBoostClassifier(verbose=0, n_estimators=1000, allow_writing_files=False))
             if self.samples < 25000:
+                models.append(svm.SVC(kernel='rbf'))
                 models.append(ensemble.BaggingClassifier())
                 models.append(ensemble.GradientBoostingClassifier())
+                models.append(xgboost.XGBClassifier(n_estimators=250, verbosity=0, use_label_encoder=False))
             else:
                 models.append(ensemble.HistGradientBoostingClassifier())
+                models.append(lightgbm.LGBMClassifier(n_estimators=250, verbose=-1, force_row_wise=True))
             models.append(ensemble.RandomForestClassifier())
             # mlp = neural_network.MLPClassifier()
-            models.append(xgboost.XGBClassifier(n_estimators=250, verbosity=0, use_label_encoder=False))
-            models.append(lightgbm.LGBMClassifier(n_estimators=250, verbose=-1, force_row_wise=True))
 
         elif self.mode == 'regression':
             models.append(linear_model.Ridge())
             # lasso = linear_model.Lasso()
             # sgd = linear_model.SGDRegressor()
-            if self.samples < 25000:
-                models.append(svm.SVR(kernel='rbf'))
             # knr = neighbors.KNeighborsRegressor()
             # dtr = tree.DecisionTreeRegressor()
             # ada = ensemble.AdaBoostRegressor()
             models.append(catboost.CatBoostRegressor(verbose=0, n_estimators=1000, allow_writing_files=False))
             models.append(ensemble.BaggingRegressor())
             if self.samples < 25000:
+                models.append(svm.SVR(kernel='rbf'))
                 models.append(ensemble.GradientBoostingRegressor())
+                models.append(xgboost.XGBRegressor(n_estimators=250, verbosity=0))
             else:
                 models.append(ensemble.HistGradientBoostingRegressor())
+                models.append(lightgbm.LGBMRegressor(n_estimators=250, verbose=-1, force_row_wise=True))
             models.append(ensemble.RandomForestRegressor())
             # mlp = neural_network.MLPRegressor())
-            models.append(xgboost.XGBRegressor(n_estimators=250, verbosity=0))
-            models.append(lightgbm.LGBMRegressor(n_estimators=250, verbose=-1, force_row_wise=True))
 
         return models
 
@@ -2506,46 +2568,6 @@ class Modelling(object):
             plt.xlabel('Samples')
             plt.show()
         return results
-
-class Metrics(object):
-
-    def norm_r2(ytrue, ypred, yshift):
-        ytrue = ytrue.reshape((-1))
-        ypred = ypred.reshape((-1))
-        yshift = yshift.reshape((-1))
-        # Shifted R2
-        res = sum((ytrue - yshift) ** 2)
-        tot = sum((yshift - np.mean(ytrue)) ** 2)
-        shift_r2 = 1 - res / tot
-        # Pred R2
-        res = sum((ytrue - ypred) ** 2)
-        tot = sum((ytrue - np.mean(ytrue)) ** 2)
-        r2 = 1 - res / tot
-
-    def r2score(ytrue, ypred):
-        ytrue = ytrue.reshape((-1))
-        ypred = ypred.reshape((-1))
-        res = sum((ytrue - ypred) ** 2)
-        tot = sum((ytrue - np.mean(ytrue)) ** 2)
-        return 1 - res / tot
-
-    def mae(ytrue, ypred):
-        # if isinstance(ytrue, pd.core.series.Series) and isinstance(ypred, pd.core.series.Series):
-        #     return np.mean(abs(ytrue - ypred))
-        # elif isinstance(ytrue, np.ndarray) and isinstance(ypred, np.ndarray):
-        #     ytrue = ytrue.reshape((-1))
-        #     ypred = ypred.reshape((-1))
-        #     return np.mean(abs(ytrue - ypred))
-        # else:
-        return np.mean(abs(np.array(ytrue).reshape((-1)) - np.array(ypred).reshape((-1))))
-
-    def mse(ytrue, ypred):
-        ytrue = ytrue.reshape((-1))
-        ypred = ypred.reshape((-1))
-        return np.mean((ytrue - ypred) ** 2)
-
-    def acc(ytrue, ypred):
-        return (np.array(np.sign(ytrue)).reshape((-1)) == np.array(np.sign(ypred)).reshape((-1))).sum() / len(np.array(ytrue))
 
 class Sequence(object):
 
@@ -2703,7 +2725,7 @@ class Sequence(object):
 
 class GridSearch(object):
 
-    def __init__(self, model, params, cv=None, scoring=Metrics.r2score):
+    def __init__(self, model, params, cv=None, scoring=r2_score):
         self.parsed_params = []
         self.result = []
         self.model = model
@@ -2715,7 +2737,7 @@ class GridSearch(object):
         self.scoring = scoring
         self._parse_params()
 
-        if scoring == Metrics.mae or scoring == Metrics.mse:
+        if scoring == mean_absolute_error or scoring == mean_squared_error:
             self.best = [np.inf, 0]
         else:
             self.best = [-np.inf, 0]
@@ -2758,14 +2780,14 @@ class GridSearch(object):
                 timing.append(time.time() - t)
 
             # Compare scores
-            if scoring == Metrics.mae or scoring == Metrics.mse:
+            if scoring == mean_absolute_error or scoring == mean_squared_error:
                 if np.mean(scoring) + np.std(scoring) <= self.best[0] + self.best[1]:
                     self.best = [np.mean(scoring), np.std(scoring)]
             else:
                 if np.mean(scoring) - np.std(scoring) > self.best[0] - self.best[1]:
                     self.best = [np.mean(scoring), np.std(scoring)]
 
-            # print('[GridSearch] [%s] Score: %.4f \u00B1 %.4f (in %.1f seconds) (Best score so-far: %.4f \u00B1 %.4f) (%i / %i)' %
+            # print('[GridSearch] [AutoML] Score: %.4f \u00B1 %.4f (in %.1f seconds) (Best score so-far: %.4f \u00B1 %.4f) (%i / %i)' %
             #       (datetime.now().strftime('%H:%M'), np.mean(scoring), np.std(scoring), np.mean(timing), self.best[0], self.best[1], i + 1, len(self.parsed_params)))
             self.result.append({
                 'scoring': scoring,
