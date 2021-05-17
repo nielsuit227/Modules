@@ -30,8 +30,6 @@ warnings.filterwarnings("ignore")
 # Priority
 # implement warning for imputing keys
 # print initial modelling when already completed
-# Weighted loss for classification
-# Unify loss function in pipeline
 # Parameterize _getHyperParameters()
 # Change input/output to X/Y
 
@@ -83,7 +81,6 @@ class Utils:
                 print('[AutoML] Cannot validate, imparsable JSON.')
                 print(json_string)
                 return json_string
-
 
 class Pipeline(object):
 
@@ -169,6 +166,7 @@ class Pipeline(object):
                 self.objective = 'accuracy'
         assert isinstance(objective, str), 'Objective needs to be a string.'
         assert objective in metrics.SCORERS.keys(), 'Metric not supported, look at sklearn.metrics.SCORERS.keys()'
+        self.scorer = metrics.SCORERS[self.objective]
 
         # Params needed
         self.mode = mode
@@ -195,8 +193,8 @@ class Pipeline(object):
         self.validateResults = validate_result
 
         # Instance initiating
-        self.input = None
-        self.output = None
+        self.X = None
+        self.Y = None
         self.colKeep = None
         self.results = None
 
@@ -343,7 +341,7 @@ class Pipeline(object):
     def _eda(self, data):
         if self.plotEDA:
             print('[AutoML] Starting Exploratory Data Analysis')
-            self.eda = ExploratoryDataAnalysis(self.input, output=self.output, folder=self.mainDir, version=self.version)
+            self.eda = ExploratoryDataAnalysis(self.X, Y=self.Y, folder=self.mainDir, version=self.version)
 
     def _dataProcessing(self, data):
         # Load if possible
@@ -357,36 +355,30 @@ class Pipeline(object):
             data = self.DataProcessing.clean(data)
 
         # Split and store in memory
-        self.output = data[[self.target]]
-        self.input = data
+        self.Y = data[[self.target]]
+        self.X = data
         if self.includeOutput is False:
-            self.input = self.input.drop(self.target, axis=1)
+            self.X = self.X.drop(self.target, axis=1)
 
         # Assert classes in case of classification
         if self.mode == 'classification':
-            if self.output.nunique()[self.target] >= 50:
+            if self.Y[self.target].nunique() >= 50:
                 warnings.warn('More than 50 classes, you might want to reconsider')
-            # classes = set(self.output[self.target])
-            # if classes != {0, 1}:
-            #     if 1 in classes:
-            #         self.output.loc[self.output != 1] = 0
-            #     else:
-            #         outputs = list(classes)
-            #         self.output.loc[self.output == outputs[0]] = 0
-            #         self.output.loc[self.output == outputs[1]] = 1
+            if set(self.Y[self.target]) != set([i for i in range(len(set(self.Y[self.target])))]):
+                warnings.warn('Classes should be [0, 1, ...]')
 
     def _featureProcessing(self):
         # Extract
-        self.input = self.FeatureProcessing.extract(self.input, self.output[self.target])
+        self.X = self.FeatureProcessing.extract(self.X, self.Y[self.target])
 
         # Select
-        self.colKeep = self.FeatureProcessing.select(self.input, self.output[self.target])
+        self.colKeep = self.FeatureProcessing.select(self.X, self.Y[self.target])
 
     def _initialModelling(self):
         # Load existing results
         if 'Results.csv' in os.listdir(self.mainDir):
             self.results = pd.read_csv(self.mainDir + 'Results.csv')
-            self.Modelling.samples = len(self.output)
+            self.Modelling.samples = len(self.Y)
 
         # Check if this version has been modelled
         if self.results is not None and \
@@ -405,26 +397,26 @@ class Pipeline(object):
 
                     # Apply Feature Set
                     self.Modelling.dataset = set
-                    # input, output = self.input.reindex(columns=cols), self.output.loc[:, self.target]
-                    input, output = self.input[cols], self.output
+                    # X, Y = self.X.reindex(columns=cols), self.Y.loc[:, self.target]
+                    X, Y = self.X[cols], self.Y
 
                     # Normalize Feature Set (Done here to get one normalization file per feature set)
                     if self.normalize:
-                        normalizeFeatures = [k for k in input.keys() if k not in self.dateCols + self.catCols]
+                        normalizeFeatures = [k for k in X.keys() if k not in self.dateCols + self.catCols]
                         scaler = StandardScaler()
-                        input[normalizeFeatures] = scaler.fit_transform(input[normalizeFeatures])
+                        X[normalizeFeatures] = scaler.fit_transform(X[normalizeFeatures])
                         pickle.dump(scaler, open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (set, self.version), 'wb'))
                         if self.mode == 'regression':
                             oScaler = StandardScaler()
-                            output[self.target] = oScaler.fit_transform(output)
+                            Y[self.target] = oScaler.fit_transform(Y)
                             pickle.dump(oScaler, open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (set, self.version), 'wb'))
 
                     # Sequence if necessary
                     if self.sequence:
-                        input, output = self.Sequence.convert(input, output)
+                        X, Y = self.Sequence.convert(X, Y)
 
                     # Do the modelling
-                    results = self.Modelling.fit(input, output)
+                    results = self.Modelling.fit(X, Y)
 
                     # Add results to memory
                     results['type'] = 'Initial modelling'
@@ -563,7 +555,7 @@ class Pipeline(object):
                 }
             elif isinstance(model, catboost.core.CatBoostClassifier):
                 return {
-                    'loss_function': ['Logloss' if self.output[self.target].nunique() == 2 else 'MultiClass'],
+                    'loss_function': ['Logloss' if self.Y[self.target].nunique() == 2 else 'MultiClass'],
                     'learning_rate': uniform(0, 1),
                     'l2_leaf_reg': uniform(0, 10),
                     'depth': randint(1, 10),
@@ -743,26 +735,26 @@ class Pipeline(object):
         INTERNAL | Grid search for defined model, parameter set and feature set.
         """
         print('\n[AutoML] Starting Hyperparameter Optimization for %s on %s features (%i samples, %i features)' %
-              (type(model).__name__, feature_set, len(self.input), len(self.colKeep[feature_set])))
+              (type(model).__name__, feature_set, len(self.X), len(self.colKeep[feature_set])))
 
         # Select data
-        input, output = self.input[self.colKeep[feature_set]], self.output
+        X, Y = self.X[self.colKeep[feature_set]], self.Y
 
         # Normalize Feature Set (the input remains original)
         if self.normalize:
             normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
             scaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-            input[normalizeFeatures] = scaler.transform(input[normalizeFeatures])
+            X[normalizeFeatures] = scaler.transform(X[normalizeFeatures])
             if self.mode == 'regression':
                 oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-                output = oScaler.transform(output)
+                Y = oScaler.transform(Y)
 
         # Run for regression (different Cross-Validation & worst case (MAE vs ACC))
         if self.mode == 'regression':
             gridSearch = GridSearch(model, params,
                                    cv=KFold(n_splits=self.cvSplits),
                                    scoring=self.objective)
-            results = gridSearch.fit(input, output)
+            results = gridSearch.fit(X, Y)
             results['worst_case'] = results['mean_objective'] + results['std_objective']
             results = results.sort_values('worst_case')
 
@@ -771,7 +763,7 @@ class Pipeline(object):
             gridSearch = GridSearch(model, params,
                                    cv=StratifiedKFold(n_splits=self.cvSplits),
                                    scoring=self.objective)
-            results = gridSearch.fit(input, output)
+            results = gridSearch.fit(X, Y)
             results['worst_case'] = results['mean_objective'] - results['std_objective']
             results = results.sort_values('worst_case', ascending=False)
 
@@ -786,24 +778,24 @@ class Pipeline(object):
         from sklearn.experimental import enable_halving_search_cv
         from sklearn.model_selection import HalvingRandomSearchCV
         print('\n[AutoML] Starting Hyperparameter Optimization (halving) for %s on %s features (%i samples, %i features)' %
-              (type(model).__name__, feature_set, len(self.input), len(self.colKeep[feature_set])))
+              (type(model).__name__, feature_set, len(self.X), len(self.colKeep[feature_set])))
 
         # Select data
-        input, output = self.input[self.colKeep[feature_set]], self.output.values.ravel()
+        X, Y = self.X[self.colKeep[feature_set]], self.Y.values.ravel()
 
         # Normalize Feature Set (the input remains original)
         if self.normalize:
             normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
             scaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-            input[normalizeFeatures] = scaler.transform(input[normalizeFeatures])
+            X[normalizeFeatures] = scaler.transform(X[normalizeFeatures])
             if self.mode == 'regression':
                 oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-                output = oScaler.transform(output)
+                Y = oScaler.transform(Y)
 
         # Specify Halving Resource
         resource = 'n_samples'
         max_resources = 'auto'
-        min_resources = int(0.2 * len(input)) if len(input) > 5000 else len(input)
+        min_resources = int(0.2 * len(X)) if len(X) > 5000 else len(X)
         if model.__module__ == 'catboost.core':
             resource = 'n_estimators'
             max_resources = 3000
@@ -823,7 +815,7 @@ class Pipeline(object):
                                              cv=KFold(n_splits=self.cvSplits),
                                              scoring=self.objective,
                                              factor=3, n_jobs=mp.cpu_count() - 1, verbose=self.verbose)
-            gridSearch.fit(input, output)
+            gridSearch.fit(X, Y)
             scikitResults = pd.DataFrame(gridSearch.cv_results_)
             results = pd.DataFrame()
             results[['params', 'mean_objective', 'std_objective', 'mean_time', 'std_time']] = scikitResults[['params', 'mean_test_score', 'std_test_score', 'mean_fit_time', 'std_fit_time']]
@@ -838,7 +830,7 @@ class Pipeline(object):
                                              cv=StratifiedKFold(n_splits=self.cvSplits),
                                              scoring=self.objective,
                                              factor=3, n_jobs=mp.cpu_count() - 1, verbose=self.verbose)
-            gridSearch.fit(input, output)
+            gridSearch.fit(X, Y)
             scikitResults = pd.DataFrame(gridSearch.cv_results_)
             results = pd.DataFrame()
             results[['params', 'mean_objective', 'std_objective', 'mean_time', 'std_time']] = scikitResults[['params', 'mean_test_score', 'std_test_score', 'mean_fit_time', 'std_fit_time']]
@@ -880,18 +872,18 @@ class Pipeline(object):
         if not os.path.exists(self.mainDir + 'Validation/'): os.mkdir(self.mainDir + 'Validation/')
 
         # Select data
-        input, output = self.input[self.colKeep[feature_set]], self.output
+        X, Y = self.X[self.colKeep[feature_set]], self.Y
 
-        # Normalize Feature Set (the input remains original)
+        # Normalize Feature Set (the X remains original)
         if self.normalize:
             normalizeFeatures = [k for k in self.colKeep[feature_set] if k not in self.dateCols + self.catCols]
             scaler = pickle.load(open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-            input[normalizeFeatures] = scaler.transform(input[normalizeFeatures])
+            X[normalizeFeatures] = scaler.transform(X[normalizeFeatures])
             if self.mode == 'regression':
                 oScaler = pickle.load(open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-                output[output.keys()] = oScaler.transform(output)
-                print('(%.1f, %.1f)' % (np.mean(output), np.std(output)))
-        input, output = input.to_numpy(), output.to_numpy().reshape((-1, 1))
+                Y[Y.keys()] = oScaler.transform(Y)
+                print('(%.1f, %.1f)' % (np.mean(Y), np.std(Y)))
+        X, Y = X.to_numpy(), Y.to_numpy().reshape((-1, 1))
 
         # For Regression
         if self.mode == 'regression':
@@ -904,27 +896,28 @@ class Pipeline(object):
             score = []
             cv = KFold(n_splits=self.cvSplits, shuffle=self.shuffle)
             # Cross Validate
-            for i, (t, v) in enumerate(cv.split(input, output)):
-                ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
+            for i, (t, v) in enumerate(cv.split(X, Y)):
+                Xt, Xv, Yt, Yv = X[t], X[v], Y[t].reshape((-1)), Y[v].reshape((-1))
                 model = copy.copy(master_model)
                 model.set_params(**params)
-                model.fit(ti, to)
+                model.fit(Xt, Yt)
 
                 # Metrics
-                score.append(getattr(metrics, self.objective)(model, to, vo))
+                score.append(self.scorer(model, Xv, Yv))
 
                 # Plot
                 ax[i // 2][i % 2].set_title('Fold-%i' % i)
-                ax[i // 2][i % 2].plot(vo, color='#2369ec')
-                ax[i // 2][i % 2].plot(predictions, color='#ffa62b', alpha=0.4)
+                ax[i // 2][i % 2].plot(Yv, color='#2369ec')
+                ax[i // 2][i % 2].plot(model.predict(Xv), color='#ffa62b', alpha=0.4)
 
             # Print & Finish plot
-            print('[AutoML] %s:        %.2f \u00B1 %.2f' % (np.mean(mae), np.std(mae)))
+            print('[AutoML] %s:        %.2f \u00B1 %.2f' % (self.scorer._score_func.__name__,
+                                                            np.mean(score), np.std(score)))
             ax[i // 2][i % 2].legend(['Output', 'Prediction'])
             plt.show()
 
         # For BINARY classification
-        elif self.mode == 'classification' and self.output[self.target].nunique() == 2:
+        elif self.mode == 'classification' and self.Y[self.target].nunique() == 2:
             # Initiating
             fig, ax = plt.subplots(math.ceil(self.cvSplits / 2), 2, sharex=True, sharey=True)
             fig.suptitle('%i-Fold Cross Validated Predictions - %s (%s)' %
@@ -941,19 +934,19 @@ class Pipeline(object):
 
             # Modelling
             cv = StratifiedKFold(n_splits=self.cvSplits)
-            for i, (t, v) in enumerate(cv.split(input, output)):
+            for i, (t, v) in enumerate(cv.split(X, Y)):
                 n = len(v)
-                ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
+                Xt, Xv, Yt, Yv = X[t], X[v], Y[t].reshape((-1)), Y[v].reshape((-1))
                 model = copy.copy(master_model)
                 model.set_params(**params)
-                model.fit(ti, to)
-                predictions = model.predict(vi).reshape((-1))
+                model.fit(Xt, Yt)
+                predictions = model.predict(Xv).reshape((-1))
 
                 # Metrics
-                tp = np.logical_and(np.sign(predictions) == 1, vo == 1).sum()
-                tn = np.logical_and(np.sign(predictions) == 0, vo == 0).sum()
-                fp = np.logical_and(np.sign(predictions) == 1, vo == 0).sum()
-                fn = np.logical_and(np.sign(predictions) == 0, vo == 1).sum()
+                tp = np.logical_and(np.sign(predictions) == 1, Yv == 1).sum()
+                tn = np.logical_and(np.sign(predictions) == 0, Yv == 0).sum()
+                fp = np.logical_and(np.sign(predictions) == 1, Yv == 0).sum()
+                fn = np.logical_and(np.sign(predictions) == 0, Yv == 1).sum()
                 acc.append((tp + tn) / n * 100)
                 if tp + fp > 0:
                     prec.append(tp / (tp + fp) * 100)
@@ -966,7 +959,7 @@ class Pipeline(object):
                 cm += np.array([[tp, fp], [fn, tn]]) / self.cvSplits
 
                 # Plot
-                ax[i // 2][i % 2].plot(vo, c='#2369ec', alpha=0.6)
+                ax[i // 2][i % 2].plot(Yv, c='#2369ec', alpha=0.6)
                 ax[i // 2][i % 2].plot(predictions, c='#ffa62b')
                 ax[i // 2][i % 2].set_title('Fold-%i' % i)
 
@@ -987,7 +980,7 @@ class Pipeline(object):
 
             # Plot ROC
             fig, ax = plt.subplots(figsize=[12, 8])
-            viz = plot_roc_curve(model, vi, vo, name='ROC fold {}'.format(i + 1), alpha=0.3, ax=ax)
+            viz = plot_roc_curve(model, Xv, Yv, name='ROC fold {}'.format(i + 1), alpha=0.3, ax=ax)
             interp_tpr = np.interp(mean_fpr, viz.fpr, viz.tpr)
             interp_tpr[0] = 0.0
             tprs.append(interp_tpr)
@@ -1019,7 +1012,7 @@ class Pipeline(object):
             fig, ax = plt.subplots(math.ceil(self.cvSplits / 2), 2, sharex=True, sharey=True)
             fig.suptitle('%i-Fold Cross Validated Predictions - %s (%s)' %
                          (self.cvSplits, type(master_model).__name__, feature_set))
-            n_classes = self.output[self.target].nunique()
+            n_classes = self.Y[self.target].nunique()
             f1Score = np.zeros((self.cvSplits, n_classes))
             logLoss = np.zeros(self.cvSplits)
             avgAcc = np.zeros(self.cvSplits)
@@ -1027,23 +1020,23 @@ class Pipeline(object):
 
             # Modelling
             cv = StratifiedKFold(n_splits=self.cvSplits)
-            for i, (t, v) in enumerate(cv.split(input, output)):
+            for i, (t, v) in enumerate(cv.split(X, Y)):
                 n = len(v)
-                ti, vi, to, vo = input[t], input[v], output[t].reshape((-1)), output[v].reshape((-1))
+                Xt, Xv, Yt, Yv = X[t], X[v], Y[t].reshape((-1)), Y[v].reshape((-1))
                 model = copy.copy(master_model)
                 model.set_params(**params)
-                model.fit(ti, to)
-                predictions = model.predict(vi).reshape((-1))
+                model.fit(Xt, Yt)
+                predictions = model.predict(Xv).reshape((-1))
 
                 # Metrics
-                f1Score[i] = metrics.f1_score(vo, predictions, average=None)
-                avgAcc[i] = metrics.accuracy_score(vo, predictions)
+                f1Score[i] = metrics.f1_score(Yv, predictions, average=None)
+                avgAcc[i] = metrics.accuracy_score(Yv, predictions)
                 if hasattr(model, 'predict_proba'):
-                    probabilities = model.predict_proba(vi)
-                    logLoss[i] = metrics.log_loss(vo, probabilities)
+                    probabilities = model.predict_proba(Xv)
+                    logLoss[i] = metrics.log_loss(Yv, probabilities)
 
                 # Plot
-                ax[i // 2][i % 2].plot(vo, c='#2369ec', alpha=0.6)
+                ax[i // 2][i % 2].plot(Yv, c='#2369ec', alpha=0.6)
                 ax[i // 2][i % 2].plot(predictions, c='#ffa62b')
                 ax[i // 2][i % 2].set_title('Fold-%i' % i)
 
@@ -1094,7 +1087,7 @@ class Pipeline(object):
         json.dump(self.bestFeatures, open(self.mainDir + 'Production/v%i/Features.json' % self.version, 'w'))
 
         # Copy data
-        input, output = self.input[self.bestFeatures], self.output
+        X, Y = self.X[self.bestFeatures], self.Y
 
         # Save Scalers & Normalize
         if self.normalize:
@@ -1109,13 +1102,13 @@ class Pipeline(object):
             normalizeFeatures = [k for k in self.bestFeatures if k not in self.dateCols + self.catCols]
             self.bestScaler = pickle.load(
                 open(self.mainDir + 'Features/Scaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-            input = self.bestScaler.transform(input[normalizeFeatures])
+            X = self.bestScaler.transform(X[normalizeFeatures])
             if self.mode == 'regression':
                 self.bestOScaler = pickle.load(
                     open(self.mainDir + 'Features/OScaler_%s_%i.pickle' % (feature_set, self.version), 'rb'))
-                output = self.bestOScaler.transform(output)
+                Y = self.bestOScaler.transform(Y)
             else:
-                output = self.output[self.target].to_numpy()
+                Y = self.Y[self.target].to_numpy()
 
         # Cluster Features require additional 'Centers' file
         if any(['dist__' in key for key in self.bestFeatures]):
@@ -1125,7 +1118,7 @@ class Pipeline(object):
         # Model
         self.bestModel = [mod for mod in self.Modelling.return_models() if type(mod).__name__ == model][0]
         self.bestModel.set_params(**params)
-        self.bestModel.fit(input, output.values.ravel())
+        self.bestModel.fit(X, Y.values.ravel())
         joblib.dump(self.bestModel, self.mainDir + 'Production/v%i/Model.joblib' % self.version)
 
         # Predict function
@@ -1134,7 +1127,7 @@ class Pipeline(object):
             f.write(predictCode)
         with open(self.mainDir + 'Production/v%i/__init__.py' % self.version, 'w') as f:
             f.write('')
-        
+
         # Pipeline
         pickle.dump(self, open(self.mainDir + 'Production/v%i/Pipeline.pickle' % self.version, 'wb'))
         return
@@ -1145,7 +1138,7 @@ class Pipeline(object):
         '''
         print('[AutoML] Testing Production files.')
         # Data Conversion
-        input, output = self._convertData(data)
+        X, Y = self._convertData(data)
 
         # Prediction
         folder = 'Production/v%i/' % self.version
@@ -1154,35 +1147,35 @@ class Pipeline(object):
         model = joblib.load(self.mainDir + folder + 'Model.joblib')
 
         # Prepare inputs & Predict
-        normalizedPrediction = model.predict(input)
+        normalizedPrediction = model.predict(X)
 
         # Output for Regression
         if self.mode == 'regression':
             # Scale
             prediction = oScaler.inverse_transform(normalizedPrediction)
-            normalizedOutput = oScaler.transform(output)
+            normalizedOutput = oScaler.transform(Y)
 
             # Print
-            print('Input  ~ (%.1f, %.1f)' % (np.mean(input), np.std(input)))
-            print('Output ~ (%.1f, %.1f)' % (np.mean(output), np.std(output)))
+            print('Input  ~ (%.1f, %.1f)' % (np.mean(X), np.std(X)))
+            print('Output ~ (%.1f, %.1f)' % (np.mean(Y), np.std(Y)))
             print('MAE (normalized):      %.3f' % mean_absolute_error(normalizedOutput, normalizedPrediction))
-            print('MAE (original):        %.3f' % mean_absolute_error(output, prediction))
+            print('MAE (original):        %.3f' % mean_absolute_error(Y, prediction))
             return prediction
 
         # Output for Classification
         if self.mode == 'classification':
-            print('ACC:   %.3f' % average_accuracy(output, prediction))
+            print('ACC:   %.3f' % average_accuracy(Y, prediction))
             return prediction
 
     def _errorAnalysis(self):
         # Prepare data
-        input, output = self.bestScaler.transform(self.input[self.bestFeatures]), self.output
+        X, Y = self.bestScaler.transform(self.X[self.bestFeatures]), self.Y
         if self.mode == 'regression':
-            output = self.bestOScaler.transform(self.output)
+            Y = self.bestOScaler.transform(self.Y)
 
         # Prediction & error
-        prediction = model.predict_proba(input)[:, 1]
-        error = output - prediction
+        prediction = model.predict_proba(X)[:, 1]
+        error = Y - prediction
 
         # Analy
         return ''
@@ -1210,26 +1203,26 @@ class Pipeline(object):
 
         # Save output
         if self.target in data.keys():
-            output = data[self.target].to_numpy().reshape((-1, 1))
+            Y = data[self.target].to_numpy().reshape((-1, 1))
         else:
-            output = None
+            Y = None
 
         # Convert Features
         if 'KMeans.csv' in os.listdir(self.mainDir + folder):
             k_means = pd.read_csv(self.mainDir + folder + 'KMeans.csv')
-            input = self.FeatureProcessing.transform(data=data, features=features, k_means=k_means)
+            X = self.FeatureProcessing.transform(data=data, features=features, k_means=k_means)
         else:
-            input = self.FeatureProcessing.transform(data, features)
+            X = self.FeatureProcessing.transform(data, features)
 
-        if input.astype('float32').replace([np.inf, -np.inf], np.nan).isna().sum().sum() != 0:
+        if X.astype('float32').replace([np.inf, -np.inf], np.nan).isna().sum().sum() != 0:
             raise ValueError('Data should not contain NaN or Infs after adding features!')
 
         # Normalize
         if self.normalize:
-            input[input.keys()] = scaler.transform(input)
+            X[X.keys()] = scaler.transform(X)
 
         # Return
-        return input, output
+        return X, Y
 
     def predict(self, data):
         '''
@@ -1239,19 +1232,19 @@ class Pipeline(object):
         model = joblib.load(self.mainDir + 'Production/v%i/Model.joblib' % self.version)
         if self.verbose > 0:
             print('[AutoML] Predicting with %s, v%i' % (type(model).__name__, self.version))
-        input, output = self._convertData(data)
+        X, Y = self._convertData(data)
 
         # Predict
         if self.mode == 'regression':
             if self.normalize:
-                predictions = oScaler.inverse_transform(model.predict(input))
+                predictions = oScaler.inverse_transform(model.predict(X))
             else:
-                predictions = model.predict(input)
+                predictions = model.predict(X)
         if self.mode == 'classification':
             try:
-                predictions = model.predict_proba(input)[:, 1]
+                predictions = model.predict_proba(X)[:, 1]
             except:
-                predictions = model.predict(input)
+                predictions = model.predict(X)
 
         return predictions
 
@@ -1310,20 +1303,20 @@ class Predict(object):
         # Normalize
         if normalize:
             assert 'scaler' in args.keys(), 'When Normalizing=True, scaler needs to be provided in args'
-            input = args['scaler'].transform(input)
+            X = args['scaler'].transform(X)
         
         # Predict
         if mode == 'regression':
             if normalize:
                 assert 'o_scaler' in args.keys(), 'When Normalizing=True, o_scaler needs to be provided in args'
-                predictions = args['oScaler'].inverse_transform(model.predict(input))
+                predictions = args['oScaler'].inverse_transform(model.predict(X))
             else:
-                predictions = model.predict(input)
+                predictions = model.predict(X)
         if mode == 'classification':
             try:
-                predictions = model.predict_proba(input)[:, 1]
+                predictions = model.predict_proba(X)[:, 1]
             except:
-                predictions = model.predict(input)
+                predictions = model.predict(X)
         
         return predictions
 '''.format(self.mode, self.normalize)
@@ -1520,9 +1513,9 @@ class FeatureProcessing(object):
                  folder='',
                  mode=None,
                  version=''):
-        self.input = None
+        self.X = None
         self.originalInput = None
-        self.output = None
+        self.Y = None
         self.model = None
         self.mode = mode
         self.threshold = None
@@ -1551,14 +1544,14 @@ class FeatureProcessing(object):
         self._cleanAndSet(inputFrame, outputFrame)
         if self.extractFeatures:
             # Manipulate features
+            # Order of these doesn't matter, all take originalInput features
             self._removeColinearity()
             self._addCrossFeatures()
-            self._addDiffFeatures()
-            # Why KMeans here?
-            # Doesn't it make sense to do this on the original data or even the selected data?
             self._addKMeansFeatures()
+            self._addTrigometryFeatures()
+            self._addDiffFeatures()
             self._addLaggedFeatures()
-        return self.input
+        return self.X
 
     def select(self, inputFrame, outputFrame):
         # Check if not exists
@@ -1584,6 +1577,7 @@ class FeatureProcessing(object):
         # Split Features
         multiFeatures = [k for k in features if '__x__' in k]
         divFeatures = [k for k in features if '__d__' in k]
+        trigoFeatures = [k for k in features if 'sin__' in k or 'cos__' in k]
         kMeansFeatures = [k for k in features if 'dist__' in k]
         diffFeatures = [k for k in features if '__diff__' in k]
         lagFeatures = [k for k in features if '__lag__' in k]
@@ -1599,6 +1593,7 @@ class FeatureProcessing(object):
         required = copy.copy(originalFeatures)
         required += [k for s in multiFeatures for k in s.split('__x__')]
         required += [k for s in divFeatures for k in s.split('__d__')]
+        required += [k.split('__')[1] for k in trigoFeatures]
         required += [s.split('__diff__')[0] for s in diffFeatures]
         required += [s.split('__lag__')[0] for s in multiFeatures]
         if len(kMeansFeatures) != 0:
@@ -1607,19 +1602,19 @@ class FeatureProcessing(object):
             data.loc[:, k] = np.zeros(len(data))
 
         # Select
-        input = data[originalFeatures]
+        X = data[originalFeatures]
 
         # Multiplicative features
         for key in multiFeatures:
             keyA, keyB = key.split('__x__')
             feature = data[keyA] * data[keyB]
-            input.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
+            X.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
 
         # Division features
         for key in divFeatures:
             keyA, keyB = key.split('__d__')
             feature = data[keyA] / data[keyB]
-            input.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
+            X.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
 
         # Differenced features
         for k in diffFeatures:
@@ -1627,7 +1622,7 @@ class FeatureProcessing(object):
             feature = data[key]
             for i in range(1, diff):
                 feature = feature.diff().fillna(0)
-            input.loc[:, k] = feature
+            X.loc[:, k] = feature
 
         # K-Means features
         if len(kMeansFeatures) != 0:
@@ -1642,14 +1637,19 @@ class FeatureProcessing(object):
             # Calculate centers
             for key in kMeansFeatures:
                 ind = int(key[key.find('dist__') + 6: key.rfind('_')])
-                input.loc[:, key] = np.sqrt(np.square(temp.loc[:, centers.keys()] - centers.iloc[ind]).sum(axis=1))
+                X.loc[:, key] = np.sqrt(np.square(temp.loc[:, centers.keys()] - centers.iloc[ind]).sum(axis=1))
 
         # Lagged features
         for k in lagFeatures:
             key, lag = k.split('__lag__')
-            input.loc[:, key] = data[key].shift(-int(lag), fill_value=0)
+            X.loc[:, key] = data[key].shift(-int(lag), fill_value=0)
 
-        return input
+        # Trigonometric features
+        for k in trigoFeatures:
+            func, key = k.split('__')
+            self.X[k] = getattr(np, func)(self.X[key])
+
+        return X
 
     def exportFunction(self):
         code = inspect.getsource(self.transform)
@@ -1670,17 +1670,17 @@ class FeatureProcessing(object):
             self.model = tree.DecisionTreeRegressor(max_depth=3)
         # Bit of necessary data cleaning (shouldn't change anything)
         inputFrame = inputFrame.astype('float32').replace(np.inf, 1e12).replace(-np.inf, -1e12).fillna(0).reset_index(drop=True)
-        self.input = copy.copy(inputFrame)
+        self.X = copy.copy(inputFrame)
         self.originalInput = copy.copy(inputFrame)
-        self.output = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
+        self.Y = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
 
     def _analyseFeature(self, feature):
         m = copy.copy(self.model)
-        m.fit(feature, self.output)
+        m.fit(feature, self.Y)
         if self.mode == 'binary':
-            return max([m.score(feature, self.output, self.output == i) for i in self.output.unique()])
+            return max([m.score(feature, self.Y, self.Y == i) for i in self.Y.unique()])
         else:
-            return m.score(feature, self.output)
+            return m.score(feature, self.Y)
 
     def _removeColinearity(self):
         '''
@@ -1696,8 +1696,8 @@ class FeatureProcessing(object):
         # Else run
         else:
             print('[Features] Analysing colinearity')
-            nk = len(self.input.keys())
-            norm = (self.input - self.input.mean(skipna=True, numeric_only=True)).to_numpy()
+            nk = len(self.X.keys())
+            norm = (self.X - self.X.mean(skipna=True, numeric_only=True)).to_numpy()
             ss = np.sqrt(np.sum(norm ** 2, axis=0))
             corr_mat = np.zeros((nk, nk))
             for i in range(nk):
@@ -1709,7 +1709,7 @@ class FeatureProcessing(object):
                         corr_mat[i, j] = c
                         corr_mat[j, i] = c
             upper = np.triu(corr_mat)
-            self.colinearFeatures = self.input.keys()[np.sum(upper > self.informationThreshold, axis=0) > 0].to_list()
+            self.colinearFeatures = self.X.keys()[np.sum(upper > self.informationThreshold, axis=0) > 0].to_list()
             json.dump(self.colinearFeatures, open(self.folder + 'Colinear_v%i.json' % self.version, 'w'))
 
         self.originalInput = self.originalInput.drop(self.colinearFeatures, axis=1)
@@ -1729,7 +1729,7 @@ class FeatureProcessing(object):
         else:
             print('[Features] Analysing cross features')
             # Make division todo List
-            keys = self.input.keys()
+            keys = self.X.keys()
             divList = []
             for key in keys:
                 divList += [(key, k) for k in keys if k != key]
@@ -1745,11 +1745,11 @@ class FeatureProcessing(object):
             # Analyse scores
             scores = {}
             for keyA, keyB in tqdm(divList):
-                feature = self.input[keyA] / self.input[keyB]
+                feature = self.X[keyA] / self.X[keyB]
                 feature = feature.clip(lower=1e-12, upper=1e12).fillna(0).values.reshape((-1, 1))
                 scores[keyA + '__d__' + keyB] = self._analyseFeature(feature)
             for keyA, keyB in tqdm(multiList):
-                feature = self.input[keyA] * self.input[keyB]
+                feature = self.X[keyA] * self.X[keyB]
                 feature = feature.clip(lower=1e-12, upper=1e12).fillna(0).values.reshape((-1, 1))
                 scores[keyA + '__x__' + keyB] = self._analyseFeature(feature)
 
@@ -1765,14 +1765,14 @@ class FeatureProcessing(object):
         newFeatures = []
         for k in multiFeatures:
             keyA, keyB = k.split('__x__')
-            feature = self.input[keyA] * self.input[keyB]
+            feature = self.X[keyA] * self.X[keyB]
             feature = feature.astype('float32').clip(lower=1e-12, upper=1e12).fillna(0)
-            self.input[k] = feature
+            self.X[k] = feature
         for k in divFeatures:
             keyA, keyB = k.split('__d__')
-            feature = self.input[keyA] / self.input[keyB]
+            feature = self.X[keyA] / self.X[keyB]
             feature = feature.astype('float32').clip(lower=1e-12, upper=1e12).fillna(0)
-            self.input[k] = feature
+            self.X[k] = feature
 
         # Store
         json.dump(self.crossFeatures, open(self.folder + 'crossFeatures_v%i.json' % self.version, 'w'))
@@ -1793,9 +1793,9 @@ class FeatureProcessing(object):
 
             scores = {}
             for key in self.originalInput.keys():
-                sinFeature = np.sin(self.input[key]).clip(lower=1e-12, upper=1e12)\
+                sinFeature = np.sin(self.X[key]).clip(lower=1e-12, upper=1e12)\
                     .fillna(0).values.reshape((-1, 1))
-                cosFeature = np.cos(self.input[key]).clip(lower=1e-12, upper=1e12)\
+                cosFeature = np.cos(self.X[key]).clip(lower=1e-12, upper=1e12)\
                     .fillna(0).values.reshape((-1, 1))
                 scores['sin__' + key] = self._analyseFeature(sinFeature)
                 scores['cos__' + key] = self._analyseFeature(cosFeature)
@@ -1808,7 +1808,7 @@ class FeatureProcessing(object):
         # Add features
         for k in self.trigoFeatures:
             func, key = k.split('__')
-            self.input[k] = getattr(np, func)(self.input[key])
+            self.X[k] = getattr(np, func)(self.X[key])
 
         # Store
         json.dump(self.trigoFeatures, open(self.folder + 'trigoFeatures_v%i.json' % self.version, 'w'))
@@ -1838,7 +1838,7 @@ class FeatureProcessing(object):
             # Add them
             for key in self.kMeansFeatures:
                 ind = int(key[key.find('dist__') + 6: key.rfind('_')])
-                self.input[key] = np.sqrt(np.square(data - centers.iloc[ind]).sum(axis=1))
+                self.X[key] = np.sqrt(np.square(data - centers.iloc[ind]).sum(axis=1))
 
         # If not executed, analyse all
         else:
@@ -1862,13 +1862,13 @@ class FeatureProcessing(object):
             scores = {}
             for key in tqdm(distances.keys()):
                 m = copy.copy(self.model)
-                m.fit(distances[[key]], self.output)
-                scores[key] = m.score(distances[[key]], self.output)
+                m.fit(distances[[key]], self.Y)
+                scores[key] = m.score(distances[[key]], self.Y)
 
             # Add the valuable features
             self.kMeansFeatures = [k for k, v in scores.items() if v > 0.1]
             for k in self.kMeansFeatures:
-                self.input[k] = distances[k]
+                self.X[k] = distances[k]
 
             # Create output
             centers = pd.DataFrame(columns=self.originalInput.keys(), data=kmeans.cluster_centers_)
@@ -1916,10 +1916,10 @@ class FeatureProcessing(object):
         # Add Differenced Features
         for k in self.diffFeatures:
             key, diff = k.split('__diff__')
-            feature = self.input[key]
+            feature = self.X[key]
             for i in range(1, diff):
                 feature = feature.diff().fillna(0)
-            self.input[k] = feature
+            self.X[k] = feature
         json.dump(self.diffFeatures, open(self.folder + 'diffFeatures_v%i.json' % self.version, 'w'))
 
     def _addLaggedFeatures(self):
@@ -1944,8 +1944,8 @@ class FeatureProcessing(object):
             for lag in tqdm(range(1, self.maxLags)):
                 for key in keys:
                     m = copy.copy(self.model)
-                    m.fit(self.originalInput[[key]][:-lag], self.output[lag:])
-                    scores[key + '__lag__%i' % lag] = m.score(self.originalInput[[key]][:-lag], self.output[lag:])
+                    m.fit(self.originalInput[[key]][:-lag], self.Y[lag:])
+                    scores[key + '__lag__%i' % lag] = m.score(self.originalInput[[key]][:-lag], self.Y[lag:])
 
             # Select
             scores = {k: v - self.baseScore[k[:k.find('__lag__')]] for k, v in sorted(scores.items(),
@@ -1957,7 +1957,7 @@ class FeatureProcessing(object):
         # Add selected
         for k in self.laggedFeatures:
             key, lag = k.split('__lag__')
-            self.input[k] = self.originalInput[key].shift(-int(lag), fill_value=0)
+            self.X[k] = self.originalInput[key].shift(-int(lag), fill_value=0)
         json.dump(self.laggedFeatures, open(self.folder + 'laggedFeatures_v%i.json' % self.version, 'w'))
 
     def _predictivePowerScore(self):
@@ -1966,8 +1966,8 @@ class FeatureProcessing(object):
         Assymmetric correlation based on single decision trees trained on 5.000 samples with 4-Fold validation.
         '''
         print('[Features] Determining features with PPS')
-        data = self.input.copy()
-        data['target'] = self.output.copy()
+        data = self.X.copy()
+        data['target'] = self.Y.copy()
         pp_score = pps.predictors(data, "target")
         pp_cols = pp_score['x'][pp_score['ppscore'] != 0].to_list()
         print('[Features] Selected %i features with Predictive Power Score' % len(pp_cols))
@@ -1980,17 +1980,17 @@ class FeatureProcessing(object):
         '''
         print('[Features] Determining features with RF')
         if self.mode == 'regression':
-            rf = RandomForestRegressor().fit(self.input, self.output)
+            rf = RandomForestRegressor().fit(self.X, self.Y)
         elif self.mode == 'classification' or self.mode == 'multiclass':
-            rf = RandomForestClassifier().fit(self.input, self.output)
+            rf = RandomForestClassifier().fit(self.X, self.Y)
         fi = rf.feature_importances_
         sfi = fi.sum()
         ind = np.flip(np.argsort(fi))
         # Info Threshold
         ind_keep = [ind[i] for i in range(len(ind)) if fi[ind[:i]].sum() <= self.informationThreshold * sfi]
-        thresholded = self.input.keys()[ind_keep].to_list()
+        thresholded = self.X.keys()[ind_keep].to_list()
         ind_keep = [ind[i] for i in range(len(ind)) if fi[i] > sfi / 100]
-        increment = self.input.keys()[ind_keep].to_list()
+        increment = self.X.keys()[ind_keep].to_list()
         print('[Features] Selected %i features with RF thresholded' % len(thresholded))
         print('[Features] Selected %i features with RF increment' % len(increment))
         return thresholded, increment
@@ -2002,14 +2002,14 @@ class FeatureProcessing(object):
         elif self.mode == 'classification' or self.mode == 'multiclass':
             rf = RandomForestClassifier()
         selector = BorutaPy(rf, n_estimators='auto', verbose=0)
-        selector.fit(self.input.to_numpy(), self.output.to_numpy())
-        bp_cols = self.input.keys()[selector.support_].to_list()
+        selector.fit(self.X.to_numpy(), self.Y.to_numpy())
+        bp_cols = self.X.keys()[selector.support_].to_list()
         print('[Features] Selected %i features with Boruta' % len(bp_cols))
         return bp_cols
 
 class ExploratoryDataAnalysis(object):
 
-    def __init__(self, data,
+    def __init__(self, data, Y=None,
                  plot_timeplots=True,
                  plot_boxplots=False,
                  plot_missing_values=True,
@@ -2021,7 +2021,6 @@ class ExploratoryDataAnalysis(object):
                  plot_scatterplots=False,
                  differ=0,
                  pretag='',
-                 output=None,
                  maxSamples=10000,
                  seasonPeriods=[24 * 60, 7 * 24 * 60],
                  lags=60,
@@ -2050,16 +2049,16 @@ class ExploratoryDataAnalysis(object):
 
         # Register data
         self.data = data.astype('float32').fillna(0)
-        if output is not None:
-            assert isinstance(output, pd.DataFrame) or isnstance(output, pd.Series)
-            if isinstance(output, pd.DataFrame): output = output[output.keys()[0]]
-            self.output = output.astype('float32').fillna(0)
-            if self.output.nunique() == 2:
+        if Y is not None:
+            assert isinstance(Y, pd.DataFrame) or isnstance(Y, pd.Series)
+            if isinstance(Y, pd.DataFrame): Y = Y[Y.keys()[0]]
+            self.Y = Y.astype('float32').fillna(0)
+            if self.Y.nunique() == 2:
                 print('[AutoML] Mode set to classification.')
                 self.mode = 'classification'
-                if set(self.output.values) != {0, 1}:
-                    assert 1 in self.output.values, 'Ambiguous classes (either {0, 1} or {-1, 1})'
-                    self.output.loc[self.output.values != 1] = 0
+                if set(self.Y.values) != {0, 1}:
+                    assert 1 in self.Y.values, 'Ambiguous classes (either {0, 1} or {-1, 1})'
+                    self.Y.loc[self.Y.values != 1] = 0
             else:
                 print('[AutoML] Mode set to regression.')
                 self.mode = 'regression'
@@ -2099,7 +2098,7 @@ class ExploratoryDataAnalysis(object):
         self.timeplots()
         print('[EDA] Generating Boxplots')
         self.boxplots()
-        if self.output is not None:
+        if self.Y is not None:
             print('[EDA] Generating SHAP plot')
             self.SHAP()
             print('[EDA] Generating Feature Ranking Plot')
@@ -2123,7 +2122,7 @@ class ExploratoryDataAnalysis(object):
         self.completeAutoCorr()
         print('[EDA] Generating PACF Plots')
         self.partialAutoCorr()
-        if self.output is not None:
+        if self.Y is not None:
             print('[EDA] Generating CCF Plots')
             self.crossCorr()
             print('[EDA] Generating Scatter plots')
@@ -2170,7 +2169,7 @@ class ExploratoryDataAnalysis(object):
 
                 # Classification
                 if self.mode == 'classification':
-                    plt.boxplot([self.data.loc[self.output == 1, key], self.data.loc[self.output == -1, key]], labels=['Faulty', 'Healthy'])
+                    plt.boxplot([self.data.loc[self.Y == 1, key], self.data.loc[self.Y == -1, key]], labels=['Faulty', 'Healthy'])
                     plt.legend(['Faulty', 'Healthy'])
 
                 # Regression
@@ -2193,7 +2192,7 @@ class ExploratoryDataAnalysis(object):
 
             # Undersample
             ind = np.linspace(0, len(self.data) - 1, self.maxSamples).astype('int')
-            data, output = self.data.iloc[ind], self.output.iloc[ind]
+            data, Y = self.data.iloc[ind], self.Y.iloc[ind]
 
             # Iterate through features
             for key in tqdm(data.keys()):
@@ -2210,7 +2209,7 @@ class ExploratoryDataAnalysis(object):
                     cm = plt.get_cmap('bwr')
                 else:
                     cm = plt.get_cmap('summer')
-                nmOutput = (output - output.min()) / (output.max() - output.min())
+                nmOutput = (Y - Y.min()) / (Y.max() - Y.min())
                 plt.scatter(data.index, data[key], c=cm(nmOutput), alpha=0.3)
 
                 # Store & Close
@@ -2343,7 +2342,7 @@ class ExploratoryDataAnalysis(object):
 
             # Prepare
             folder = 'Correlation/Cross/'
-            output = self.output.to_numpy().reshape((-1))
+            Y = self.Y.to_numpy().reshape((-1))
 
             # Iterate through features
             for key in tqdm(self.data.keys()):
@@ -2354,7 +2353,7 @@ class ExploratoryDataAnalysis(object):
                 # Plot
                 try:
                     fig = plt.figure(figsize=[24, 16])
-                    plt.xcorr(self.data[key], output, maxlags=self.lags)
+                    plt.xcorr(self.data[key], Y, maxlags=self.lags)
                     plt.title(key)
                     fig.savefig(self.folder + folder + self.tag + key + '_differ_' + str(self.differ) + '_v%i.png' % self.version, format='png', dpi=300)
                     plt.close()
@@ -2375,7 +2374,7 @@ class ExploratoryDataAnalysis(object):
 
                 # Plot
                 fig = plt.figure(figsize=[24, 16])
-                plt.scatter(self.output, self.data[key], alpha=0.2)
+                plt.scatter(self.Y, self.data[key], alpha=0.2)
                 plt.ylabel(key)
                 plt.xlabel('Output')
                 plt.title('Scatterplot ' + key + ' - output')
@@ -2394,9 +2393,9 @@ class ExploratoryDataAnalysis(object):
 
             # Create model
             if self.mode == 'classification':
-                model = RandomForestClassifier(**args).fit(self.data, self.output)
+                model = RandomForestClassifier(**args).fit(self.data, self.Y)
             else:
-                model = RandomForestRegressor(**args).fit(self.data, self.output)
+                model = RandomForestRegressor(**args).fit(self.data, self.Y)
 
             # Calculate SHAP values
             import shap
@@ -2420,9 +2419,9 @@ class ExploratoryDataAnalysis(object):
 
             # Create model
             if self.mode == 'classification':
-                model = RandomForestClassifier(**args).fit(self.data, self.output)
+                model = RandomForestClassifier(**args).fit(self.data, self.Y)
             else:
-                model = RandomForestRegressor(**args).fit(self.data, self.output)
+                model = RandomForestRegressor(**args).fit(self.data, self.Y)
 
             # Plot
             fig, ax = plt.subplots(figsize=[4, 6], constrained_layout=True)
@@ -2452,10 +2451,10 @@ class ExploratoryDataAnalysis(object):
 
             # Calculate PPS
             data = self.data.copy()
-            if isinstance(self.output, pd.core.series.Series):
-                data.loc[:, 'target'] = self.output
-            elif isinstance(self.output, pd.DataFrame):
-                data.loc[:, 'target'] = self.output.loc[:, self.output.keys()[0]]
+            if isinstance(self.Y, pd.core.series.Series):
+                data.loc[:, 'target'] = self.Y
+            elif isinstance(self.Y, pd.DataFrame):
+                data.loc[:, 'target'] = self.Y.loc[:, self.Y.keys()[0]]
             pp_score = pps.predictors(data, 'target').sort_values('ppscore')
 
             # Plot
@@ -2488,16 +2487,16 @@ class Modelling(object):
         self.store_models = store_models
         self.folder = folder if folder[-1] == '/' else folder + '/'
 
-    def fit(self, input, output):
-        self.samples = len(output)
+    def fit(self, X, Y):
+        self.samples = len(Y)
         if self.mode == 'regression':
             from sklearn.model_selection import KFold
             cv = KFold(n_splits=self.cvSplits, shuffle=self.shuffle)
-            return self._fit(input, output, cv)
+            return self._fit(X, Y, cv)
         if self.mode == 'classification':
             from sklearn.model_selection import StratifiedKFold
             cv = StratifiedKFold(n_splits=self.cvSplits, shuffle=self.shuffle)
-            return self._fit(input, output, cv)
+            return self._fit(X, Y, cv)
 
     def return_models(self):
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
@@ -2550,10 +2549,10 @@ class Modelling(object):
 
         return models
 
-    def _fit(self, input, output, cross_val):
+    def _fit(self, X, Y, cross_val):
         # Convert to NumPy
-        X = np.array(input)
-        Y = np.array(output).ravel()
+        X = np.array(X)
+        Y = np.array(Y).ravel()
 
         # Data
         print('[Modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.cvSplits, len(X[0])))
@@ -2675,69 +2674,69 @@ class Sequence(object):
         if diff not in ['none', 'diff', 'logdiff']:
             raise ValueError('Type should be in [None, diff, logdiff, frac]')
 
-    def convert(self, input, output, flat=False):
-        if isinstance(input, pd.DataFrame) or isinstance(input, pd.core.series.Series):
-            assert isinstance(output, pd.DataFrame) or isinstance(output, pd.core.series.Series), \
+    def convert(self, X, Y, flat=False):
+        if isinstance(X, pd.DataFrame) or isinstance(X, pd.core.series.Series):
+            assert isinstance(Y, pd.DataFrame) or isinstance(Y, pd.core.series.Series), \
                 'Input and Output need to be the same data type.'
-            return self.convert_pandas(input, output)
-        elif isinstance(input, np.ndarray):
-            assert isinstance(output, np.ndarray), 'Input and Output need to be the same data type.'
-            return self.convert_numpy(input, output, flat=flat)
+            return self.convert_pandas(X, Y)
+        elif isinstance(X, np.ndarray):
+            assert isinstance(Y, np.ndarray), 'Input and Output need to be the same data type.'
+            return self.convert_numpy(X, Y, flat=flat)
         else:
             TypeError('Input & Output need to be same datatype, either Numpy or Pandas.')
 
-    def convert_numpy(self, input, output, flat=False):
-        if input.ndim == 1:
-            input = input.reshape((-1, 1))
-        if output.ndim == 1:
-            output = output.reshape((-1, 1))
-        samples = len(input) - self.mback - self.mfore - self.shift - 1
-        features = len(input[0])
+    def convert_numpy(self, X, Y, flat=False):
+        if X.ndim == 1:
+            X = X.reshape((-1, 1))
+        if Y.ndim == 1:
+            Y = Y.reshape((-1, 1))
+        samples = len(X) - self.mback - self.mfore - self.shift - 1
+        features = len(X[0])
         input_sequence = np.zeros((samples, self.nback, features))
         output_sequence = np.zeros((samples, self.nfore))
         if self.diff == 'none':
             for i in range(samples):
-                input_sequence[i] = input[i + self.backVec]
-                output_sequence[i] = output[i - 1 + self.mback + self.shift + self.foreVec].reshape((-1))
+                input_sequence[i] = X[i + self.backVec]
+                output_sequence[i] = Y[i - 1 + self.mback + self.shift + self.foreVec].reshape((-1))
             return input_sequence, output_sequence
         elif self.diff[-4:] == 'diff':
             if self.diff == 'logdiff':
-                input = np.log(input)
-                output = np.log(output)
+                X = np.log(X)
+                Y = np.log(Y)
             if (self.backVec == 0).all():
                 self.backVec = np.array([0, 1])
             for i in range(samples):
-                input_sequence[i] = input[i + self.backVec[1:]] - input[i + self.backVec[:-1]]
-                output_sequence[i] = (output[i + self.mback + self.shift + self.foreVec] -
-                                      output[i + self.mback + self.shift + self.foreRoll]).reshape((-1))
+                input_sequence[i] = X[i + self.backVec[1:]] - X[i + self.backVec[:-1]]
+                output_sequence[i] = (Y[i + self.mback + self.shift + self.foreVec] -
+                                      Y[i + self.mback + self.shift + self.foreRoll]).reshape((-1))
             return input_sequence, output_sequence
 
-    def convert_pandas(self, input, output):
+    def convert_pandas(self, X, Y):
 
         # Check inputs
-        if isinstance(input, pd.core.series.Series):
-            input = input.to_frame()
-        if isinstance(output, pd.core.series.Series):
-            output = output.to_frame()
-        assert len(input) == len(output)
-        assert isinstance(input, pd.DataFrame)
-        assert isinstance(output, pd.DataFrame)
+        if isinstance(X, pd.core.series.Series):
+            X = X.to_frame()
+        if isinstance(Y, pd.core.series.Series):
+            Y = Y.to_frame()
+        assert len(X) == len(Y)
+        assert isinstance(X, pd.DataFrame)
+        assert isinstance(Y, pd.DataFrame)
 
         # Keys
-        inputKeys = input.keys()
-        outputKeys = output.keys()
+        inputKeys = X.keys()
+        outputKeys = Y.keys()
 
         # No Differencing
         if self.diff == 'none':
             # Input
             for lag in self.backVec:
                 keys = [key + '_' + str(lag) for key in inputKeys]
-                input[keys] = input[inputKeys].shift(lag)
+                X[keys] = X[inputKeys].shift(lag)
 
             # Output
             for shift in self.foreVec:
                 keys = [key + '_' + str(shift) for key in outputKeys]
-                output[keys] = output[outputKeys].shift(-shift)
+                Y[keys] = Y[YKeys].shift(-shift)
 
         # With differencing
         elif self.diff[-4:] == 'diff':
@@ -2745,40 +2744,40 @@ class Sequence(object):
             for lag in self.backVec:
                 # Shifted
                 keys = [key + '_' + str(lag) for key in inputKeys]
-                input[keys] = input[inputKeys].shift(lag)
+                X[keys] = X[inputKeys].shift(lag)
 
                 # Differenced
                 dkeys = [key + '_d_' + str(lag) for key in inputKeys]
-                input[dkeys] = input[inputKeys].shift(lag) - input[inputKeys]
+                X[dkeys] = X[inputKeys].shift(lag) - X[inputKeys]
 
             # Output
             for shift in self.foreVec:
                 # Only differenced
                 keys = [key + '_' + str(shift) for key in outputKeys]
-                output[keys] = output[outputKeys].shift(lag) - output[outputKeys]
+                Y[keys] = Y[outputKeys].shift(lag) - Y[outputKeys]
 
         # Drop _0 (same as original)
-        input = input.drop([key for key in input.keys() if '_0' in key], axis=1)
-        output = output.drop([key for key in output.keys() if '_0' in key], axis=1)
+        X = X.drop([key for key in X.keys() if '_0' in key], axis=1)
+        Y = Y.drop([key for key in Y.keys() if '_0' in key], axis=1)
 
         # Return (first lags are NaN, last shifts are NaN
-        return input.iloc[lag:-shift if shift>0 else None], output.iloc[lag:-shift if shift>0 else None]
+        return X.iloc[lag:-shift if shift>0 else None], Y.iloc[lag:-shift if shift>0 else None]
 
     def revert(self, differenced, original):
         # unsequenced integrating loop: d = np.hstack((d[0], d[0] + np.cumsum(dd)))
         if self.nfore == 1:
             differenced = differenced.reshape((-1, 1))
-        output = np.zeros_like(differenced)
+        Y = np.zeros_like(differenced)
         if self.diff == 'none':
             return
         if self.diff == 'logdiff':
             for i in range(self.nfore):
-                output[:, i] = np.log(original[self.mback + self.foreRoll[i]:-self.foreVec[i]]) + differenced[:, i]
-            return np.exp(output)
+                Y[:, i] = np.log(original[self.mback + self.foreRoll[i]:-self.foreVec[i]]) + differenced[:, i]
+            return np.exp(Y)
         if self.diff == 'diff':
             for i in range(self.nfore):
-                output[:, i] = original[self.mback + self.foreRoll[i]:-self.foreVec[i]] + differenced[:, i]
-            return output
+                Y[:, i] = original[self.mback + self.foreRoll[i]:-self.foreVec[i]] + differenced[:, i]
+            return Y
 
 class GridSearch(object):
 
@@ -2807,25 +2806,25 @@ class GridSearch(object):
             len(self.parsed_params),
             len(self.parsed_params) * self.cv.n_splits))
 
-    def fit(self, input, output):
+    def fit(self, X, Y):
         # Convert to Numpy
-        if isinstance(input, pd.DataFrame) or isinstance(input, pd.core.series.Series):
-            input = np.array(input)
-        if isinstance(output, pd.DataFrame) or isinstance(output, pd.core.series.Series):
-            output = np.array(output).reshape((-1))
+        if isinstance(X, pd.DataFrame) or isinstance(X, pd.core.series.Series):
+            X = np.array(X)
+        if isinstance(Y, pd.DataFrame) or isinstance(Y, pd.core.series.Series):
+            Y = np.array(Y).reshape((-1))
 
         # Loop through parameters
         for i, param in tqdm(enumerate(self.parsed_params)):
             # print('[GridSearch] ', param)
             scoring = []
             timing = []
-            for train_ind, val_ind in self.cv.split(input, output):
+            for train_ind, val_ind in self.cv.split(X, Y):
                 # Start Timer
                 t = time.time()
 
                 # Split data
-                xtrain, xval = input[train_ind], input[val_ind]
-                ytrain, yval = output[train_ind], output[val_ind]
+                xtrain, xval = X[train_ind], X[val_ind]
+                ytrain, yval = Y[train_ind], Y[val_ind]
 
                 # Model training
                 model = copy.copy(self.model)
@@ -2904,8 +2903,8 @@ class LSTM(object):
         self.__init__(**params)
 
 
-    def fit(self, input, output):
-        self.model.fit(input, output,
+    def fit(self, X, Y):
+        self.model.fit(X, Y,
                        epochs=self.epochs,
                        batch_size=self.batch_size,
                        shuffle=self.shuffle,
@@ -2913,5 +2912,5 @@ class LSTM(object):
         return self.model
 
 
-    def predict(self, input):
-        return self.model.predict(input)
+    def predict(self, X):
+        return self.model.predict(X)
