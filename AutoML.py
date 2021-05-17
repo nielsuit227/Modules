@@ -11,10 +11,8 @@ import multiprocessing as mp
 
 from boruta import BorutaPy
 import catboost, xgboost, lightgbm, sklearn
-from sklearn import neural_network, tree, cluster
+from sklearn import neural_network, tree, cluster, metrics
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import plot_roc_curve, auc, f1_score, log_loss, accuracy_score, r2_score, \
-    mean_squared_error, mean_absolute_error
 from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 
@@ -31,6 +29,7 @@ warnings.filterwarnings("ignore")
 
 # Priority
 # implement warning for imputing keys
+# print initial modelling when already completed
 # Weighted loss for classification
 # Unify loss function in pipeline
 # Parameterize _getHyperParameters()
@@ -93,6 +92,7 @@ class Pipeline(object):
                  project='',
                  version=None,
                  mode='regression',
+                 objective=None,
                  fast_run=False,
 
                  # Data Processing
@@ -147,19 +147,32 @@ class Pipeline(object):
         self.fastRun = fast_run
 
         # Checks
-        assert mode == 'regression' or mode == 'classification'
-        assert isinstance(target, str)
-        assert isinstance(project, str)
-        assert isinstance(num_cols, list)
-        assert isinstance(date_cols, list)
-        assert isinstance(cat_cols, list)
-        assert isinstance(shift, int)
-        assert isinstance(max_diff, int)
-        assert max_lags < 50
-        assert information_threshold > 0 and information_threshold < 1
-        assert max_diff < 5
+        assert mode == 'regression' or mode == 'classification', 'Supported modes: regression, classification.'
+        assert isinstance(target, str), 'Target needs to be of type string, key of target'
+        assert isinstance(project, str), 'Project is a name, needs to be of type string'
+        assert isinstance(num_cols, list), 'Num cols must be a list of strings'
+        assert isinstance(date_cols, list), 'Date cols must be a list of strings'
+        assert isinstance(cat_cols, list), 'Cat Cols must be a list of strings'
+        assert isinstance(shift, int), 'Shift needs to be an integer'
+        assert isinstance(max_diff, int), 'max_diff needs to be an integer'
+        assert max_lags < 50, 'Max_lags too big. Max 50.'
+        assert information_threshold > 0 and information_threshold < 1, 'Information threshold needs to be within [0, 1'
+        assert max_diff < 5, 'Max difftoo big. Max 5.'
+
+        # Objective
+        if objective is not None:
+            self.objective = objective
+        else:
+            if mode == 'regression:':
+                self.objective = 'neg_mean_squared_error'
+            elif mode == 'classification':
+                self.objective = 'accuracy'
+        assert isinstance(objective, str), 'Objective needs to be a string.'
+        assert objective in metrics.SCORERS.keys(), 'Metric not supported, look at sklearn.metrics.SCORERS.keys()'
 
         # Params needed
+        self.mode = mode
+        self.version = version
         self.numCols = num_cols
         self.dateCols = date_cols
         self.catCols = cat_cols
@@ -182,8 +195,6 @@ class Pipeline(object):
         self.validateResults = validate_result
 
         # Instance initiating
-        self.mode = mode
-        self.version = version
         self.input = None
         self.output = None
         self.colKeep = None
@@ -191,8 +202,10 @@ class Pipeline(object):
 
         # Flags
         self._setFlags()
+
         # Create Directories
         self._createDirs()
+
         # Load Version
         self._loadVersion()
 
@@ -207,6 +220,7 @@ class Pipeline(object):
                                                    folder=self.mainDir + 'Features/', version=self.version)
         self.Sequence = Sequence(back=back, forward=forward, shift=shift, diff=diff)
         self.Modelling = Modelling(mode=mode, shuffle=shuffle, store_models=store_models,
+                                   scoring=metrics.SCORERS[self.objective],
                                    store_results=False, folder=self.mainDir + 'Models/')
 
         # Store production
@@ -275,13 +289,8 @@ class Pipeline(object):
                 continue
 
     def _sortResults(self, results):
-        if self.mode == 'regression':
-            results['worst_case'] = results['mean_score'] + results['std_score']
-            results = results.sort_values('worst_case', ascending=True)
-        elif self.mode == 'classification':
-            results.loc[:, 'worst_case'] = results['mean_score'] - results['std_score']
-            results = results.sort_values('worst_case', ascending=False)
-        return results
+        results['worst_case'] = results['mean_objective'] - results['std_objective']
+        return results.sort_values('worst_case', ascending=False)
 
     def _getBestParams(self, model, feature_set):
         # Filter results for model and version
@@ -752,26 +761,26 @@ class Pipeline(object):
         if self.mode == 'regression':
             gridSearch = GridSearch(model, params,
                                    cv=KFold(n_splits=self.cvSplits),
-                                   scoring=mean_absolute_error)
+                                   scoring=self.objective)
             results = gridSearch.fit(input, output)
-            results['worst_case'] = results['mean_score'] + results['std_score']
+            results['worst_case'] = results['mean_objective'] + results['std_objective']
             results = results.sort_values('worst_case')
 
         # run for classification
         elif self.mode == 'classification':
             gridSearch = GridSearch(model, params,
                                    cv=StratifiedKFold(n_splits=self.cvSplits),
-                                   scoring=mean_squared_error)
+                                   scoring=self.objective)
             results = gridSearch.fit(input, output)
-            results['worst_case'] = results['mean_score'] - results['std_score']
+            results['worst_case'] = results['mean_objective'] - results['std_objective']
             results = results.sort_values('worst_case', ascending=False)
 
         return results
 
     def _gridSearchIterationHalvingCV(self, model, params, feature_set):
         """
-        EXPERIMENTAL | Grid search for defined model, parameter set and feature set.
-        Contrary to normal function, uses Scikit-Learns GridHalvingCV. Special halvign algo
+        Grid search for defined model, parameter set and feature set.
+        Contrary to normal function, uses Scikit-Learns HalvingRandomSearchCV. Special halvign algo
         that uses subsets of data for early elimination. Speeds up significantly :)
         """
         from sklearn.experimental import enable_halving_search_cv
@@ -812,13 +821,13 @@ class Pipeline(object):
                                              max_resources=max_resources,
                                              min_resources=min_resources,
                                              cv=KFold(n_splits=self.cvSplits),
-                                             scoring='neg_mean_absolute_error',
+                                             scoring=self.objective,
                                              factor=3, n_jobs=mp.cpu_count() - 1, verbose=self.verbose)
             gridSearch.fit(input, output)
             scikitResults = pd.DataFrame(gridSearch.cv_results_)
             results = pd.DataFrame()
-            results[['params', 'mean_score', 'std_score', 'mean_time', 'std_time']] = scikitResults[['params', 'mean_test_score', 'std_test_score', 'mean_fit_time', 'std_fit_time']]
-            results['worst_case'] = - results['mean_score'] - results['std_score']
+            results[['params', 'mean_objective', 'std_objective', 'mean_time', 'std_time']] = scikitResults[['params', 'mean_test_score', 'std_test_score', 'mean_fit_time', 'std_fit_time']]
+            results['worst_case'] = - results['mean_objective'] - results['std_objective']
             results = results.sort_values('worst_case')
 
         if self.mode == 'classification':
@@ -827,13 +836,13 @@ class Pipeline(object):
                                              max_resources=max_resources,
                                              min_resources=min_resources,
                                              cv=StratifiedKFold(n_splits=self.cvSplits),
-                                             scoring='accuracy',
+                                             scoring=self.objective,
                                              factor=3, n_jobs=mp.cpu_count() - 1, verbose=self.verbose)
             gridSearch.fit(input, output)
             scikitResults = pd.DataFrame(gridSearch.cv_results_)
             results = pd.DataFrame()
-            results[['params', 'mean_score', 'std_score', 'mean_time', 'std_time']] = scikitResults[['params', 'mean_test_score', 'std_test_score', 'mean_fit_time', 'std_fit_time']]
-            results['worst_case'] = results['mean_score'] - results['std_score']
+            results[['params', 'mean_objective', 'std_objective', 'mean_time', 'std_time']] = scikitResults[['params', 'mean_test_score', 'std_test_score', 'mean_fit_time', 'std_fit_time']]
+            results['worst_case'] = results['mean_objective'] - results['std_objective']
             results = results.sort_values('worst_case')
 
         # Update resource in params
@@ -892,7 +901,7 @@ class Pipeline(object):
             fig.suptitle('%i-Fold Cross Validated Predictions - %s' % (self.cvSplits, type(master_model).__name__))
 
             # Initialize iterables
-            mae = []
+            score = []
             cv = KFold(n_splits=self.cvSplits, shuffle=self.shuffle)
             # Cross Validate
             for i, (t, v) in enumerate(cv.split(input, output)):
@@ -900,10 +909,9 @@ class Pipeline(object):
                 model = copy.copy(master_model)
                 model.set_params(**params)
                 model.fit(ti, to)
-                predictions = model.predict(vi).reshape((-1))
 
                 # Metrics
-                mae.append(mean_absolute_error(vo, predictions))
+                score.append(getattr(metrics, self.objective)(model, to, vo))
 
                 # Plot
                 ax[i // 2][i % 2].set_title('Fold-%i' % i)
@@ -911,7 +919,7 @@ class Pipeline(object):
                 ax[i // 2][i % 2].plot(predictions, color='#ffa62b', alpha=0.4)
 
             # Print & Finish plot
-            print('[AutoML] MAE:        %.2f \u00B1 %.2f' % (np.mean(mae), np.std(mae)))
+            print('[AutoML] %s:        %.2f \u00B1 %.2f' % (np.mean(mae), np.std(mae)))
             ax[i // 2][i % 2].legend(['Output', 'Prediction'])
             plt.show()
 
@@ -1028,11 +1036,11 @@ class Pipeline(object):
                 predictions = model.predict(vi).reshape((-1))
 
                 # Metrics
-                f1Score[i] = f1_score(vo, predictions, average=None)
-                avgAcc[i] = accuracy_score(vo, predictions)
+                f1Score[i] = metrics.f1_score(vo, predictions, average=None)
+                avgAcc[i] = metrics.accuracy_score(vo, predictions)
                 if hasattr(model, 'predict_proba'):
                     probabilities = model.predict_proba(vi)
-                    logLoss[i] = log_loss(vo, probabilities)
+                    logLoss[i] = metrics.log_loss(vo, probabilities)
 
                 # Plot
                 ax[i // 2][i % 2].plot(vo, c='#2369ec', alpha=0.6)
@@ -1076,10 +1084,10 @@ class Pipeline(object):
         print('[AutoML] ', params)
         if self.mode == 'classification':
             print('[AutoML] Accuracy: %.2f \u00B1 %.2f' %
-                              (self.mainDir[:-1], results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
+                              (self.mainDir[:-1], results.iloc[0]['mean_objective'], results.iloc[0]['std_objective']))
         elif self.mode == 'regression':
             print('[AutoML] Mean Absolute Error: %.2f \u00B1 %.2f' %
-                              (self.mainDir[:-1], results.iloc[0]['mean_score'], results.iloc[0]['std_score']))
+                              (self.mainDir[:-1], results.iloc[0]['mean_objective'], results.iloc[0]['std_objective']))
 
         # Save Features
         self.bestFeatures = self.colKeep[feature_set]
@@ -2440,8 +2448,9 @@ class ExploratoryDataAnalysis(object):
 
 class Modelling(object):
 
-    def __init__(self, mode='regression', shuffle=False, plot=False,
+    def __init__(self, mode='regression', shuffle=False, plot=False, scoring=None,
                  folder='models/', n_splits=3, dataset=0, store_models=False, store_results=True):
+        self.scoring = scoring
         self.mode = mode
         self.shuffle = shuffle
         self.plot = plot
@@ -2459,11 +2468,11 @@ class Modelling(object):
         if self.mode == 'regression':
             from sklearn.model_selection import KFold
             cv = KFold(n_splits=self.cvSplits, shuffle=self.shuffle)
-            return self._fit(input, output, cv, mean_absolute_error)
+            return self._fit(input, output, cv)
         if self.mode == 'classification':
             from sklearn.model_selection import StratifiedKFold
             cv = StratifiedKFold(n_splits=self.cvSplits, shuffle=self.shuffle)
-            return self._fit(input, output, cv, average_accuracy)
+            return self._fit(input, output, cv)
 
     def return_models(self):
         from sklearn import linear_model, svm, neighbors, tree, ensemble, neural_network
@@ -2472,6 +2481,7 @@ class Modelling(object):
         models = []
 
         if self.mode == 'classification':
+            # self.scorer._factory_args().find('True')
 
             models.append(linear_model.RidgeClassifier())
             # lasso = linear_model.Lasso()
@@ -2510,20 +2520,23 @@ class Modelling(object):
             models.append(ensemble.RandomForestRegressor())
             # mlp = neural_network.MLPRegressor())
 
+        # Filter predict_proba models
+        models = [m for m in models if hasattr(m, 'predict_proba')]
+
         return models
 
-    def _fit(self, input, output, cross_val, metric):
+    def _fit(self, input, output, cross_val):
         # Convert to NumPy
-        input = np.array(input)
-        output = np.array(output).ravel()
+        X = np.array(input)
+        Y = np.array(output).ravel()
 
         # Data
-        print('[Modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.cvSplits, len(input[0])))
+        print('[Modelling] Splitting data (shuffle=%s, splits=%i, features=%i)' % (str(self.shuffle), self.cvSplits, len(X[0])))
 
         if self.store_results and 'Initial_Models.csv' in os.listdir(self.folder):
             results = pd.read_csv(self.folder + 'Initial_Models.csv')
         else:
-            results = pd.DataFrame(columns=['date', 'model', 'dataset', 'params', 'mean_score', 'std_score', 'mean_time', 'std_time'])
+            results = pd.DataFrame(columns=['date', 'model', 'dataset', 'params', 'mean_objective', 'std_objective', 'mean_time', 'std_time'])
 
         # Models
         self.models = self.return_models()
@@ -2536,37 +2549,38 @@ class Modelling(object):
                 results['dataset'] == self.dataset),
                 results['date'] == datetime.today().strftime('%d %b %Y, %Hh')))[0]
             if len(ind) != 0:
-                self.acc.append(results.iloc[ind[0]]['mean_score'])
-                self.std.append(results.iloc[ind[0]]['std_score'])
+                self.acc.append(results.iloc[ind[0]]['mean_objective'])
+                self.std.append(results.iloc[ind[0]]['std_objective'])
                 continue
 
             # Time & loops through Cross-Validation
-            v_acc = []
-            t_acc = []
-            t_train = []
-            for t, v in cross_val.split(input, output):
+            val_score = []
+            train_score = []
+            train_time = []
+            for t, v in cross_val.split(X, Y):
                 t_start = time.time()
-                ti, vi, to, vo = input[t], input[v], output[t], output[v]
+                Xt, Xv, Yt, Yv = X[t], X[v], Y[t], Y[v]
                 model = copy.copy(master_model)
-                model.fit(ti, to)
-                v_acc.append(metric(vo, model.predict(vi)))
-                t_acc.append(metric(to, model.predict(ti)))
-                t_train.append(time.time() - t_start)
+                model.fit(Xt, Yt)
+                val_score.append(self.scoring(model, Xv, Yv))
+                train_score.append(self.scoring(model, Xt, Yt))
+                train_time.append(time.time() - t_start)
 
             # Results
             results = results.append({'date': datetime.today().strftime('%d %b %Y'), 'model': type(model).__name__,
                                       'dataset': self.dataset, 'params': model.get_params(),
-                                      'mean_score': np.mean(v_acc),
-                                      'std_score': np.std(v_acc), 'mean_time': np.mean(t_train),
-                                      'std_time': np.std(t_train)}, ignore_index=True)
-            self.acc.append(np.mean(v_acc))
-            self.std.append(np.std(v_acc))
+                                      'mean_objective': np.mean(val_score),
+                                      'std_objective': np.std(val_score), 'mean_time': np.mean(train_time),
+                                      'std_time': np.std(train_time)}, ignore_index=True)
+            self.acc.append(np.mean(val_score))
+            self.std.append(np.std(val_score))
             if self.store_models:
                 joblib.dump(model, self.folder + type(model).__name__ + '_%.5f.joblib' % self.acc[-1])
             if self.plot:
                 plt.plot(p, alpha=0.2)
-            print('[Modelling] %s train/val: %.2f %.2f, training time: %.1f s' %
-                  (type(model).__name__.ljust(60), np.mean(t_acc), np.mean(v_acc), time.time() - t_start))
+            print('[Modelling] %s %s train/val: %.2f %.2f, training time: %.1f s' %
+                  (type(model).__name__.ljust(60), self.scoring._score_func.__name__,
+                   np.mean(train_score), np.mean(val_score), time.time() - t_start))
 
         # Store CSV
         if self.store_results:
@@ -2596,8 +2610,7 @@ class Sequence(object):
         Scenarios:
         - Sequenced I/O                     --> back & forward in int or list of ints
         - Sequenced input, single output    --> back: int, forward: list of ints
-        - Single input, single output       --> back & forward = 1
-
+        - Single input, single output       --> back & forward =
 
         :param back: Int or List[int]: input indices to include
         :param forward: Int or List[int]: output indices to include
@@ -2744,7 +2757,7 @@ class Sequence(object):
 
 class GridSearch(object):
 
-    def __init__(self, model, params, cv=None, scoring=r2_score):
+    def __init__(self, model, params, cv=None, scoring=metrics.r2_score):
         self.parsed_params = []
         self.result = []
         self.model = model
@@ -2756,7 +2769,7 @@ class GridSearch(object):
         self.scoring = scoring
         self._parse_params()
 
-        if scoring == mean_absolute_error or scoring == mean_squared_error:
+        if scoring == metrics.mean_absolute_error or scoring == metrics.mean_squared_error:
             self.best = [np.inf, 0]
         else:
             self.best = [-np.inf, 0]
@@ -2810,8 +2823,8 @@ class GridSearch(object):
             #       (datetime.now().strftime('%H:%M'), np.mean(scoring), np.std(scoring), np.mean(timing), self.best[0], self.best[1], i + 1, len(self.parsed_params)))
             self.result.append({
                 'scoring': scoring,
-                'mean_score': np.mean(scoring),
-                'std_score': np.std(scoring),
+                'mean_objective': np.mean(scoring),
+                'std_objective': np.std(scoring),
                 'time': timing,
                 'mean_time': np.mean(timing),
                 'std_time': np.std(timing),
