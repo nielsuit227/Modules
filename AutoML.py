@@ -810,6 +810,7 @@ class Pipeline(object):
         if self.mode == 'regression':
             gridSearch = HalvingRandomSearchCV(model, params,
                                              resource=resource,
+                                             n_candidates=200,
                                              max_resources=max_resources,
                                              min_resources=min_resources,
                                              cv=KFold(n_splits=self.cvSplits),
@@ -843,6 +844,21 @@ class Pipeline(object):
                 results.loc[results.index[i], 'params'][resource] = max_resources
 
         return results
+
+    def _createStacking(self):
+        '''
+        Based on the best performing models, in addition to cheap models based on very different assumptions,
+        A stacking model is optimized to enhance/combine the performance of the models.
+        '''
+        # First, the ideal dataset has to be chosen, we're restricted to a single one...
+        results = self._sortResults(self.results[np.logical_and(
+            self.results['type'] == 'Hyperparameter Opt',
+            self.results['data_version'] == self.version,
+        )])
+        feature_set = results['dataset'].value_counts()[0]
+
+
+
 
     def validate(self, model, feature_set, params=None):
         '''
