@@ -1554,6 +1554,8 @@ class FeatureProcessing(object):
             self._removeColinearity()
             self._addCrossFeatures()
             self._addDiffFeatures()
+            # Why KMeans here?
+            # Doesn't it make sense to do this on the original data or even the selected data?
             self._addKMeansFeatures()
             self._addLaggedFeatures()
         return self.input
@@ -1672,6 +1674,14 @@ class FeatureProcessing(object):
         self.originalInput = copy.copy(inputFrame)
         self.output = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
 
+    def _analyseFeature(self, feature):
+        m = copy.copy(self.model)
+        m.fit(feature, self.output)
+        if self.mode == 'binary':
+            return max([m.score(feature, self.output, self.output == i) for i in self.output.unique()])
+        else:
+            return m.score(feature, self.output)
+
     def _removeColinearity(self):
         '''
         Calculates the Pearson Correlation Coefficient for all input features.
@@ -1736,30 +1746,18 @@ class FeatureProcessing(object):
             scores = {}
             for keyA, keyB in tqdm(divList):
                 feature = self.input[keyA] / self.input[keyB]
-                feature = feature.clip(lower=1e-12, upper=1e12).fillna(0)
-                m = copy.copy(self.model)
-                m.fit(feature.values.reshape((-1, 1)), self.output)
-                if self.mode == 'binary':
-                    scores[keyA + '__d__' + keyB] = max([m.score(feature.values.reshape((-1, 1)), self.output,
-                                                                 self.output == i) for i in self.output.unique()])
-                else:
-                    scores[keyA + '__d__' + keyB] = m.score(feature.values.reshape((-1, 1)), self.output)
+                feature = feature.clip(lower=1e-12, upper=1e12).fillna(0).values.reshape((-1, 1))
+                scores[keyA + '__d__' + keyB] = self._analyseFeature(feature)
             for keyA, keyB in tqdm(multiList):
                 feature = self.input[keyA] * self.input[keyB]
-                feature = feature.clip(lower=1e-12, upper=1e12).fillna(0)
-                m = copy.copy(self.model)
-                m.fit(feature.values.reshape((-1, 1)), self.output)
-                if self.mode == 'binary':
-                    scores[keyA + '__x__' + keyB] = max([m.score(feature.values.reshape((-1, 1)), self.output,
-                                                                 self.output == i) for i in self.output.unique()])
-                else:
-                    scores[keyA + '__x__' + keyB] = m.score(feature.values.reshape((-1, 1)), self.output)
+                feature = feature.clip(lower=1e-12, upper=1e12).fillna(0).values.reshape((-1, 1))
+                scores[keyA + '__x__' + keyB] = self._analyseFeature(feature)
 
             # Select valuable features
             scores = {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
             items = min(250, sum(score > 0.1 for score in scores.values()))
             # MLJAR: min(100, max(10, 0.1 * len(scores)))
-            self.crossFeatures = [k for k, v in list(scores.items())[:items] if v > 0.1]
+            self.crossFeatures = [k for k, v in list(scores.items())[:items]]
 
         # Split and Add
         multiFeatures = [k for k in self.crossFeatures if '__x__' in k]
@@ -1779,6 +1777,42 @@ class FeatureProcessing(object):
         # Store
         json.dump(self.crossFeatures, open(self.folder + 'crossFeatures_v%i.json' % self.version, 'w'))
         print('[Features] Added %i cross features' % len(self.crossFeatures))
+
+    def _addTrigometryFeatures(self):
+        '''
+        Calculates trigonometry features with sinus, cosines
+        '''
+        # Check if not already executed
+        if os.path.exists(self.folder + 'trigoFeatures_v%i.json' % self.version):
+            self.crossFeatures = json.load(open(self.folder + 'trigoFeatures_v%i.json' % self.version, 'r'))
+            print('[Features] Loaded %i trigonometric features' % len(self.crossFeatures))
+
+        # Else, execute
+        else:
+            print('[Features] Analysing Trigonometric features')
+
+            scores = {}
+            for key in self.originalInput.keys():
+                sinFeature = np.sin(self.input[key]).clip(lower=1e-12, upper=1e12)\
+                    .fillna(0).values.reshape((-1, 1))
+                cosFeature = np.cos(self.input[key]).clip(lower=1e-12, upper=1e12)\
+                    .fillna(0).values.reshape((-1, 1))
+                scores['sin__' + key] = self._analyseFeature(sinFeature)
+                scores['cos__' + key] = self._analyseFeature(cosFeature)
+
+        # Select valuable features
+        scores = {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+        items = min(100, sum(score > 0.1 for score in scores.values()))
+        self.trigoFeatures = [k for k, v in list(scores.items())[:items]]
+
+        # Add features
+        for k in self.trigoFeatures:
+            func, key = k.split('__')
+            self.input[k] = getattr(np, func)(self.input[key])
+
+        # Store
+        json.dump(self.trigoFeatures, open(self.folder + 'trigoFeatures_v%i.json' % self.version, 'w'))
+        print('[Features] Added %i trigonometric features' % len(self.trigoFeatures))
 
     def _addKMeansFeatures(self):
         '''
