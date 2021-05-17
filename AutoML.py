@@ -1555,7 +1555,6 @@ class FeatureProcessing(object):
             self._addCrossFeatures()
             self._addDiffFeatures()
             self._addKMeansFeatures()
-            self._calcBaseline()
             self._addLaggedFeatures()
         return self.input
 
@@ -1663,6 +1662,8 @@ class FeatureProcessing(object):
         assert isinstance(outputFrame, pd.Series), 'Output supports only Pandas Series'
         if self.mode == 'classification':
             self.model = tree.DecisionTreeClassifier(max_depth=3)
+            if outputFrame.nunique() > 2:
+                self.mode = 'multiclass'
         elif self.mode == 'regression':
             self.model = tree.DecisionTreeRegressor(max_depth=3)
         # Bit of necessary data cleaning (shouldn't change anything)
@@ -1670,24 +1671,6 @@ class FeatureProcessing(object):
         self.input = copy.copy(inputFrame)
         self.originalInput = copy.copy(inputFrame)
         self.output = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
-
-    def _calcBaseline(self):
-        '''
-        Calculates baseline for correlation, method same for all functions.
-        '''
-        # Check if not already executed
-        if os.path.exists(self.folder + 'BaseScores_v%i.json' % self.version):
-            print('[Features] Loading Baseline')
-            self.baseScore = json.load(open(self.folder + 'BaseScores_v%i.json' % self.version, 'r'))
-            return
-
-        # Calculate scores
-        print('[Features] Calculating baseline feature importance v%i' % self.version)
-        for key in self.input.keys():
-            m = copy.copy(self.model)
-            m.fit(self.input[[key]], self.output)
-            self.baseScore[key] = m.score(self.input[[key]], self.output)
-        json.dump(self.baseScore, open(self.folder + 'BaseScores_v%i.json' % self.version, 'w'))
 
     def _removeColinearity(self):
         '''
@@ -1752,17 +1735,25 @@ class FeatureProcessing(object):
             # Analyse scores
             scores = {}
             for keyA, keyB in tqdm(divList):
-                feature = self.input[[keyA]] / self.input[[keyB]]
+                feature = self.input[keyA] / self.input[keyB]
                 feature = feature.clip(lower=1e-12, upper=1e12).fillna(0)
                 m = copy.copy(self.model)
-                m.fit(feature, self.output)
-                scores[keyA + '__d__' + keyB] = m.score(feature, self.output)
+                m.fit(feature.values.reshape((-1, 1)), self.output)
+                if self.mode == 'binary':
+                    scores[keyA + '__d__' + keyB] = max([m.score(feature.values.reshape((-1, 1)), self.output,
+                                                                 self.output == i) for i in self.output.unique()])
+                else:
+                    scores[keyA + '__d__' + keyB] = m.score(feature.values.reshape((-1, 1)), self.output)
             for keyA, keyB in tqdm(multiList):
-                feature = self.input[[keyA]] * self.input[[keyB]]
+                feature = self.input[keyA] * self.input[keyB]
                 feature = feature.clip(lower=1e-12, upper=1e12).fillna(0)
                 m = copy.copy(self.model)
-                m.fit(feature, self.output)
-                scores[keyA + '__x__' + keyB] = m.score(feature, self.output)
+                m.fit(feature.values.reshape((-1, 1)), self.output)
+                if self.mode == 'binary':
+                    scores[keyA + '__x__' + keyB] = max([m.score(feature.values.reshape((-1, 1)), self.output,
+                                                                 self.output == i) for i in self.output.unique()])
+                else:
+                    scores[keyA + '__x__' + keyB] = m.score(feature.values.reshape((-1, 1)), self.output)
 
             # Select valuable features
             scores = {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
@@ -1956,7 +1947,7 @@ class FeatureProcessing(object):
         print('[Features] Determining features with RF')
         if self.mode == 'regression':
             rf = RandomForestRegressor().fit(self.input, self.output)
-        elif self.mode == 'classification':
+        elif self.mode == 'classification' or self.mode == 'multiclass':
             rf = RandomForestClassifier().fit(self.input, self.output)
         fi = rf.feature_importances_
         sfi = fi.sum()
@@ -1974,7 +1965,7 @@ class FeatureProcessing(object):
         print('[Features] Determining features with Boruta')
         if self.mode == 'regression':
             rf = RandomForestRegressor()
-        elif self.mode == 'classification':
+        elif self.mode == 'classification' or self.mode == 'multiclass':
             rf = RandomForestClassifier()
         selector = BorutaPy(rf, n_estimators='auto', verbose=0)
         selector.fit(self.input.to_numpy(), self.output.to_numpy())
