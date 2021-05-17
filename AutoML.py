@@ -1073,14 +1073,10 @@ class Pipeline(object):
 
         # Notify of results
         print('[AutoML] Preparing Production Env Files for %s, feature set %s' %
-                          (self.mainDir[:-1], model, feature_set))
+                          (model, feature_set))
         print('[AutoML] ', params)
-        if self.mode == 'classification':
-            print('[AutoML] Accuracy: %.2f \u00B1 %.2f' %
-                              (self.mainDir[:-1], results.iloc[0]['mean_objective'], results.iloc[0]['std_objective']))
-        elif self.mode == 'regression':
-            print('[AutoML] Mean Absolute Error: %.2f \u00B1 %.2f' %
-                              (self.mainDir[:-1], results.iloc[0]['mean_objective'], results.iloc[0]['std_objective']))
+        print('[AutoML] %s: %.2f \u00B1 %.2f' %
+                          (self.scorer._score_func.__name__, results.iloc[0]['mean_objective'], results.iloc[0]['std_objective']))
 
         # Save Features
         self.bestFeatures = self.colKeep[feature_set]
