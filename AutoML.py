@@ -1571,8 +1571,8 @@ class FeatureProcessing(object):
 
     def transform(self, data, features, **args):
         # Split Features
-        multiFeatures = [k for k in features if '__x__' in k]
-        divFeatures = [k for k in features if '__d__' in k]
+        crossFeatures = [k for k in features if '__x__' in k or '__d__' in k]
+        addFeatures = [k for k in features if '__sub__' in k or '__add__' in k]
         trigoFeatures = [k for k in features if 'sin__' in k or 'cos__' in k]
         kMeansFeatures = [k for k in features if 'dist__' in k]
         diffFeatures = [k for k in features if '__diff__' in k]
@@ -1587,8 +1587,8 @@ class FeatureProcessing(object):
 
         # Fill missing features for normalization
         required = copy.copy(originalFeatures)
-        required += [k for s in multiFeatures for k in s.split('__x__')]
-        required += [k for s in divFeatures for k in s.split('__d__')]
+        required += [s.split('__')[::2] for s in crossFeatures]
+        requried += [s.split('__')[::2] for s in addFeatures]
         required += [k.split('__')[1] for k in trigoFeatures]
         required += [s.split('__diff__')[0] for s in diffFeatures]
         required += [s.split('__lag__')[0] for s in multiFeatures]
@@ -1601,16 +1601,26 @@ class FeatureProcessing(object):
         X = data[originalFeatures]
 
         # Multiplicative features
-        for key in multiFeatures:
-            keyA, keyB = key.split('__x__')
-            feature = data[keyA] * data[keyB]
-            X.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
+        for key in crossFeatures:
+            if '__x__' in key:
+                keyA, keyB = k.split('__x__')
+                feature = X[keyA] * X[keyB]
+                X.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
+            else:
+                keyA, keyB = k.split('__d__')
+                feature = X[keyA] / X[keyB]
+                X.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
 
-        # Division features
-        for key in divFeatures:
-            keyA, keyB = key.split('__d__')
-            feature = data[keyA] / data[keyB]
-            X.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
+        # Additive features
+        for key in addFeatures:
+            if '__sub__' in key:
+                keyA, keyB = key.split('__sub__')
+                feature = X[keyA] - X[keyB]
+                X.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
+            else:
+                keyA, keyB = key.split('__add__')
+                feature = X[keyA] + X[keyB]
+                X.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
 
         # Differenced features
         for k in diffFeatures:
@@ -1671,12 +1681,23 @@ class FeatureProcessing(object):
         self.Y = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
 
     def _analyseFeature(self, feature):
+        feature = feature.clip(lower=1e-12, upper=1e12).fillna(0).values.reshape((-1, 1))
         m = copy.copy(self.model)
         m.fit(feature, self.Y)
         if self.mode == 'binary':
             return max([m.score(feature, self.Y, self.Y == i) for i in self.Y.unique()])
         else:
             return m.score(feature, self.Y)
+
+    def _selectFeatures(self, scores):
+        # Sort
+        scores = {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+
+        # Select
+        items = min(100, max(10, 0.1 * len(scores)))
+
+        # Return Keys
+        return [key for key, value in list(scores.items())[:items]]
 
     def _removeColinearity(self):
         '''
@@ -1724,51 +1745,42 @@ class FeatureProcessing(object):
         # Else, execute
         else:
             print('[Features] Analysing cross features')
-            # Make division todo List
-            keys = self.X.keys()
-            divList = []
-            for key in keys:
-                divList += [(key, k) for k in keys if k != key]
+            scores = {}
 
-            # Make multiplication todo list
-            multiList = []
-            for i, keyA in enumerate(keys):
-                for j, keyB in enumerate(keys):
+            # Analyse Cross Features
+            for i, keyA in enumerate(self.originalInput.keys()):
+                for j, keyB in enumerate(self.originalInput.keys()):
+                    # Skip if they're the same
+                    if keyA == keyB:
+                        continue
+
+                    # Analyse Division
+                    feature = self.X[keyA] / self.X[keyB]
+                    scores[keyA + '__d__' + keyB] = self._analyseFeature(feature)
+
+                    # Multiplication i * j == j * i, so skip if j >= i
                     if j >= i:
                         continue
-                    multiList.append((keyA, keyB))
 
-            # Analyse scores
-            scores = {}
-            for keyA, keyB in tqdm(divList):
-                feature = self.X[keyA] / self.X[keyB]
-                feature = feature.clip(lower=1e-12, upper=1e12).fillna(0).values.reshape((-1, 1))
-                scores[keyA + '__d__' + keyB] = self._analyseFeature(feature)
-            for keyA, keyB in tqdm(multiList):
-                feature = self.X[keyA] * self.X[keyB]
-                feature = feature.clip(lower=1e-12, upper=1e12).fillna(0).values.reshape((-1, 1))
-                scores[keyA + '__x__' + keyB] = self._analyseFeature(feature)
+                    # Analyse Multiplication
+                    feature = self.X[keyA] * self.X[keyB]
+                    scores[keyA + '__x__' + keyB] = self._analyseFeature(feature)
 
             # Select valuable features
-            scores = {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
-            items = min(250, sum(score > 0.1 for score in scores.values()))
-            # MLJAR: min(100, max(10, 0.1 * len(scores)))
-            self.crossFeatures = [k for k, v in list(scores.items())[:items]]
+            self.crossFeatures = self._selectFeatures(scores)
 
-        # Split and Add
-        multiFeatures = [k for k in self.crossFeatures if '__x__' in k]
-        divFeatures = [k for k in self.crossFeatures if '__d__' in k]
-        newFeatures = []
-        for k in multiFeatures:
-            keyA, keyB = k.split('__x__')
-            feature = self.X[keyA] * self.X[keyB]
-            feature = feature.astype('float32').clip(lower=1e-12, upper=1e12).fillna(0)
-            self.X[k] = feature
-        for k in divFeatures:
-            keyA, keyB = k.split('__d__')
-            feature = self.X[keyA] / self.X[keyB]
-            feature = feature.astype('float32').clip(lower=1e-12, upper=1e12).fillna(0)
-            self.X[k] = feature
+        # Add features
+        for key in self.crossFeatures:
+            if '__x__' in key:
+                keyA, keyB = k.split('__x__')
+                feature = self.X[keyA] * self.X[keyB]
+                feature = feature.astype('float32').clip(lower=1e-12, upper=1e12).fillna(0)
+                self.X[k] = feature
+            else:
+                keyA, keyB = k.split('__d__')
+                feature = self.X[keyA] / self.X[keyB]
+                feature = feature.astype('float32').clip(lower=1e-12, upper=1e12).fillna(0)
+                self.X[k] = feature
 
         # Store
         json.dump(self.crossFeatures, open(self.folder + 'crossFeatures_v%i.json' % self.version, 'w'))
@@ -1780,8 +1792,8 @@ class FeatureProcessing(object):
         '''
         # Check if not already executed
         if os.path.exists(self.folder + 'trigoFeatures_v%i.json' % self.version):
-            self.crossFeatures = json.load(open(self.folder + 'trigoFeatures_v%i.json' % self.version, 'r'))
-            print('[Features] Loaded %i trigonometric features' % len(self.crossFeatures))
+            self.trigoFeatures = json.load(open(self.folder + 'trigoFeatures_v%i.json' % self.version, 'r'))
+            print('[Features] Loaded %i trigonometric features' % len(self.trigoFeatures))
 
         # Else, execute
         else:
@@ -1789,17 +1801,13 @@ class FeatureProcessing(object):
 
             scores = {}
             for key in self.originalInput.keys():
-                sinFeature = np.sin(self.X[key]).clip(lower=1e-12, upper=1e12)\
-                    .fillna(0).values.reshape((-1, 1))
-                cosFeature = np.cos(self.X[key]).clip(lower=1e-12, upper=1e12)\
-                    .fillna(0).values.reshape((-1, 1))
+                sinFeature = np.sin(self.X[key])
+                cosFeature = np.cos(self.X[key])
                 scores['sin__' + key] = self._analyseFeature(sinFeature)
                 scores['cos__' + key] = self._analyseFeature(cosFeature)
 
         # Select valuable features
-        scores = {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
-        items = min(100, sum(score > 0.1 for score in scores.values()))
-        self.trigoFeatures = [k for k, v in list(scores.items())[:items]]
+        self.trigoFeatures = self._selectFeatures(scores)
 
         # Add features
         for k in self.trigoFeatures:
@@ -1809,6 +1817,50 @@ class FeatureProcessing(object):
         # Store
         json.dump(self.trigoFeatures, open(self.folder + 'trigoFeatures_v%i.json' % self.version, 'w'))
         print('[Features] Added %i trigonometric features' % len(self.trigoFeatures))
+
+    def _addAdditiveFeatures(self):
+        '''
+        Calculates simple additive and subtractive features
+        '''
+        # Load if available
+        if os.path.exists(self.folder + 'addFeatures_v%i.json' % self.version):
+            self.addFeatures = json.load(open(self.folder + 'addFeatures_v%i.json' % self.version, 'r'))
+            print('[Features] Loaded %i additive features' % len(self.addFeatures))
+
+        # Else, execute
+        else:
+            scores = {}
+            for i, keyA in enumerate(self.originalInput.keys()):
+                for j, keyB in enumerate(self.originalInput.keys()):
+                    # Skip if they're the same
+                    if keyA == keyB:
+                        continue
+                    # Difference feature
+                    feature = self.input[keyA] - self.input[keyB]
+                    scores[keyA + '__sub__' + keyB] = self._analyseFeature(feature)
+                    # A + B == B + A, so skip if i > j
+                    if j > i:
+                        continue
+                    feature = self.input[keyA] + self.input[keyB]
+                    scores[keyA + '__add__' + keyB] = self._analyseFeature(feature)
+
+        # Select valuable Features
+        self.addFeatures = self._selectFeatures(scores)
+
+        # Add features
+        for key in self.addFeatures:
+            if '__sub__' in key:
+                keyA, keyB = key.split('__sub__')
+                feature = self.X[keyA] - self.X[keyB]
+                self.X.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
+            else:
+                keyA, keyB = key.split('__add__')
+                feature = self.X[keyA] + self.X[keyB]
+                self.X.loc[:, key] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
+
+        # store
+        json.dump(self.addFeatures, open(self.folder + 'addFeatures_v%i.json' % self.version, 'w'))
+        print('[Features] Added %i additive features' % len(self.addFeatures))
 
     def _addKMeansFeatures(self):
         '''
