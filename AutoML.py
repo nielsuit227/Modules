@@ -854,6 +854,7 @@ class Pipeline(object):
                                              n_candidates=200,
                                              max_resources=max_resources,
                                              min_resources=min_resources,
+                                             n_candidates=250,
                                              cv=KFold(n_splits=self.cvSplits),
                                              scoring=self.objective,
                                              factor=3, n_jobs=mp.cpu_count() - 1, verbose=self.verbose)
@@ -869,6 +870,7 @@ class Pipeline(object):
                                              resource=resource,
                                              max_resources=max_resources,
                                              min_resources=min_resources,
+                                             n_candidates=250,
                                              cv=StratifiedKFold(n_splits=self.cvSplits),
                                              scoring=self.objective,
                                              factor=3, n_jobs=mp.cpu_count() - 1, verbose=self.verbose)
