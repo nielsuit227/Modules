@@ -1,0 +1,17 @@
+numpy==1.16.0
+ppscore
+pandas
+seaborn
+tqdm
+matplotlib
+boruta
+catboost
+xgboost
+lightgbm
+catboost
+scikit-learn
+statsmodels
+scipy
+keras
+tensorflow
+gurobipy

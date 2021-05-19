@@ -1,6 +1,7 @@
-import numpy as np
 import matplotlib.pyplot as plt
-'''
+import numpy as np
+
+"""
 Density Bases Spatial Clustering for Applications with Noise. [1]
 Clustering algorithm parameterized by the cluster radius and the minimum points in this radius to be defined a cluster.
 The algorithm efficiently checks for each point how many points are within said radius. If this exceeds the points
@@ -14,7 +15,7 @@ Initializes the model.
 radius          Distance defining whether points are within clusters
 minpoints:      Minimum points within radius to be defined cluster
 tree:           (Optional) Will exploit data structure of Radius Nearest Neighbor to speed up the algorithm.
-
+ 
 
 Fit(data)
 Runs the DBSCAN algorithm for the given data.
@@ -46,10 +47,9 @@ returns seeds which are within Euclidean distance as defined by radius.
 
 
 [1] A Density-Based Algorithm for Discovering Clusters in Large Spatial Databases with Noise - Ester et al. - 1996
-'''
+"""
 # todo implement merge
 class DBSCAN(object):
-
     def __init__(self, radius=1.0, minpoints=50, tree=None):
 
         # Pass variables
@@ -79,6 +79,7 @@ class DBSCAN(object):
                 #       % (100*i/self._n, np.sum(self._clusterid == np.max(self._clusterid))))
                 self.expandcluster(i)
         return self._clusterid
+
     # _clusterid is initialized as -1 (outliers) and keeps track of assigned clusters.
     # _checked is initalized as False and every point is marked True when it is checked against other points
 
@@ -99,17 +100,20 @@ class DBSCAN(object):
                 else:
                     seeds[npoint] = False
         return
+
     # seeds is a vector which marks unchecked data samples in the neighborhood of the cluster. Points that are radius
     # of extended clusters are added. It's a to do list for checking distances pretty much.
 
     def neighbor(self, point):
-        seeds = np.zeros(self._n, dtype='bool')
+        seeds = np.zeros(self._n, dtype="bool")
         if np.size(point) == 1:
             self._checked[point] = True
             if not self._tree:
                 seedsindex = self.bruteforce(self._data[point, :])
             else:
-                seedsindex = self._tree.exact_r_nn(self._eps, self._data[point, :], maxeval=10)
+                seedsindex = self._tree.exact_r_nn(
+                    self._eps, self._data[point, :], maxeval=10
+                )
         else:
             if not self._tree:
                 seedsindex = self.bruteforce(point)
@@ -129,9 +133,11 @@ class DBSCAN(object):
     def plot(self):
         plt.figure()
         self._outliers = self._clusterid == -1
-        plt.scatter(self._data[:, 0], self._data[:, 1], c='g', s=1)
-        plt.scatter(self._data[self._outliers, 0], self._data[self._outliers, 1], c='r', s=1)
-        plt.suptitle('Estimated clusters')
+        plt.scatter(self._data[:, 0], self._data[:, 1], c="g", s=1)
+        plt.scatter(
+            self._data[self._outliers, 0], self._data[self._outliers, 1], c="r", s=1
+        )
+        plt.suptitle("Estimated clusters")
         plt.legend(self._outliers)
 
     def predict_outlier(self, point):
@@ -140,4 +146,3 @@ class DBSCAN(object):
             return False
         else:
             return True
-

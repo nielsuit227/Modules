@@ -1,5 +1,5 @@
-import tensorflow as tf
 import numpy as np
+import tensorflow as tf
 
 
 class SOM(object):
@@ -47,53 +47,90 @@ class SOM(object):
             # Randomly initialized weights
             self._weightage_vects = tf.Variable(tf.random_normal([m * n, dim]))
             # SOM grid locations
-            self._location_vects = tf.constant(np.array(list(self._neuron_locations(m, n))))
+            self._location_vects = tf.constant(
+                np.array(list(self._neuron_locations(m, n)))
+            )
             # The training vector
             self._vect_input = tf.placeholder("float", [dim])
             # Iteration number
             self._iter_input = tf.placeholder("float")
             # Best Matching Unit
             # todo rewrite this line once comfortable with tf
-            bmu_index = tf.argmin(tf.sqrt(tf.reduce_sum(tf.pow(tf.subtract(self._weightage_vects,
-                                   tf.stack([self._vect_input for i in range(m * n)])), 2), 1)), 0)
+            bmu_index = tf.argmin(
+                tf.sqrt(
+                    tf.reduce_sum(
+                        tf.pow(
+                            tf.subtract(
+                                self._weightage_vects,
+                                tf.stack([self._vect_input for i in range(m * n)]),
+                            ),
+                            2,
+                        ),
+                        1,
+                    )
+                ),
+                0,
+            )
             # This will extract the location of the BMU based on the BMU's index
-            slice_input = tf.pad(tf.reshape(bmu_index, [1]),
-                                 np.array([[0, 1]]))
-            bmu_loc = tf.reshape(tf.slice(self._location_vects, slice_input,
-                                          tf.constant(np.array([1, 2], dtype=np.int64))),
-                                 [2])
+            slice_input = tf.pad(tf.reshape(bmu_index, [1]), np.array([[0, 1]]))
+            bmu_loc = tf.reshape(
+                tf.slice(
+                    self._location_vects,
+                    slice_input,
+                    tf.constant(np.array([1, 2], dtype=np.int64)),
+                ),
+                [2],
+            )
 
             # To compute the alpha and sigma values based on iteration
             # number
-            learning_rate_op = tf.subtract(1.0, tf.divide(self._iter_input,
-                                                  self._n_iterations))
+            learning_rate_op = tf.subtract(
+                1.0, tf.divide(self._iter_input, self._n_iterations)
+            )
             _alpha_op = tf.multiply(alpha, learning_rate_op)
             _sigma_op = tf.multiply(sigma, learning_rate_op)
 
             # Construct the op that will generate a vector with learning
             # rates for all neurons, based on iteration number and location
             # wrt BMU.
-            bmu_distance_squares = tf.reduce_sum(tf.pow(tf.subtract(
-                self._location_vects, tf.stack(
-                    [bmu_loc for i in range(m * n)])), 2), 1)
-            neighbourhood_func = tf.exp(tf.negative(tf.divide(tf.cast(
-                bmu_distance_squares, "float32"), tf.pow(_sigma_op, 2))))
+            bmu_distance_squares = tf.reduce_sum(
+                tf.pow(
+                    tf.subtract(
+                        self._location_vects, tf.stack([bmu_loc for i in range(m * n)])
+                    ),
+                    2,
+                ),
+                1,
+            )
+            neighbourhood_func = tf.exp(
+                tf.negative(
+                    tf.divide(
+                        tf.cast(bmu_distance_squares, "float32"), tf.pow(_sigma_op, 2)
+                    )
+                )
+            )
             learning_rate_op = tf.multiply(_alpha_op, neighbourhood_func)
 
             # Finally, the op that will use learning_rate_op to update
             # the weightage vectors of all neurons based on a particular
             # input
-            learning_rate_multiplier = tf.stack([tf.tile(tf.slice(
-                learning_rate_op, np.array([i]), np.array([1])), [dim])
-                for i in range(m * n)])
+            learning_rate_multiplier = tf.stack(
+                [
+                    tf.tile(
+                        tf.slice(learning_rate_op, np.array([i]), np.array([1])), [dim]
+                    )
+                    for i in range(m * n)
+                ]
+            )
             weightage_delta = tf.multiply(
                 learning_rate_multiplier,
-                tf.subtract(tf.stack([self._vect_input for i in range(m * n)]),
-                       self._weightage_vects))
-            new_weightages_op = tf.add(self._weightage_vects,
-                                       weightage_delta)
-            self._training_op = tf.assign(self._weightage_vects,
-                                          new_weightages_op)
+                tf.subtract(
+                    tf.stack([self._vect_input for i in range(m * n)]),
+                    self._weightage_vects,
+                ),
+            )
+            new_weightages_op = tf.add(self._weightage_vects, weightage_delta)
+            self._training_op = tf.assign(self._weightage_vects, new_weightages_op)
             # Initialize tf session
             self._sess = tf.Session()
             init_op = tf.global_variables_initializer()
@@ -122,11 +159,12 @@ class SOM(object):
         # Training iterations
         for iter_no in range(self._n_iterations):
             # Train with each vector one by one
-            print('Iteration %.0f' % iter_no, end='\r')
+            print("Iteration %.0f" % iter_no, end="\r")
             for input_vect in input_vects:
-                self._sess.run(self._training_op,
-                               feed_dict={self._vect_input: input_vect,
-                                          self._iter_input: iter_no})
+                self._sess.run(
+                    self._training_op,
+                    feed_dict={self._vect_input: input_vect, self._iter_input: iter_no},
+                )
 
         # Store a centroid grid for easy retrieval later on
         centroid_grid = [[] for i in range(self._m)]
@@ -163,9 +201,10 @@ class SOM(object):
 
         to_return = []
         for vect in input_vects:
-            min_index = min([i for i in range(len(self._weightages))],
-                            key=lambda x: np.linalg.norm(vect -
-                                                         self._weightages[x]))
+            min_index = min(
+                [i for i in range(len(self._weightages))],
+                key=lambda x: np.linalg.norm(vect - self._weightages[x]),
+            )
             to_return.append(self._locations[min_index])
 
         return to_return

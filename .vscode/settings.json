@@ -1,0 +1,19 @@
+{
+    "editor.formatOnSave": true,
+    "editor.formatOnPaste": true,
+    "editor.defaultFormatter": "ms-python.python",
+    "python.formatting.provider": "black",
+  
+    "python.linting.lintOnSave": true,
+    "python.linting.enabled": true,
+    "python.linting.flake8Enabled": true,
+    "python.linting.mypyEnabled": true,
+    "python.linting.pylintEnabled": false,
+    
+    "[python]": {
+      "editor.formatOnPaste": false,
+      "editor.codeActionsOnSave": {
+        "source.organizeImports": true
+      }
+    },
+  }

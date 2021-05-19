@@ -1,12 +1,13 @@
 # Python 3.6.5.
 # Numpy 1.16.0.
 # Matplotlib 3.0.2.
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 
 def sortnode(val):
     return val[2]
+
 
 # todo: implement multiple splitting algo's (now median)
 # todo: make predict function? for buckets
@@ -56,10 +57,17 @@ bin_r_nn      Calculates the Radius Nearest Neighbors within the same leaf.
 
 
 class KDTree(object):
-
-    def __init__(self, leafsize=10, kdim=None, random=False, pc_sort=False, sort_algo='quicksort', savedata=True):
-        if sort_algo not in {'quicksort', 'mergesort', 'heapsort', 'stable'}:
-            raise ValueError('Select sorting algo of numpy.argsort v1.16.0.')
+    def __init__(
+        self,
+        leafsize=10,
+        kdim=None,
+        random=False,
+        pc_sort=False,
+        sort_algo="quicksort",
+        savedata=True,
+    ):
+        if sort_algo not in {"quicksort", "mergesort", "heapsort", "stable"}:
+            raise ValueError("Select sorting algo of numpy.argsort v1.16.0.")
         # Pass settings
         self._leafs = leafsize
         self._rk = random
@@ -91,10 +99,26 @@ class KDTree(object):
         idx = np.argsort(data[:, ind], kind=self._sort_algo)
         data = data[idx, :]
         # Tree: data, data index, node, splitdim, splitval
-        self._tree = [(None, idx, 0, ind, data[int(self._n/2), ind])]
+        self._tree = [(None, idx, 0, ind, data[int(self._n / 2), ind])]
         # Stack: data, data index, node, leaf, depth
-        self._stack.append((data[:int(self._n/2), :], idx[:int(self._n/2)], 1, int(self._n / 2) < self._leafs, 0))
-        self._stack.append((data[int(self._n/2):, :], idx[int(self._n/2):], 2, int(self._n / 2) < self._leafs, 0))
+        self._stack.append(
+            (
+                data[: int(self._n / 2), :],
+                idx[: int(self._n / 2)],
+                1,
+                int(self._n / 2) < self._leafs,
+                0,
+            )
+        )
+        self._stack.append(
+            (
+                data[int(self._n / 2) :, :],
+                idx[int(self._n / 2) :],
+                2,
+                int(self._n / 2) < self._leafs,
+                0,
+            )
+        )
         while self._stack:
             data, idx, node, leaf, depth = self._stack.pop()
             if leaf:
@@ -111,10 +135,24 @@ class KDTree(object):
                 data = data[tidx, :]
                 idx = idx[tidx]
                 ndata, ndim = np.shape(data)
-                self._stack.append((data[:int(ndata / 2), :], idx[:int(ndata / 2)], node * 2 + 1, int(ndata / 2)
-                                    < self._leafs, depth + 1))
-                self._stack.append((data[int(ndata / 2):, :], idx[int(ndata / 2):], node * 2 + 2, int(ndata / 2)
-                                    < self._leafs, depth + 1))
+                self._stack.append(
+                    (
+                        data[: int(ndata / 2), :],
+                        idx[: int(ndata / 2)],
+                        node * 2 + 1,
+                        int(ndata / 2) < self._leafs,
+                        depth + 1,
+                    )
+                )
+                self._stack.append(
+                    (
+                        data[int(ndata / 2) :, :],
+                        idx[int(ndata / 2) :],
+                        node * 2 + 2,
+                        int(ndata / 2) < self._leafs,
+                        depth + 1,
+                    )
+                )
                 self._tree.append((None, idx, node, ind, data[int(ndata / 2), ind]))
         self._tree.sort(key=sortnode)
         return self._tree
@@ -187,18 +225,11 @@ class KDTree(object):
                 leafSize = np.size(branch[1])
                 dist = np.zeros(leafSize)
                 for i in range(leafSize):
-                    dist[i] = np.mean(np.sum((data-data[i, :])**2, 1))
+                    dist[i] = np.mean(np.sum((data - data[i, :]) ** 2, 1))
                 Z.append(np.mean(dist))
                 Y.append(dist)
         plt.boxplot(Z)
-        plt.suptitle('Boxplot of average distance within leaf')
+        plt.suptitle("Boxplot of average distance within leaf")
         plt.figure()
         plt.boxplot(Y)
-        plt.suptitle('Boxplot of all distances within leaf')
-
-
-
-
-
-
-
+        plt.suptitle("Boxplot of all distances within leaf")

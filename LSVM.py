@@ -1,6 +1,7 @@
-import numpy as np
 import gurobipy as grb
-'''
+import numpy as np
+
+"""
 Simple Online Linear Support Vector Machine.
 
 __init__:
@@ -31,25 +32,25 @@ _update(x, y):
  
 save_model():
  Creates a parameter file as required by load_model
-'''
+"""
 
 
 class LSVM(object):
-
-    def __init__(self,
-                 load_model=None,
-                 regularization=1,
-                 learning_rate=0.001,
-                 weights=None,
-                 ):
+    def __init__(
+        self,
+        load_model=None,
+        regularization=1,
+        learning_rate=0.001,
+        weights=None,
+    ):
         self._mu = []
         self._var = []
         if load_model is not None:
-            self._c = load_model['reg']
-            self._eta = load_model['eta']
-            self._w = load_model['w']
-            self._mu = load_model['mean']
-            self._var = load_model['variance']
+            self._c = load_model["reg"]
+            self._eta = load_model["eta"]
+            self._w = load_model["w"]
+            self._mu = load_model["mean"]
+            self._var = load_model["variance"]
         else:
             self._c = regularization
             self._eta = learning_rate
@@ -75,15 +76,17 @@ class LSVM(object):
         x -= self._mu
         x /= np.sqrt(self._var)
         # Use Gurobi to optimize offline
-        svm = grb.Model('LSVM')
-        svm.setParam('OutputFlag', False)
+        svm = grb.Model("LSVM")
+        svm.setParam("OutputFlag", False)
         w = {}
         s = {}
         for i in range(m):
             w[i] = svm.addVar(vtype=grb.GRB.CONTINUOUS)
         for i in range(n):
             s[i] = svm.addVar(vtype=grb.GRB.CONTINUOUS, lb=0, ub=self._c)
-            svm.addConstr(1 - y[i] * grb.quicksum(w[j] * x[i, j] for j in range(m)) <= s[i])
+            svm.addConstr(
+                1 - y[i] * grb.quicksum(w[j] * x[i, j] for j in range(m)) <= s[i]
+            )
         svm.setObjective(grb.quicksum(s[i] for i in range(n)))
         svm.optimize()
         self._w = [w[i].x for i in range(m)]
@@ -105,9 +108,11 @@ class LSVM(object):
             self._w = self._w + self._eta * y * x
 
     def save_model(self, filename):
-        np.savez(filename+'.npz',
-                 w=self._w,
-                 reg=self._c,
-                 eta=self._eta,
-                 mean=self._mu,
-                 variance=self._var)
+        np.savez(
+            filename + ".npz",
+            w=self._w,
+            reg=self._c,
+            eta=self._eta,
+            mean=self._mu,
+            variance=self._var,
+        )
