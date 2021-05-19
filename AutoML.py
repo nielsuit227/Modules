@@ -1,9 +1,11 @@
-import os, time, itertools, re, joblib, json, pickle, copy, shutil, textwrap, inspect, math
+import os, time, re, joblib, json, pickle, copy, shutil, textwrap, inspect, math
+import itertools, functools
 import numpy as np
 import pandas as pd
 import ppscore as pps
 import seaborn as sns
 from tqdm import tqdm
+from tqdm.contrib.concurrent import process_map
 from datetime import datetime
 import matplotlib
 import matplotlib.pyplot as plt
@@ -15,6 +17,7 @@ from sklearn import neural_network, tree, cluster, metrics
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import StratifiedKFold, KFold
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.tree import DecisionTreeClassifier
 
 from statsmodels.tsa.seasonal import STL
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
@@ -31,7 +34,9 @@ warnings.filterwarnings("ignore")
 # implement warning for imputing keys
 # print initial modelling when already completed
 # Parameterize _getHyperParameters()
-# Change input/output to X/Y
+# Change resources of halving grid search to samples when samples > 25.000
+# Stacking Builder
+# For metrics per class, make sure that all is outputted by Modelling and Pipeline.validatecal
 
 # Nicety
 # add report output
@@ -39,6 +44,13 @@ warnings.filterwarnings("ignore")
 # implement autoencoder for Feature Extraction
 # implement transformers
 
+def printTime(func):
+    def wrap(*args, **kwargs):
+        t = time.time()
+        x = func(*args, **kwargs)
+        print(func.__name__, time.time() - t)
+        return x
+    return wrap
 
 class Utils:
     @staticmethod
@@ -81,6 +93,35 @@ class Utils:
                 print('[AutoML] Cannot validate, imparsable JSON.')
                 print(json_string)
                 return json_string
+
+    def crossFeaturesMP(self, data, labels):
+        processes = []
+        print('[Features] Initializing all cross-features')
+        time.sleep(0.02)
+        for i in tqdm(range(data.shape[1])):
+            for j in range(data.shape[1]):
+                if i < j:
+                    continue
+                processes.append(((i, j), '{}x{}'.format(i, j)))
+        print('[Features] Analysing all cross-features')
+        time.sleep(0.02)
+        print(processes[0])
+        scores = process_map(
+            functools.partial(Utils.crossFeature, data, labels),
+            processes, max_workers=4, chunksize=min(25, int(len(processes) / 8 / 8)))
+        # with mp.Pool() as p:
+        #     scores = p.starmap(functools.partial(Utils.crossFeature, data, labels),
+        #                   iter(processes))
+        return scores
+
+    @staticmethod
+    def crossFeature(data, labels, arg):
+        feature, name = arg
+        feature = data[:, feature[0]] * data[:, feature[1]]
+        feature = feature.reshape((-1, 1))
+        model = DecisionTreeClassifier(max_depth=3)
+        model.fit(feature, labels)
+        return (name, model.score(feature, labels))
 
 class Pipeline(object):
 
@@ -1558,6 +1599,8 @@ class FeatureProcessing(object):
             # Manipulate features
             # Order of these doesn't matter, all take originalInput features
             self._removeColinearity()
+            self._calcBaseline()
+            # self._addMultiFeaturesMP()
             self._addCrossFeatures()
             self._addKMeansFeatures()
             self._addTrigometryFeatures()
@@ -1696,24 +1739,40 @@ class FeatureProcessing(object):
         self.originalInput = copy.copy(inputFrame)
         self.Y = outputFrame.replace([np.inf, -np.inf], 0).fillna(0).reset_index(drop=True)
 
+    def _calcBaseline(self):
+        baseline = {}
+        for key in self.originalInput.keys():
+            baseline[key] = self._analyseFeature(self.X[key])
+        self.baseline = pd.DataFrame(baseline).max(axis=1)
+
     def _analyseFeature(self, feature):
         feature = feature.clip(lower=1e-12, upper=1e12).fillna(0).values.reshape((-1, 1))
         m = copy.copy(self.model)
         m.fit(feature, self.Y)
-        if self.mode == 'binary':
-            return max([m.score(feature, self.Y, self.Y == i) for i in self.Y.unique()])
+        if self.mode == 'multiclass':
+            return [m.score(feature, self.Y, self.Y == i) for i in self.Y.unique()]
         else:
-            return m.score(feature, self.Y)
+            return [m.score(feature, self.Y)]
+
+    def _acceptFeature(self, candidate):
+        if (candidate > self.baseline.values).any():
+            return True
+        else:
+            return False
 
     def _selectFeatures(self, scores):
-        # Sort
-        scores = {k: v for k, v in sorted(scores.items(), key=lambda item: item[1], reverse=True)}
+        # Convert dict to dataframe
+        scores = pd.DataFrame(scores)
 
-        # Select
-        items = min(100, max(10, 0.1 * len(scores)))
+        # Select inds
+        featuresPerBin = 50
+        inds = []
+        for score in range(len(scores)):
+            inds += [i for i, k in enumerate(scores.keys())
+                     if k in scores.loc[score].sort_values(ascending=False).keys()[:featuresPerBin]]
 
         # Return Keys
-        return [key for key, value in list(scores.items())[:items]]
+        return list(scores.keys()[np.unique(inds)])
 
     def _removeColinearity(self):
         '''
@@ -1748,13 +1807,34 @@ class FeatureProcessing(object):
         self.originalInput = self.originalInput.drop(self.colinearFeatures, axis=1)
         print('[Features] Removed %i Co-Linear features (%.3f %% threshold)' % (len(self.colinearFeatures), self.informationThreshold))
 
+    @staticmethod
+    def _staticMultiply(model, data, labels, features):
+        feature = data[features[0]] * data[features[1]]
+        feature = feature.clip(lower=1e-12, upper=1e12).fillna(0).values.reshape((-1, 1))
+        model.fit(feature, labels)
+        return (features[0] + '__x__' + features[1],
+                max([model.score(feature, labels, labels == i) for i in labels.unique()]))
+
+    def _addMultiFeaturesMP(self):
+        print('[Features] Listing Multiplication Features')
+        features = []
+        for i, keyA in enumerate(self.originalInput.keys()):
+            for j, keyB in enumerate(self.originalInput.keys()):
+                if i >= j:
+                    continue
+                features.append((keyA, keyB))
+        print('[Features] Analysing {} Multiplication Features'.format(len(features)))
+        scores = dict(process_map(functools.partial(self._staticMultiply, self.model, self.X, self.Y),
+                    features, max_workers=8, chunksize=min(100, int(len(features) / 8 / 8))))
+        self.multiFeatures = self._selectFeatures(scores)
+
     def _addCrossFeatures(self):
         '''
         Calculates cross-feature features with m and multiplication.
         Should be limited to say ~500.000 features (runs about 100-150 features / second)
         '''
         # Check if not already executed
-        if os.path.exists(self.folder + 'crossFeatures_v%i.json' % self.version):
+        if os.path.exists(self.folder + 'crossFeatures_v%i.json' % self.version) and False:
             self.crossFeatures = json.load(open(self.folder + 'crossFeatures_v%i.json' % self.version, 'r'))
             print('[Features] Loaded %i cross features' % len(self.crossFeatures))
 
@@ -1762,17 +1842,26 @@ class FeatureProcessing(object):
         else:
             print('[Features] Analysing cross features')
             scores = {}
+            nKeys = len(self.originalInput.keys())
 
             # Analyse Cross Features
-            for i, keyA in enumerate(self.originalInput.keys()):
-                for j, keyB in enumerate(self.originalInput.keys()):
+            for i, keyA in enumerate(tqdm(self.originalInput.keys())):
+                acceptedForKeyA = 0
+                for j, keyB in enumerate(self.originalInput.keys()[np.random.permutation(nKeys)]):
                     # Skip if they're the same
                     if keyA == keyB:
+                        continue
+                    # Skip rest if keyA is not useful in first min(50, 30%) (uniform)
+                    if acceptedForKeyA == 0 and j > min(50, int(nKeys / 3)):
                         continue
 
                     # Analyse Division
                     feature = self.X[keyA] / self.X[keyB]
-                    scores[keyA + '__d__' + keyB] = self._analyseFeature(feature)
+                    score = self._analyseFeature(feature)
+                    # Accept or not
+                    if self._acceptFeature(score):
+                        scores[keyA + '__d__' + keyB] = score
+                        acceptedForKeyA += 1
 
                     # Multiplication i * j == j * i, so skip if j >= i
                     if j >= i:
@@ -1780,23 +1869,25 @@ class FeatureProcessing(object):
 
                     # Analyse Multiplication
                     feature = self.X[keyA] * self.X[keyB]
-                    scores[keyA + '__x__' + keyB] = self._analyseFeature(feature)
+                    score = self._analyseFeature(feature)
+                    # Accept or not
+                    if self._acceptFeature(score):
+                        scores[keyA + '__x__' + keyB] = score
+                        acceptedForKeyA += 1
 
             # Select valuable features
             self.crossFeatures = self._selectFeatures(scores)
 
         # Add features
-        for key in self.crossFeatures:
-            if '__x__' in key:
+        for k in self.crossFeatures:
+            if '__x__' in k:
                 keyA, keyB = k.split('__x__')
                 feature = self.X[keyA] * self.X[keyB]
-                feature = feature.astype('float32').clip(lower=1e-12, upper=1e12).fillna(0)
-                self.X[k] = feature
+                self.X[k] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
             else:
                 keyA, keyB = k.split('__d__')
                 feature = self.X[keyA] / self.X[keyB]
-                feature = feature.astype('float32').clip(lower=1e-12, upper=1e12).fillna(0)
-                self.X[k] = feature
+                self.X[k] = feature.clip(lower=1e-12, upper=1e12).fillna(0)
 
         # Store
         json.dump(self.crossFeatures, open(self.folder + 'crossFeatures_v%i.json' % self.version, 'w'))
@@ -1816,11 +1907,18 @@ class FeatureProcessing(object):
             print('[Features] Analysing Trigonometric features')
 
             scores = {}
-            for key in self.originalInput.keys():
+            for key in tqdm(self.originalInput.keys()):
+                # Sinus feature
                 sinFeature = np.sin(self.X[key])
+                score = self._analyseFeature(sinFeature)
+                if self._acceptFeature(score):
+                    score['sin__' + key] = score
+
+                # Cosinus feature
                 cosFeature = np.cos(self.X[key])
-                scores['sin__' + key] = self._analyseFeature(sinFeature)
-                scores['cos__' + key] = self._analyseFeature(cosFeature)
+                score = self._analyseFeature(cosFeature)
+                if self._acceptFeature(score):
+                    scores['cos__' + key]
 
         # Select valuable features
         self.trigoFeatures = self._selectFeatures(scores)
@@ -1846,19 +1944,34 @@ class FeatureProcessing(object):
         # Else, execute
         else:
             scores = {}
+            nKeys = len(self.originalInput.keys())
             for i, keyA in enumerate(self.originalInput.keys()):
-                for j, keyB in enumerate(self.originalInput.keys()):
+                acceptedForKeyA = 0
+                for j, keyB in enumerate(self.originalInput.keys()[np.random.permutation(nKeys)]):
                     # Skip if they're the same
                     if keyA == keyB:
                         continue
-                    # Difference feature
+                    # Skip rest if keyA is not useful in first min(50, 30%) (uniform)
+                    if acceptedForKeyA == 0 and j > min(50, int(nKeys / 3)):
+                        continue
+
+                    # Subtracting feature
                     feature = self.input[keyA] - self.input[keyB]
-                    scores[keyA + '__sub__' + keyB] = self._analyseFeature(feature)
+                    score = self._analyseFeature(feature)
+                    if self._acceptFeature(score):
+                        scores[keyA + '__sub__' + keyB] = score
+                        acceptedForKeyA += 1
+
                     # A + B == B + A, so skip if i > j
                     if j > i:
                         continue
+
+                    # Additive feature
                     feature = self.input[keyA] + self.input[keyB]
-                    scores[keyA + '__add__' + keyB] = self._analyseFeature(feature)
+                    score = self._analyseFeature(feature)
+                    if self._acceptFeature(score):
+                        scores[keyA + '__add__' + keyB] = score
+                        acceptedForKeyA += 1
 
         # Select valuable Features
         self.addFeatures = self._selectFeatures(scores)
@@ -1925,12 +2038,12 @@ class FeatureProcessing(object):
             # Analyse correlation
             scores = {}
             for key in tqdm(distances.keys()):
-                m = copy.copy(self.model)
-                m.fit(distances[[key]], self.Y)
-                scores[key] = m.score(distances[[key]], self.Y)
+                score = self._analyseFeature(distances[key])
+                if self._acceptFeature(score):
+                    scores[key] = score
 
             # Add the valuable features
-            self.kMeansFeatures = [k for k, v in scores.items() if v > 0.1]
+            self.kMeansFeatures = self._selectFeatures(scores)
             for k in self.kMeansFeatures:
                 self.X[k] = distances[k]
 
@@ -1969,12 +2082,12 @@ class FeatureProcessing(object):
             for diff in tqdm(range(1, self.maxDiff+1)):
                 diffInput = diffInput.diff().fillna(0)
                 for key in keys:
-                    m = copy.copy(self.model)
-                    m.fit(diffInput[key], diffOutput)
-                    score[key + '__diff__%i' % diff] = m.score(diffInput[key], diffOutput)
+                    score = self._analyseFeature(diffInput[key])
+                    if self._acceptFeature(score):
+                        scores[key + '__diff__%i' % diff] = score
 
             # Select the valuable features
-            self.diffFeatures = [k for k, v in scores.items() if v > 0.1]
+            self.diffFeatures = self._selectFeatures(scores)
             print('[Features] Added %i differenced features' % len(self.diffFeatures))
 
         # Add Differenced Features
@@ -1982,7 +2095,7 @@ class FeatureProcessing(object):
             key, diff = k.split('__diff__')
             feature = self.X[key]
             for i in range(1, diff):
-                feature = feature.diff().fillna(0)
+                feature = feature.diff().clip(lower=1e-12, upper=1e12).fillna(0)
             self.X[k] = feature
         json.dump(self.diffFeatures, open(self.folder + 'diffFeatures_v%i.json' % self.version, 'w'))
 
@@ -2007,21 +2120,20 @@ class FeatureProcessing(object):
             scores = {}
             for lag in tqdm(range(1, self.maxLags)):
                 for key in keys:
-                    m = copy.copy(self.model)
-                    m.fit(self.originalInput[[key]][:-lag], self.Y[lag:])
-                    scores[key + '__lag__%i' % lag] = m.score(self.originalInput[[key]][:-lag], self.Y[lag:])
+                    score = self._analyseFeature(self.X[key].shift(-1))
+                    if self._acceptFeature(score):
+                        scores[key + '__lag__%i' % lag] = score
 
             # Select
-            scores = {k: v - self.baseScore[k[:k.find('__lag__')]] for k, v in sorted(scores.items(),
-                                              key=lambda k: k[1] - self.baseScore[k[0][:k[0].find('__lag__')]], reverse=True)}
-            items = min(250, sum(v > 0.1 for v in scores.values()))
-            self.laggedFeatures = [k for k, v in list(scores.items())[:items] if v > self.baseScore[k[:k.find('__lag__')]]]
+            self.laggedFeatures = self._selectFeatures(scores)
             print('[Features] Added %i lagged features' % len(self.laggedFeatures))
 
         # Add selected
         for k in self.laggedFeatures:
             key, lag = k.split('__lag__')
             self.X[k] = self.originalInput[key].shift(-int(lag), fill_value=0)
+
+        # Store
         json.dump(self.laggedFeatures, open(self.folder + 'laggedFeatures_v%i.json' % self.version, 'w'))
 
     def _predictivePowerScore(self):
